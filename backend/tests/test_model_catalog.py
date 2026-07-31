@@ -1,6 +1,26 @@
+import anyio
 import pytest
+from sqlalchemy import select
 
+from app.db.models import ChannelModel
+from app.main import app
+from app.services.capabilities import extract_capabilities, pi_model_config
 from tests.conftest import configure_route
+
+
+def test_model_catalog_allows_local_desktop_cors_preflight(client):
+    response = client.options(
+        "/v1/models",
+        headers={
+            "Origin": "onlyoffice://desktop",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "authorization,content-type",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "onlyoffice://desktop"
+    assert "authorization" in response.headers["access-control-allow-headers"].lower()
 
 
 @pytest.mark.parametrize(
@@ -118,6 +138,123 @@ def test_aggregate_catalog_deduplicates_routed_multi_protocol_models(
     assert data[0]["id"] == "shared-unrouted"
     assert data[0]["x_local_gateway"] == {
         "supported_endpoints": ["/v1/chat/completions", "/v1/responses"]
+    }
+
+
+def test_model_catalog_exposes_manual_pi_capabilities(client, admin_headers):
+    configure_route(client, admin_headers, model_id="capable-model")
+    response = client.put(
+        "/api/admin/v1/model-capabilities/capable-model",
+        headers=admin_headers,
+        json={
+            "source": "manual",
+            "context_window": 128000,
+            "max_tokens": 8192,
+            "supports_image_input": True,
+            "reasoning": True,
+            "thinking_level_map": {"high": "default", "max": "max"},
+            "cost_input": 1.25,
+            "cost_output": 5,
+            "cost_cache_read": 0.2,
+            "cost_cache_write": 1,
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    item = client.get("/v1/models").json()["data"][0]
+
+    metadata = item["x_local_gateway"]
+    assert metadata["capabilities"]["context_window"] == 128000
+    assert metadata["capabilities"]["supports_image_input"] is True
+    assert metadata["pi_model_config"] == {
+        "input": ["text", "image"],
+        "reasoning": True,
+        "cost": {
+            "input": 1.25,
+            "output": 5.0,
+            "cacheRead": 0.2,
+            "cacheWrite": 1.0,
+        },
+        "contextWindow": 128000,
+        "maxTokens": 8192,
+        "thinkingLevelMap": {"high": "default", "max": "max"},
+    }
+
+
+def test_auto_capability_detection_uses_conservative_values(client, admin_headers):
+    configure_route(client, admin_headers, model_id="auto-capable")
+
+    async def seed_metadata():
+        async with app.state.db.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(ChannelModel).where(ChannelModel.model_id == "auto-capable")
+                )
+            ).scalars().all()
+            rows[0].metadata_json = {
+                "openai_compatible": {
+                    "context_window": 128000,
+                    "max_tokens": 16000,
+                    "input_modalities": ["text", "image"],
+                    "reasoning": True,
+                }
+            }
+            rows[1].metadata_json = {
+                "openai_compatible": {
+                    "context_window": 64000,
+                    "max_tokens": 8000,
+                    "input_modalities": ["text"],
+                    "reasoning": True,
+                }
+            }
+            await session.commit()
+
+    anyio.run(seed_metadata)
+
+    response = client.post(
+        "/api/admin/v1/model-capabilities/detect/auto-capable",
+        headers=admin_headers,
+    )
+    assert response.status_code == 200, response.text
+
+    capabilities = response.json()
+    assert capabilities["source"] == "auto"
+    assert capabilities["context_window"] == 64000
+    assert capabilities["max_tokens"] == 8000
+    assert capabilities["supports_image_input"] is False
+    assert capabilities["reasoning"] is True
+
+    item = client.get("/v1/models").json()["data"][0]
+    assert item["x_local_gateway"]["pi_model_config"]["input"] == ["text"]
+    assert item["x_local_gateway"]["pi_model_config"]["contextWindow"] == 64000
+
+
+def test_capability_detection_understands_reasoning_effort_catalog_shape():
+    capabilities = extract_capabilities(
+        {
+            "supportsReasoningEffort": True,
+            "reasoningEffort": "high",
+            "reasoningEfforts": [
+                {"value": "low", "label": "Low"},
+                {"value": "medium", "label": "Medium"},
+                {"value": "high", "label": "High", "default": True},
+            ],
+        }
+    )
+
+    assert capabilities["reasoning"] is True
+    assert capabilities["thinking_level_map"] == {
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+    }
+    assert pi_model_config(capabilities) == {
+        "reasoning": True,
+        "thinkingLevelMap": {
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+        },
     }
 
 

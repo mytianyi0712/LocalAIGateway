@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_session
 from app.adapters import PROTOCOL_ENDPOINTS
+from app.services.capabilities import pi_model_config
 from app.services.catalog import (
     iso_timestamp,
     list_all_routable_models,
@@ -16,6 +17,30 @@ from app.services.proxy import gateway_access_error, proxy_request
 
 
 router = APIRouter()
+
+
+def has_capability_data(capabilities: dict) -> bool:
+    cost = capabilities.get("cost") or {}
+    return any(
+        capabilities.get(key) is not None
+        for key in ("context_window", "max_tokens", "supports_image_input", "reasoning", "thinking_level_map")
+    ) or any(cost.get(key) is not None for key in ("input", "output", "cacheRead", "cacheWrite"))
+
+
+def gateway_metadata(item: dict, protocols: list[str] | None = None) -> dict:
+    capabilities = item.get("capabilities") or {}
+    selected_protocols = protocols or item.get("protocols") or []
+    metadata = {
+        "supported_endpoints": [
+            endpoint
+            for protocol in selected_protocols
+            for endpoint in PROTOCOL_ENDPOINTS[protocol]
+        ],
+    }
+    if has_capability_data(capabilities):
+        metadata["capabilities"] = capabilities
+        metadata["pi_model_config"] = pi_model_config(capabilities)
+    return metadata
 
 
 async def aggregate_model_catalog_response(request: Request, session: AsyncSession):
@@ -31,13 +56,7 @@ async def aggregate_model_catalog_response(request: Request, session: AsyncSessi
                 "object": "model",
                 "created": unix_timestamp(item["created_at"]),
                 "owned_by": "local-ai-gateway",
-                "x_local_gateway": {
-                    "supported_endpoints": [
-                        endpoint
-                        for protocol in item["protocols"]
-                        for endpoint in PROTOCOL_ENDPOINTS[protocol]
-                    ],
-                },
+                "x_local_gateway": gateway_metadata(item),
             }
             for item in models
         ],
@@ -64,6 +83,7 @@ async def model_catalog_response(
                     "object": "model",
                     "created": unix_timestamp(item["created_at"]),
                     "owned_by": "local-ai-gateway",
+                    "x_local_gateway": gateway_metadata(item, [protocol]),
                 }
                 for item in models
             ],
@@ -75,6 +95,7 @@ async def model_catalog_response(
                 "id": item["id"],
                 "display_name": item["display_name"],
                 "created_at": iso_timestamp(item["created_at"]),
+                "x_local_gateway": gateway_metadata(item, [protocol]),
             }
             for item in models
         ]
@@ -92,6 +113,7 @@ async def model_catalog_response(
                 "version": item["id"],
                 "displayName": item["display_name"],
                 "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
+                "x_local_gateway": gateway_metadata(item, [protocol]),
             }
             for item in models
         ]

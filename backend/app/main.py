@@ -3,6 +3,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import FileResponse
@@ -63,6 +64,15 @@ class SPAStaticFiles(StaticFiles):
 
 
 app = FastAPI(title="Local AI Gateway", version="0.1.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=(
+        r"^(https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?"
+        r"|file://.*|onlyoffice://.*|ascdesktop://.*|null)$"
+    ),
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 app.include_router(admin_router)
 app.include_router(proxy_router)
 

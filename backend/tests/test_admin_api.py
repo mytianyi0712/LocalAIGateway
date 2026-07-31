@@ -27,6 +27,37 @@ def test_configuration_and_unique_priority(client, admin_headers):
     assert [item["priority"] for item in current["candidates"]] == [0, 1]
 
 
+def test_deleting_channel_removes_its_route_candidates(client, admin_headers):
+    _, configured, _ = configure_route(client, admin_headers)
+
+    response = client.delete(
+        f"/api/admin/v1/channels/{configured[0][0]['id']}", headers=admin_headers
+    )
+
+    assert response.status_code == 204, response.text
+    channels = client.get("/api/admin/v1/channels", headers=admin_headers).json()["items"]
+    assert [item["id"] for item in channels] == [configured[1][0]["id"]]
+    routes = client.get("/api/admin/v1/routes", headers=admin_headers).json()["items"]
+    assert [item["channel_model_id"] for item in routes[0]["candidates"]] == [
+        configured[1][1]["id"]
+    ]
+
+
+def test_deleting_provider_removes_channels_and_route_candidates(client, admin_headers):
+    provider, _, _ = configure_route(client, admin_headers)
+
+    response = client.delete(
+        f"/api/admin/v1/providers/{provider['id']}", headers=admin_headers
+    )
+
+    assert response.status_code == 204, response.text
+    assert client.get("/api/admin/v1/providers", headers=admin_headers).json()["items"] == []
+    assert client.get("/api/admin/v1/channels", headers=admin_headers).json()["items"] == []
+    routes = client.get("/api/admin/v1/routes", headers=admin_headers).json()["items"]
+    assert len(routes) == 1
+    assert routes[0]["candidates"] == []
+
+
 def test_api_key_never_echoes(client, admin_headers):
     provider = client.post(
         "/api/admin/v1/providers",

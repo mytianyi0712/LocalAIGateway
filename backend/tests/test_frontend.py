@@ -36,7 +36,13 @@ def test_native_frontend_assets_are_served(client):
     assert "function openRequestLog(requestId)" in script.text
     assert "dashboard-token-section" in script.text
     assert "cache-hit-section" in script.text
+    assert "data-candidate-drag-handle" in script.text
+    assert "priority, enabled: enabledInput.checked" in script.text
+    assert "列表越靠上，调度优先级越高" in script.text
+    assert "function capabilityEditorMarkup(route)" in script.text
+    assert "结果已显示在下方表单中" in script.text
     assert stylesheet.status_code == 200
     assert ".app-shell" in stylesheet.text
     assert ".token-metric" in stylesheet.text
     assert ".cache-hit-ring" in stylesheet.text
+    assert ".candidate-drag-handle" in stylesheet.text

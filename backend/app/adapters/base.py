@@ -625,6 +625,7 @@ class OpenAICompatibleAdapter(ProtocolAdapter):
             "model": model_id,
             "messages": [{"role": "user", "content": "Reply only OK"}],
             "max_tokens": 2,
+            "stream": True,
         }
         return _json_request(
             "POST",
@@ -668,7 +669,7 @@ class OpenAIResponsesAdapter(OpenAICompatibleAdapter):
     protocol = "openai_responses"
 
     def health_probe(self, base_url: str, api_key: str, model_id: str) -> httpx.Request:
-        body = {"model": model_id, "input": "Reply only OK", "max_output_tokens": 2}
+        body = {"model": model_id, "input": "Reply only OK", "max_output_tokens": 2, "stream": True}
         return _json_request(
             "POST", join_base_path(base_url, "/v1/responses"), self.discovery_headers(api_key), body
         )
@@ -726,6 +727,7 @@ class ClaudeAdapter(ProtocolAdapter):
             "model": model_id,
             "max_tokens": 2,
             "messages": [{"role": "user", "content": "Reply only OK"}],
+            "stream": True,
         }
         return _json_request(
             "POST", join_base_path(base_url, "/v1/messages"), self.discovery_headers(api_key), body
@@ -789,8 +791,9 @@ class GeminiAdapter(ProtocolAdapter):
         body = {
             "contents": [{"role": "user", "parts": [{"text": "Reply only OK"}]}],
             "generationConfig": {"maxOutputTokens": 2},
+            "stream": True,
         }
-        url = join_base_path(base_url, f"/v1beta/models/{model_id}:generateContent")
+        url = join_base_path(base_url, f"/v1beta/models/{model_id}:streamGenerateContent")
         return _json_request("POST", url, self.discovery_headers(api_key), body)
 
     def parse_models(self, payload: bytes) -> list[dict[str, Any]]:

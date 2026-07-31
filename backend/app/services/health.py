@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.adapters import get_adapter
+from app.adapters.base import StreamObserver
 from app.db.models import Channel, ChannelHealth, ChannelModel, HealthProbeLog, utcnow
 from app.services.circuit_breaker import (
     as_utc,
@@ -58,9 +59,13 @@ async def probe_channel(app, channel_id: str) -> bool:
     error_kind = None
     success = False
     try:
-        response = await app.state.http.send(request)
+        response = await app.state.http.send(request, stream=True)
         status_code = response.status_code
-        success = response.is_success and bool(response.content)
+        observer = StreamObserver()
+        async for chunk in response.aiter_bytes():
+            adapter.observe_chunk(observer, chunk)
+        adapter.finish_observer(observer)
+        success = response.is_success and (observer.saw_completion or observer.first_token_at is not None)
         if not success:
             error_kind, _ = classify_http_status(response.status_code)
     except Exception as exc:

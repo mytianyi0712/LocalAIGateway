@@ -146,6 +146,22 @@ class ModelRoute(Base, TimestampMixin):
     )
 
 
+class ModelCaps(Base, TimestampMixin):
+    __tablename__ = "model_caps"
+
+    requested_model_id: Mapped[str] = mapped_column(String, primary_key=True)
+    context_window: Mapped[int | None] = mapped_column(Integer)
+    max_tokens: Mapped[int | None] = mapped_column(Integer)
+    supports_image_input: Mapped[bool | None] = mapped_column(Boolean)
+    reasoning: Mapped[bool | None] = mapped_column(Boolean)
+    thinking_level_map: Mapped[dict | None] = mapped_column(JSON)
+    cost_input: Mapped[float | None] = mapped_column(Float)
+    cost_output: Mapped[float | None] = mapped_column(Float)
+    cost_cache_read: Mapped[float | None] = mapped_column(Float)
+    cost_cache_write: Mapped[float | None] = mapped_column(Float)
+    source: Mapped[str] = mapped_column(String, default="auto", nullable=False)
+
+
 class RouteCandidate(Base, TimestampMixin):
     __tablename__ = "route_candidates"
     __table_args__ = (

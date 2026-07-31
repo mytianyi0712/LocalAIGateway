@@ -30,6 +30,7 @@ from app.db.models import (
     ChannelProtocol,
     DiscoveryRun,
     HealthProbeLog,
+    ModelCaps,
     ModelRoute,
     Provider,
     RequestAttempt,
@@ -37,6 +38,7 @@ from app.db.models import (
     RouteCandidate,
 )
 from app.services.discovery import discover_channel_models
+from app.services.capabilities import CAPABILITY_FIELDS, caps_json, detect_model_capabilities
 from app.services.health import probe_channel
 from app.services.routing import synchronize_shared_protocol_routes
 from app.services.settings import get_access_policy, get_runtime_settings, update_runtime_settings
@@ -164,6 +166,29 @@ class RoutePatch(BaseModel):
     enabled: bool
 
 
+class ModelCapsInput(BaseModel):
+    source: Literal["auto", "manual"] = "manual"
+    context_window: int | None = Field(default=None, ge=1)
+    max_tokens: int | None = Field(default=None, ge=1)
+    supports_image_input: bool | None = None
+    reasoning: bool | None = None
+    thinking_level_map: dict[str, str | None] | None = None
+    cost_input: float | None = Field(default=None, ge=0)
+    cost_output: float | None = Field(default=None, ge=0)
+    cost_cache_read: float | None = Field(default=None, ge=0)
+    cost_cache_write: float | None = Field(default=None, ge=0)
+
+    @field_validator("thinking_level_map")
+    @classmethod
+    def validate_thinking_level_map(cls, value: dict[str, str | None] | None):
+        if value is None:
+            return None
+        allowed = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
+        if any(key not in allowed for key in value):
+            raise ValueError("Unsupported thinking level")
+        return value
+
+
 class CandidateInput(BaseModel):
     channel_model_id: str
     priority: int = Field(ge=0)
@@ -288,6 +313,35 @@ def route_bundle_json(rows: list[ModelRoute]) -> dict:
     }
 
 
+async def route_bundle_with_caps_json(session: AsyncSession, rows: list[ModelRoute]) -> dict:
+    item = route_bundle_json(rows)
+    item["capabilities"] = await get_model_caps(item["requested_model_id"], session)
+    return item
+
+
+async def get_model_caps(model_id: str, session: AsyncSession) -> dict:
+    row = await session.get(ModelCaps, model_id)
+    auto_caps = await detect_model_capabilities(session, model_id) if row is None or row.source == "auto" else None
+    return caps_json(row, auto_caps)
+
+
+async def upsert_model_caps(model_id: str, payload: ModelCapsInput, session: AsyncSession) -> dict:
+    row = await session.get(ModelCaps, model_id)
+    if row is None:
+        row = ModelCaps(requested_model_id=model_id)
+        session.add(row)
+    row.source = payload.source
+    if payload.source == "auto":
+        values = await detect_model_capabilities(session, model_id)
+    else:
+        values = payload.model_dump(exclude={"source"})
+    for key in CAPABILITY_FIELDS:
+        setattr(row, key, values.get(key))
+    await session.commit()
+    await session.refresh(row)
+    return caps_json(row)
+
+
 async def load_route_bundle(session: AsyncSession, model_id: str) -> list[ModelRoute]:
     statement = (
         select(ModelRoute)
@@ -372,17 +426,28 @@ async def patch_provider(
     return provider_json(row)
 
 
+async def delete_channels_and_candidates(session: AsyncSession, channel_ids: list[str]) -> None:
+    """Remove route bindings before database cascades remove the channel models."""
+    if not channel_ids:
+        return
+    channel_model_ids = select(ChannelModel.id).where(ChannelModel.channel_id.in_(channel_ids))
+    await session.execute(
+        delete(RouteCandidate).where(RouteCandidate.channel_model_id.in_(channel_model_ids))
+    )
+    await session.execute(delete(Channel).where(Channel.id.in_(channel_ids)))
+
+
 @router.delete("/providers/{provider_id}", status_code=204)
 async def delete_provider(provider_id: str, session: AsyncSession = Depends(get_session)):
     row = await session.get(Provider, provider_id)
     if not row:
         raise HTTPException(404, "Provider not found")
-    count = await session.scalar(
-        select(func.count()).select_from(Channel).where(Channel.provider_id == provider_id)
+    channel_ids = list(
+        (await session.execute(select(Channel.id).where(Channel.provider_id == provider_id)))
+        .scalars()
     )
-    if count:
-        raise HTTPException(409, "Delete provider channels first")
-    await session.delete(row)
+    await delete_channels_and_candidates(session, channel_ids)
+    await session.execute(delete(Provider).where(Provider.id == provider_id))
     await session.commit()
     return Response(status_code=204)
 
@@ -606,15 +671,7 @@ async def delete_channel(channel_id: str, session: AsyncSession = Depends(get_se
     row = await session.get(Channel, channel_id)
     if not row:
         raise HTTPException(404, "Channel not found")
-    count = await session.scalar(
-        select(func.count())
-        .select_from(RouteCandidate)
-        .join(ChannelModel)
-        .where(ChannelModel.channel_id == channel_id)
-    )
-    if count:
-        raise HTTPException(409, "Remove route candidates before deleting channel")
-    await session.delete(row)
+    await delete_channels_and_candidates(session, [channel_id])
     await session.commit()
     return Response(status_code=204)
 
@@ -841,8 +898,9 @@ async def list_routes(session: AsyncSession = Depends(get_session)):
         .all()
     )
     bundles = [await load_route_bundle(session, model_id) for model_id in model_ids]
+    items = [await route_bundle_with_caps_json(session, rows) for rows in bundles if rows]
     return {
-        "items": [route_bundle_json(rows) for rows in bundles if rows],
+        "items": items,
         "total": len(bundles),
         "page": 1,
         "page_size": len(bundles),
@@ -901,7 +959,37 @@ async def create_route(payload: RouteInput, session: AsyncSession = Depends(get_
         await session.rollback()
         raise HTTPException(409, "Route already exists") from exc
     rows = await load_route_bundle(session, payload.requested_model_id)
-    return route_bundle_json(rows)
+    return await route_bundle_with_caps_json(session, rows)
+
+
+@router.get("/model-capabilities/{model_id:path}")
+async def read_model_capabilities(model_id: str, session: AsyncSession = Depends(get_session)):
+    return await get_model_caps(model_id, session)
+
+
+@router.put("/model-capabilities/{model_id:path}")
+async def replace_model_capabilities(
+    model_id: str, payload: ModelCapsInput, session: AsyncSession = Depends(get_session)
+):
+    exists = await session.scalar(
+        select(func.count()).select_from(ModelRoute).where(ModelRoute.requested_model_id == model_id)
+    )
+    if not exists:
+        raise HTTPException(404, "Route not found")
+    return await upsert_model_caps(model_id, payload, session)
+
+
+@router.post("/model-capabilities/detect/{model_id:path}")
+async def detect_model_capabilities_endpoint(
+    model_id: str, session: AsyncSession = Depends(get_session)
+):
+    exists = await session.scalar(
+        select(func.count()).select_from(ModelRoute).where(ModelRoute.requested_model_id == model_id)
+    )
+    if not exists:
+        raise HTTPException(404, "Route not found")
+    payload = ModelCapsInput(source="auto")
+    return await upsert_model_caps(model_id, payload, session)
 
 
 @router.patch("/routes/{route_id}")
@@ -978,7 +1066,7 @@ async def replace_candidates(
             session.add(RouteCandidate(route_id=sibling.id, **item.model_dump()))
     await session.commit()
     rows = await load_route_bundle(session, route.requested_model_id)
-    return route_bundle_json(rows)
+    return await route_bundle_with_caps_json(session, rows)
 
 
 @router.delete("/routes/{route_id}", status_code=204)

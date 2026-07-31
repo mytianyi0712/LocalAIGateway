@@ -11,6 +11,7 @@ from app.db.models import (
     ModelRoute,
     RouteCandidate,
 )
+from app.services.capabilities import get_or_detect_caps
 
 
 async def list_routable_models(session: AsyncSession, protocol: str) -> list[dict]:
@@ -39,14 +40,17 @@ async def list_routable_models(session: AsyncSession, protocol: str) -> list[dic
         .order_by(ModelRoute.requested_model_id)
     )
     rows = (await session.execute(statement)).all()
-    return [
-        {
-            "id": model_id,
-            "display_name": display_name or model_id,
-            "created_at": created_at,
-        }
-        for model_id, created_at, display_name in rows
-    ]
+    result = []
+    for model_id, created_at, display_name in rows:
+        result.append(
+            {
+                "id": model_id,
+                "display_name": display_name or model_id,
+                "created_at": created_at,
+                "capabilities": await get_or_detect_caps(session, model_id),
+            }
+        )
+    return result
 
 
 async def list_all_routable_models(session: AsyncSession) -> list[dict]:

@@ -612,7 +612,14 @@ def test_due_open_channel_is_probed_and_recovers(client, admin_headers):
 
     with respx.mock(assert_all_called=False) as mock:
         probe = mock.post("https://upstream.test/v1/chat/completions").mock(
-            return_value=httpx.Response(200, content=b'{"choices":[{"message":{"content":"OK"}}]}')
+            return_value=httpx.Response(
+                200,
+                stream=ChunkStream(
+                    [b'data: {"choices":[{"message":{"content":"OK"}}]}\n\n',
+                     b'data: [DONE]\n\n'],
+                ),
+                headers={"content-type": "text/event-stream"},
+            )
         )
         client.portal.call(client.app.state.health_supervisor._probe_due_channels)
         assert probe.call_count == 1
@@ -643,7 +650,14 @@ def test_health_probe_uses_selected_or_first_channel_model(client, admin_headers
 
     with respx.mock(assert_all_called=False) as mock:
         probe = mock.post("https://upstream.test/v1/chat/completions").mock(
-            return_value=httpx.Response(200, content=b'{"choices":[{"message":{"content":"OK"}}]}')
+            return_value=httpx.Response(
+                200,
+                stream=ChunkStream(
+                    [b'data: {"choices":[{"message":{"content":"OK"}}]}\n\n',
+                     b'data: [DONE]\n\n'],
+                ),
+                headers={"content-type": "text/event-stream"},
+            )
         )
         assert client.portal.call(probe_channel, client.app, channel_id) is True
     assert json.loads(probe.calls[0].request.content)["model"] == "z-selected"
@@ -657,7 +671,14 @@ def test_health_probe_uses_selected_or_first_channel_model(client, admin_headers
 
     with respx.mock(assert_all_called=False) as mock:
         probe = mock.post("https://upstream.test/v1/chat/completions").mock(
-            return_value=httpx.Response(200, content=b'{"choices":[{"message":{"content":"OK"}}]}')
+            return_value=httpx.Response(
+                200,
+                stream=ChunkStream(
+                    [b'data: {"choices":[{"message":{"content":"OK"}}]}\n\n',
+                     b'data: [DONE]\n\n'],
+                ),
+                headers={"content-type": "text/event-stream"},
+            )
         )
         assert client.portal.call(probe_channel, client.app, channel_id) is True
     assert json.loads(probe.calls[0].request.content)["model"] == "a-first"

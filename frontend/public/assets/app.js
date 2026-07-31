@@ -602,7 +602,7 @@ function showModels(channelId) {
 
 async function deleteProvider(providerId) {
   const provider = state.providers.find((item) => item.id === providerId);
-  if (!await confirmAction({ title: '删除供应商', message: `删除供应商“${provider?.name || ''}”？需要先删除其所有渠道。`, confirmLabel: '删除', danger: true })) return;
+  if (!await confirmAction({ title: '删除供应商', message: `删除供应商“${provider?.name || ''}”？其全部渠道及相关路由候选项将一并删除。`, confirmLabel: '删除', danger: true })) return;
   await remove(`/providers/${providerId}`);
   toast('供应商已删除');
   renderPage();
@@ -610,7 +610,7 @@ async function deleteProvider(providerId) {
 
 async function deleteChannel(channelId) {
   const channel = state.channels.find((item) => item.id === channelId);
-  if (!await confirmAction({ title: '删除渠道', message: `删除渠道“${channel?.name || ''}”？`, confirmLabel: '删除', danger: true })) return;
+  if (!await confirmAction({ title: '删除渠道', message: `删除渠道“${channel?.name || ''}”？该渠道的模型和相关路由候选项将一并删除。`, confirmLabel: '删除', danger: true })) return;
   await remove(`/channels/${channelId}`);
   toast('渠道已删除');
   renderPage();
@@ -633,17 +633,29 @@ async function loadRoutes(version) {
   elements.page.innerHTML = renderRoutesPage();
 }
 
+function capabilitySummary(caps = {}) {
+  const parts = [];
+  if (caps.context_window) parts.push(`上下文 ${number(caps.context_window)}`);
+  if (caps.max_tokens) parts.push(`输出 ${number(caps.max_tokens)}`);
+  if (caps.supports_image_input === true) parts.push('图像');
+  if (caps.supports_image_input === false) parts.push('仅文本');
+  if (caps.reasoning === true) parts.push('思考');
+  if (caps.reasoning === false) parts.push('无思考');
+  return `<div class="capability-summary"><span class="capability-source">${caps.source === 'manual' ? '手动' : '自动'}</span>${parts.length ? parts.map((item) => `<span>${escapeHtml(item)}</span>`).join('') : '<span class="subtle-text">未识别</span>'}</div>`;
+}
+
 function renderRoutesPage() {
   const options = routeOptions();
   const rows = state.routes.map((route) => `<tr>
     <td><span class="mono">${escapeHtml(route.requested_model_id)}</span></td>
     <td>${protocols(route.protocols)}</td>
+    <td>${capabilitySummary(route.capabilities || {})}</td>
     <td><div class="route-chain">${route.candidates.length ? route.candidates.map((candidate) => `<span class="route-candidate ${candidate.health_state === 'open' || candidate.manual_enabled === false ? 'is-open' : ''}"><b>P${number(candidate.priority)}</b>${escapeHtml(candidate.channel_name)}</span>`).join('') : '<span class="subtle-text">未配置候选渠道</span>'}</div></td>
-    <td class="action-cell"><div class="table-actions">${iconButton({ action: 'edit-candidates', iconName: 'pencil', label: '编辑候选', attrs: `data-route-id="${escapeAttr(route.id)}"` })}${iconButton({ action: 'delete-route', iconName: 'trash-2', label: '删除路由', danger: true, attrs: `data-route-id="${escapeAttr(route.id)}"` })}</div></td>
+    <td class="action-cell"><div class="table-actions">${iconButton({ action: 'edit-caps', iconName: 'settings', label: '配置能力', attrs: `data-route-id="${escapeAttr(route.id)}"` })}${iconButton({ action: 'edit-candidates', iconName: 'pencil', label: '编辑候选', attrs: `data-route-id="${escapeAttr(route.id)}"` })}${iconButton({ action: 'delete-route', iconName: 'trash-2', label: '删除路由', danger: true, attrs: `data-route-id="${escapeAttr(route.id)}"` })}</div></td>
   </tr>`).join('');
   return `<div class="page-stack">
     ${toolbar('模型候选优先级', '一个模型路由包含跨格式共享的候选顺序', `${button({ action: 'refresh-routes', label: '刷新', iconName: 'refresh-cw' })}${button({ action: 'open-route', label: '添加路由', iconName: 'plus', primary: true, disabled: !options.length })}`)}
-    ${panel('路由表', '优先级 0 最高', `<div class="section-body-flush">${state.routes.length ? `<div class="table-scroll"><table class="data-table routes-table"><thead><tr><th>请求模型</th><th>请求格式</th><th>候选顺序</th><th class="action-cell">操作</th></tr></thead><tbody>${rows}</tbody></table></div>` : emptyState('尚未创建模型路由', options.length ? '选择一个已探测模型，为它创建统一的路由入口。' : '请先在供应商与渠道页面探测可用模型。', 'route')}</div>`) }
+    ${panel('路由表', '优先级 0 最高', `<div class="section-body-flush">${state.routes.length ? `<div class="table-scroll"><table class="data-table routes-table"><thead><tr><th>请求模型</th><th>请求格式</th><th>能力</th><th>候选顺序</th><th class="action-cell">操作</th></tr></thead><tbody>${rows}</tbody></table></div>` : emptyState('尚未创建模型路由', options.length ? '选择一个已探测模型，为它创建统一的路由入口。' : '请先在供应商与渠道页面探测可用模型。', 'route')}</div>`) }
   </div>`;
 }
 
@@ -667,6 +679,94 @@ async function saveRoute(form) {
   openCandidates(created.id);
 }
 
+function capabilityEditorMarkup(route) {
+  const caps = route.capabilities || {};
+  const cost = caps.cost || {};
+  const boolOption = (value, selected, label) => `<option value="${value}" ${selected ? 'selected' : ''}>${label}</option>`;
+  const boolSelect = (name, value) => `<select class="select" name="${name}">
+    ${boolOption('', value == null, '自动 / 未知')}
+    ${boolOption('true', value === true, '支持')}
+    ${boolOption('false', value === false, '不支持')}
+  </select>`;
+  const thinkingLevelMap = caps.thinking_level_map ? JSON.stringify(caps.thinking_level_map, null, 2) : '';
+  const body = `<form class="form-stack" id="caps-form" data-form="caps">
+    <section class="drawer-section"><h3>来源</h3><div class="field"><label for="caps-source">能力来源</label><select class="select" id="caps-source" name="source"><option value="auto" ${caps.source !== 'manual' ? 'selected' : ''}>自动从上游聚合</option><option value="manual" ${caps.source === 'manual' ? 'selected' : ''}>手动配置</option></select></div></section>
+    <section class="drawer-section"><h3>上下文与输出</h3><div class="form-grid is-two"><div class="field"><label for="caps-context">上下文 Token</label><input class="number-input" id="caps-context" name="context_window" type="number" min="1" step="1" value="${caps.context_window || ''}" placeholder="自动"></div><div class="field"><label for="caps-max-tokens">最大输出 Token</label><input class="number-input" id="caps-max-tokens" name="max_tokens" type="number" min="1" step="1" value="${caps.max_tokens || ''}" placeholder="自动"></div></div></section>
+    <section class="drawer-section"><h3>输入与思考</h3><div class="form-grid is-two"><div class="field"><label>图像输入</label>${boolSelect('supports_image_input', caps.supports_image_input)}</div><div class="field"><label>思考能力</label>${boolSelect('reasoning', caps.reasoning)}</div></div><div class="field"><label for="caps-thinking-map">thinkingLevelMap JSON</label><textarea class="textarea" id="caps-thinking-map" name="thinking_level_map" rows="5" placeholder='{"high":"default","max":"max"}'>${escapeHtml(thinkingLevelMap)}</textarea></div></section>
+    <section class="drawer-section"><h3>成本（每百万 Token）</h3><div class="form-grid is-two"><div class="field"><label>输入</label><input class="number-input" name="cost_input" type="number" min="0" step="0.000001" value="${cost.input ?? ''}" placeholder="0"></div><div class="field"><label>输出</label><input class="number-input" name="cost_output" type="number" min="0" step="0.000001" value="${cost.output ?? ''}" placeholder="0"></div><div class="field"><label>缓存读取</label><input class="number-input" name="cost_cache_read" type="number" min="0" step="0.000001" value="${cost.cacheRead ?? ''}" placeholder="0"></div><div class="field"><label>缓存写入</label><input class="number-input" name="cost_cache_write" type="number" min="0" step="0.000001" value="${cost.cacheWrite ?? ''}" placeholder="0"></div></div></section>
+  </form>`;
+  const footer = `${button({ action: 'detect-caps', label: '重新自动探测', iconName: 'refresh-cw' })}${button({ action: 'close-drawer', label: '取消' })}${button({ action: 'save-caps', label: '保存能力', iconName: 'check', primary: true })}`;
+  return { body, footer };
+}
+
+function openCapabilityEditor(routeId) {
+  const route = state.routes.find((item) => item.id === routeId);
+  if (!route) return;
+  state.drawerRoute = route;
+  openDrawer({
+    title: route.requested_model_id,
+    subtitle: '模型能力会写入 model catalog 的 x_local_gateway.pi_model_config',
+    ...capabilityEditorMarkup(route),
+  });
+}
+
+function formNumberOrNull(values, name) {
+  const value = values.get(name);
+  return value === null || String(value).trim() === '' ? null : Number(value);
+}
+
+function formBoolOrNull(values, name) {
+  const value = values.get(name);
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  return null;
+}
+
+async function saveCapabilities(form) {
+  const route = state.drawerRoute;
+  if (!route) return;
+  const values = new FormData(form);
+  const rawMap = String(values.get('thinking_level_map') || '').trim();
+  let thinkingLevelMap = null;
+  if (rawMap) {
+    try {
+      thinkingLevelMap = JSON.parse(rawMap);
+    } catch {
+      throw new Error('thinkingLevelMap 必须是有效 JSON');
+    }
+  }
+  const payload = {
+    source: values.get('source') || 'manual',
+    context_window: formNumberOrNull(values, 'context_window'),
+    max_tokens: formNumberOrNull(values, 'max_tokens'),
+    supports_image_input: formBoolOrNull(values, 'supports_image_input'),
+    reasoning: formBoolOrNull(values, 'reasoning'),
+    thinking_level_map: thinkingLevelMap,
+    cost_input: formNumberOrNull(values, 'cost_input'),
+    cost_output: formNumberOrNull(values, 'cost_output'),
+    cost_cache_read: formNumberOrNull(values, 'cost_cache_read'),
+    cost_cache_write: formNumberOrNull(values, 'cost_cache_write'),
+  };
+  await put(`/model-capabilities/${encodeURIComponent(route.requested_model_id)}`, payload);
+  closeDrawer();
+  toast('模型能力已保存');
+  await loadRoutes(state.renderVersion);
+}
+
+async function detectCapabilities() {
+  const route = state.drawerRoute;
+  if (!route) return;
+  const capabilities = await post(`/model-capabilities/detect/${encodeURIComponent(route.requested_model_id)}`);
+  route.capabilities = capabilities;
+  openDrawer({
+    title: route.requested_model_id,
+    subtitle: '模型能力会写入 model catalog 的 x_local_gateway.pi_model_config',
+    ...capabilityEditorMarkup(route),
+  });
+  toast('已重新聚合上游能力，结果已显示在下方表单中');
+  await loadRoutes(state.renderVersion);
+}
+
 function openCandidates(routeId) {
   const route = state.routes.find((item) => item.id === routeId);
   if (!route) return;
@@ -674,20 +774,27 @@ function openCandidates(routeId) {
   const current = new Map(route.candidates.map((candidate) => [candidate.channel_model_id, candidate]));
   const candidates = state.channelModels
     .filter((model) => model.available && model.model_id === route.requested_model_id)
-    .sort((a, b) => (a.channel_name || '').localeCompare(b.channel_name || ''))
-    .map((model, index) => ({ ...model, existing: current.get(model.id), priority: current.get(model.id)?.priority ?? index }));
+    .map((model) => ({ ...model, existing: current.get(model.id) }))
+    .sort((a, b) => {
+      if (a.existing && b.existing) return a.existing.priority - b.existing.priority;
+      if (a.existing) return -1;
+      if (b.existing) return 1;
+      return (a.channel_name || '').localeCompare(b.channel_name || '');
+    });
+  let visiblePriority = 1;
   const rows = candidates.map((candidate) => {
     const selected = Boolean(candidate.existing);
-    return `<div class="candidate-row">
+    return `<div class="candidate-row ${selected ? 'is-selected' : ''}" data-candidate-row data-model-id="${escapeAttr(candidate.id)}">
+      <button class="candidate-drag-handle" type="button" data-candidate-drag-handle data-model-id="${escapeAttr(candidate.id)}" aria-label="调整 ${escapeAttr(candidate.channel_name)} 的顺序" title="拖动调整顺序；可用上下方向键移动" ${selected ? 'draggable="true"' : 'disabled'}>${icon('grip-vertical')}</button>
+      <span class="candidate-order" data-candidate-order>${selected ? number(visiblePriority++) : '-'}</span>
       <label class="checkbox-row"><input type="checkbox" data-candidate-selected data-model-id="${escapeAttr(candidate.id)}" ${selected ? 'checked' : ''}><span><strong>${escapeHtml(candidate.channel_name)}</strong><small class="subtle-text">${escapeHtml((candidate.protocols || [candidate.protocol]).join(' / '))}</small></span></label>
-      <input class="number-input" type="number" min="0" step="1" value="${number(candidate.priority)}" aria-label="${escapeAttr(candidate.channel_name)} 优先级" data-candidate-priority data-model-id="${escapeAttr(candidate.id)}" ${selected ? '' : 'disabled'}>
       <input class="switch-control" type="checkbox" aria-label="启用 ${escapeAttr(candidate.channel_name)}" data-candidate-enabled data-model-id="${escapeAttr(candidate.id)}" ${candidate.existing?.enabled !== false ? 'checked' : ''} ${selected ? '' : 'disabled'}>
     </div>`;
   }).join('');
   openDrawer({
     title: route.requested_model_id,
-    subtitle: '配置候选渠道与唯一优先级',
-    body: `<section class="drawer-section"><h3>候选渠道</h3>${rows || emptyState('没有可用候选渠道', '当前模型没有可用的上游渠道。', 'route')}</section>`,
+    subtitle: '列表越靠上，调度优先级越高',
+    body: `<section class="drawer-section"><h3>候选渠道</h3><div class="candidate-list" data-candidate-list>${rows || emptyState('没有可用候选渠道', '当前模型没有可用的上游渠道。', 'route')}</div></section>`,
     footer: `${button({ action: 'close-drawer', label: '取消' })}${button({ action: 'save-candidates', label: '保存顺序', iconName: 'check', primary: true })}`,
   });
 }
@@ -695,19 +802,41 @@ function openCandidates(routeId) {
 async function saveCandidates() {
   const route = state.drawerRoute;
   if (!route) return;
-  const selected = [...elements.drawerBody.querySelectorAll('[data-candidate-selected]:checked')];
-  const candidates = selected.map((checkbox) => {
-    const modelId = checkbox.dataset.modelId;
-    const priorityInput = elements.drawerBody.querySelector(`[data-candidate-priority][data-model-id="${CSS.escape(modelId)}"]`);
-    const enabledInput = elements.drawerBody.querySelector(`[data-candidate-enabled][data-model-id="${CSS.escape(modelId)}"]`);
-    return { channel_model_id: modelId, priority: Number(priorityInput.value), enabled: enabledInput.checked };
+  const candidates = [...elements.drawerBody.querySelectorAll('[data-candidate-row]')]
+    .filter((row) => row.querySelector('[data-candidate-selected]').checked)
+    .map((row, priority) => {
+      const modelId = row.dataset.modelId;
+      const enabledInput = row.querySelector('[data-candidate-enabled]');
+      return { channel_model_id: modelId, priority, enabled: enabledInput.checked };
   });
-  if (candidates.some((candidate) => !Number.isInteger(candidate.priority) || candidate.priority < 0)) throw new Error('优先级必须是非负整数');
-  if (new Set(candidates.map((candidate) => candidate.priority)).size !== candidates.length) throw new Error('同一路由的优先级不能重复');
   await put(`/routes/${route.id}/candidates`, { candidates });
   closeDrawer();
   toast('候选顺序已保存');
   await loadRoutes(state.renderVersion);
+}
+
+function updateCandidateOrder() {
+  let priority = 1;
+  for (const row of elements.drawerBody.querySelectorAll('[data-candidate-row]')) {
+    const selected = row.querySelector('[data-candidate-selected]').checked;
+    row.classList.toggle('is-selected', selected);
+    row.querySelector('[data-candidate-enabled]').disabled = !selected;
+    const dragHandle = row.querySelector('[data-candidate-drag-handle]');
+    dragHandle.disabled = !selected;
+    dragHandle.draggable = selected;
+    row.querySelector('[data-candidate-order]').textContent = selected ? String(priority++) : '-';
+  }
+}
+
+function moveCandidateRow(row, direction) {
+  const rows = [...elements.drawerBody.querySelectorAll('[data-candidate-row]')]
+    .filter((item) => item.querySelector('[data-candidate-selected]').checked);
+  const index = rows.indexOf(row);
+  const destination = rows[index + direction];
+  if (!destination) return;
+  if (direction < 0) destination.before(row);
+  else destination.after(row);
+  updateCandidateOrder();
 }
 
 async function deleteRoute(routeId) {
@@ -910,8 +1039,11 @@ async function handleAction(target) {
     if (action === 'delete-channel') return deleteChannel(target.dataset.channelId);
     if (action === 'refresh-routes') return renderPage();
     if (action === 'open-route') return routeForm();
+    if (action === 'edit-caps') return openCapabilityEditor(target.dataset.routeId);
     if (action === 'edit-candidates') return openCandidates(target.dataset.routeId);
     if (action === 'save-candidates') return saveCandidates();
+    if (action === 'save-caps') return document.getElementById('caps-form')?.requestSubmit();
+    if (action === 'detect-caps') return detectCapabilities();
     if (action === 'delete-route') return deleteRoute(target.dataset.routeId);
     if (action === 'refresh-logs') return loadLogs(state.renderVersion);
     if (action === 'logs-prev') { state.logs.page -= 1; return loadLogs(state.renderVersion); }
@@ -939,6 +1071,7 @@ async function handleSubmit(event) {
     if (form.dataset.form === 'provider') await saveProvider(form);
     else if (form.dataset.form === 'channel') await saveChannel(form);
     else if (form.dataset.form === 'route') await saveRoute(form);
+    else if (form.dataset.form === 'caps') await saveCapabilities(form);
     else if (form.dataset.form === 'auth') await saveAuth(form);
     else if (form.dataset.form === 'settings') await saveSettings(form);
     else if (form.dataset.form === 'logs-filter') await submitLogFilter(form);
@@ -952,8 +1085,8 @@ function handleChange(event) {
   if (target.matches('[data-channel-toggle]')) toggleChannel(target.dataset.channelId, target.checked);
   if (target.matches('[data-candidate-selected]')) {
     const row = target.closest('.candidate-row');
-    row.querySelector('[data-candidate-priority]').disabled = !target.checked;
-    row.querySelector('[data-candidate-enabled]').disabled = !target.checked;
+    if (target.checked) elements.drawerBody.querySelector('[data-candidate-list]').append(row);
+    updateCandidateOrder();
   }
   if (target.matches('[data-trust-toggle]')) {
     const keyArea = document.getElementById('access-keys');
@@ -977,6 +1110,12 @@ document.addEventListener('click', (event) => {
   if (target && !target.disabled) handleAction(target);
 });
 document.addEventListener('keydown', (event) => {
+  const dragHandle = event.target.closest('[data-candidate-drag-handle]');
+  if (dragHandle && ['ArrowUp', 'ArrowDown'].includes(event.key)) {
+    event.preventDefault();
+    moveCandidateRow(dragHandle.closest('[data-candidate-row]'), event.key === 'ArrowUp' ? -1 : 1);
+    return;
+  }
   const logRow = event.target.closest('[data-log-request-id]');
   if (!logRow || !['Enter', ' '].includes(event.key)) return;
   event.preventDefault();
@@ -984,6 +1123,31 @@ document.addEventListener('keydown', (event) => {
 });
 document.addEventListener('submit', handleSubmit);
 document.addEventListener('change', handleChange);
+document.addEventListener('dragstart', (event) => {
+  const dragHandle = event.target.closest('[data-candidate-drag-handle]');
+  if (!dragHandle || dragHandle.disabled) return;
+  const row = dragHandle.closest('[data-candidate-row]');
+  row.classList.add('is-dragging');
+  event.dataTransfer.effectAllowed = 'move';
+  event.dataTransfer.setData('text/plain', row.dataset.modelId);
+});
+document.addEventListener('dragover', (event) => {
+  const list = event.target.closest('[data-candidate-list]');
+  const target = event.target.closest('[data-candidate-row]');
+  const dragging = elements.drawerBody.querySelector('.candidate-row.is-dragging');
+  if (!list || !target || !dragging || target === dragging) return;
+  event.preventDefault();
+  const insertAfter = event.clientY > target.getBoundingClientRect().top + target.offsetHeight / 2;
+  if (insertAfter) target.after(dragging);
+  else target.before(dragging);
+  updateCandidateOrder();
+});
+document.addEventListener('dragend', () => {
+  const dragging = elements.drawerBody.querySelector('.candidate-row.is-dragging');
+  if (!dragging) return;
+  dragging.classList.remove('is-dragging');
+  updateCandidateOrder();
+});
 window.addEventListener('popstate', renderPage);
 elements.modal.addEventListener('cancel', () => {
   if (state.confirmResolve) resolveConfirmation(false);
