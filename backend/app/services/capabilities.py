@@ -4,7 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.db.models import Channel, ChannelModel, ModelCaps, ModelRoute, RouteCandidate
+from app.db.models import CapabilityProfile, Channel, ChannelModel, ModelCaps, ModelRoute, RouteCandidate
 
 
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
@@ -18,6 +18,14 @@ CAPABILITY_FIELDS = (
     "cost_output",
     "cost_cache_read",
     "cost_cache_write",
+)
+# 能力档案只收集功能能力字段（不含成本）：成本属于定价，随模型而异。
+PROFILE_FIELDS = (
+    "context_window",
+    "max_tokens",
+    "supports_image_input",
+    "reasoning",
+    "thinking_level_map",
 )
 
 
@@ -288,7 +296,11 @@ async def detect_model_capabilities(session: AsyncSession, requested_model_id: s
     return aggregate_capabilities(detected)
 
 
-def caps_json(row: ModelCaps | None, auto_caps: dict[str, Any] | None = None) -> dict[str, Any]:
+def caps_json(
+    row: ModelCaps | None,
+    auto_caps: dict[str, Any] | None = None,
+    profile_name: str | None = None,
+) -> dict[str, Any]:
     stored_values = {key: getattr(row, key) for key in CAPABILITY_FIELDS} if row else {}
     if row is None:
         values = {key: (auto_caps or {}).get(key) for key in CAPABILITY_FIELDS}
@@ -298,6 +310,8 @@ def caps_json(row: ModelCaps | None, auto_caps: dict[str, Any] | None = None) ->
         values = stored_values
     return {
         "source": row.source if row else "auto",
+        "profile_id": row.profile_id if row else None,
+        "profile_name": profile_name,
         "context_window": values.get("context_window"),
         "max_tokens": values.get("max_tokens"),
         "supports_image_input": values.get("supports_image_input"),
@@ -344,4 +358,8 @@ async def get_or_detect_caps(session: AsyncSession, requested_model_id: str) -> 
     auto_caps = None
     if row is None or row.source == "auto":
         auto_caps = await detect_model_capabilities(session, requested_model_id)
-    return caps_json(row, auto_caps)
+    profile_name = None
+    if row is not None and row.profile_id:
+        profile = await session.get(CapabilityProfile, row.profile_id)
+        profile_name = profile.name if profile else None
+    return caps_json(row, auto_caps, profile_name=profile_name)

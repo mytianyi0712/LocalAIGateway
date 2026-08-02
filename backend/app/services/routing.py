@@ -153,3 +153,4 @@ async def resolve_candidates(
         )
         for candidate, channel_model, channel, provider in rows
     ]
+

@@ -1,6 +1,6 @@
 from collections.abc import AsyncIterator
 
-from sqlalchemy import event, select
+from sqlalchemy import event, inspect, select, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -35,7 +35,24 @@ class Database:
     async def initialize(self) -> None:
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+        await self._ensure_schema_columns()
         await self._backfill_protocol_bindings()
+
+    async def _ensure_schema_columns(self) -> None:
+        # create_all 不会给已存在的表补列；对旧库做幂等 ALTER。
+        async with self.engine.begin() as connection:
+            columns = await connection.run_sync(
+                lambda sync_conn: {
+                    column["name"] for column in inspect(sync_conn).get_columns("model_caps")
+                }
+            )
+            if "profile_id" not in columns:
+                await connection.execute(
+                    text(
+                        "ALTER TABLE model_caps ADD COLUMN profile_id VARCHAR "
+                        "REFERENCES capability_profiles(id) ON DELETE SET NULL"
+                    )
+                )
 
     async def _backfill_protocol_bindings(self) -> None:
         async with self.sessions() as session:

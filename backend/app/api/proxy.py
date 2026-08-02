@@ -10,10 +10,17 @@ from app.services.capabilities import pi_model_config
 from app.services.catalog import (
     iso_timestamp,
     list_all_routable_models,
+    list_claude_mapping_models,
+    list_codex_mapping_models,
     list_routable_models,
     unix_timestamp,
 )
-from app.services.proxy import gateway_access_error, proxy_request
+from app.services.proxy import (
+    gateway_access_error,
+    proxy_codex_entry,
+    proxy_mapped_entry,
+    proxy_request,
+)
 
 
 router = APIRouter()
@@ -37,6 +44,9 @@ def gateway_metadata(item: dict, protocols: list[str] | None = None) -> dict:
             for endpoint in PROTOCOL_ENDPOINTS[protocol]
         ],
     }
+    item_gateway = item.get("x_local_gateway")
+    if isinstance(item_gateway, dict) and item_gateway.get("mapping"):
+        metadata["mapping"] = item_gateway["mapping"]
     if has_capability_data(capabilities):
         metadata["capabilities"] = capabilities
         metadata["pi_model_config"] = pi_model_config(capabilities)
@@ -181,6 +191,90 @@ async def openai_responses_proxy(request: Request):
 @router.post("/v1/messages")
 async def claude_proxy(request: Request):
     return await proxy_request(request, "claude")
+
+
+@router.get("/claudecode")
+async def claudecode_info(request: Request):
+    access_error = await gateway_access_error(request, "claude")
+    if access_error:
+        return access_error
+    return {
+        "name": "Local AI Gateway Claude model mapping",
+        "base_url": "/claudecode",
+        "endpoints": [
+            "GET /claudecode/v1/models",
+            "GET /claudecode/v1/messages/models",
+            "POST /claudecode/v1/messages",
+        ],
+        "configure": {
+            "ANTHROPIC_BASE_URL": "http://<host>:3000/claudecode",
+            "ANTHROPIC_API_KEY": "<any value>",
+            "ANTHROPIC_MODEL": "<mapped model id, e.g. claude-opus-5>",
+        },
+    }
+
+
+@router.get("/claudecode/v1/models")
+@router.get("/claudecode/v1/messages/models")
+async def claudecode_models(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+):
+    access_error = await gateway_access_error(request, "claude")
+    if access_error:
+        return access_error
+    models = await list_claude_mapping_models(session)
+    return await model_catalog_response(request, session, "claude", models)
+
+
+@router.post("/claudecode/v1/messages")
+async def claudecode_messages(request: Request):
+    return await proxy_mapped_entry(request)
+
+
+@router.get("/codex")
+async def codex_info(request: Request):
+    access_error = await gateway_access_error(request, "openai_responses")
+    if access_error:
+        return access_error
+    # Codex CLI appends `/responses` and `/models` to the configured base URL,
+    # so the base must include the `/v1` prefix (like https://api.openai.com/v1).
+    # The canonical way to point Codex at a proxy is `openai_base_url` (or a
+    # custom `[model_providers.<id>]` entry) in `~/.codex/config.toml`.
+    return {
+        "name": "Local AI Gateway Codex model mapping",
+        "base_url": "/codex/v1",
+        "endpoints": [
+            "GET /codex/v1/models",
+            "GET /codex/v1/responses/models",
+            "POST /codex/v1/responses",
+        ],
+        "configure": {
+            "config_toml": {
+                "openai_base_url": "http://<host>:3000/codex/v1",
+                "model": "<mapped model id, e.g. gpt-5-codex>",
+            },
+            "OPENAI_API_KEY": "<any value>",
+        },
+    }
+
+
+@router.get("/codex/v1/models")
+@router.get("/codex/v1/responses/models")
+async def codex_models(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+):
+    access_error = await gateway_access_error(request, "openai_responses")
+    if access_error:
+        return access_error
+    models = await list_codex_mapping_models(session)
+    return await model_catalog_response(request, session, "openai_responses", models)
+
+
+@router.post("/codex/v1/responses")
+async def codex_responses(request: Request):
+    return await proxy_codex_entry(request)
 
 
 @router.post("/v1beta/models/{model_action:path}")

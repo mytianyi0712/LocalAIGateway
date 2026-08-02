@@ -51,15 +51,43 @@ async def lifespan(app: FastAPI):
 
 
 class SPAStaticFiles(StaticFiles):
+    def _is_api_request(self, path: str) -> bool:
+        # 管理/代理 API 路径必须返回真实错误，不能被 SPA 回退吞掉：
+        # 否则旧后端进程（缺路由）会返回 200 + index.html，前端把 HTML
+        # 当 JSON 解析后报出 “Cannot read properties of null” 这类误导性错误。
+        return (
+            path == "api"
+            or path.startswith("api/")
+            or path == "v1"
+            or path.startswith("v1/")
+            or path == "v1beta"
+            or path.startswith("v1beta/")
+            or path == "claudecode"
+            or path.startswith("claudecode/")
+            or path == "codex"
+            or path.startswith("codex/")
+        )
+
     async def get_response(self, path: str, scope):
         try:
             response = await super().get_response(path, scope)
         except StarletteHTTPException as exc:
-            if exc.status_code == 404 and "." not in Path(path).name:
+            if (
+                exc.status_code == 404
+                and not self._is_api_request(path)
+                and "." not in Path(path).name
+            ):
                 return FileResponse(Path(self.directory) / "index.html")
             raise
-        if response.status_code == 404 and "." not in Path(path).name:
+        if (
+            response.status_code == 404
+            and not self._is_api_request(path)
+            and "." not in Path(path).name
+        ):
             return FileResponse(Path(self.directory) / "index.html")
+        # 前端为原生静态文件且经常更新：禁止缓存，确保浏览器总是拿到最新版本。
+        if path.startswith("assets/") or path == "assets/app.js":
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         return response
 
 

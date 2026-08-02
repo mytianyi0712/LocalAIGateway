@@ -12,6 +12,21 @@ def test_spa_history_route_returns_frontend(client):
     assert "<title>Local AI Gateway</title>" in response.text
 
 
+def test_api_paths_are_not_swallowed_by_spa_fallback(client):
+    """旧后端缺路由时，/api、/v1 等路径必须返回真实 404 JSON，
+    不能被 SPA 回退成 200 + index.html（否则前端会报 null.items）。"""
+    for path in (
+        "/api/admin/v1/nonexistent-route",
+        "/v1/nonexistent-endpoint",
+        "/v1beta/nonexistent",
+        "/claudecode/nonexistent",
+        "/codex/nonexistent",
+    ):
+        response = client.get(path)
+        assert response.status_code == 404, path
+        assert response.headers["content-type"].startswith("application/json"), path
+
+
 def test_native_frontend_assets_are_served(client):
     script = client.get("/assets/app.js")
     stylesheet = client.get("/assets/app.css")

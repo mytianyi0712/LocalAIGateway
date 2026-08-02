@@ -6,7 +6,7 @@ from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -23,11 +23,14 @@ from app.core.access import resolve_access_policy
 from app.core.security import SecretStore
 from app.db.models import (
     AppSetting,
+    CapabilityProfile,
     Channel,
     ChannelHealth,
     ChannelModel,
     ChannelModelProtocol,
     ChannelProtocol,
+    ClaudeModelMapping,
+    CodexModelMapping,
     DiscoveryRun,
     HealthProbeLog,
     ModelCaps,
@@ -38,9 +41,20 @@ from app.db.models import (
     RouteCandidate,
 )
 from app.services.discovery import discover_channel_models
-from app.services.capabilities import CAPABILITY_FIELDS, caps_json, detect_model_capabilities
+from app.services.presets import (
+    get_claude_presets,
+    get_codex_presets,
+    refresh_claude_presets,
+    refresh_codex_presets,
+)
+from app.services.capabilities import (
+    CAPABILITY_FIELDS,
+    PROFILE_FIELDS,
+    caps_json,
+    detect_model_capabilities,
+)
 from app.services.health import probe_channel
-from app.services.routing import synchronize_shared_protocol_routes
+from app.services.routing import resolve_candidates, synchronize_shared_protocol_routes
 from app.services.settings import get_access_policy, get_runtime_settings, update_runtime_settings
 
 
@@ -168,6 +182,7 @@ class RoutePatch(BaseModel):
 
 class ModelCapsInput(BaseModel):
     source: Literal["auto", "manual"] = "manual"
+    profile_id: str | None = None
     context_window: int | None = Field(default=None, ge=1)
     max_tokens: int | None = Field(default=None, ge=1)
     supports_image_input: bool | None = None
@@ -189,6 +204,26 @@ class ModelCapsInput(BaseModel):
         return value
 
 
+class CapabilityProfileInput(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    description: str | None = Field(default=None, max_length=1000)
+    context_window: int | None = Field(default=None, ge=1)
+    max_tokens: int | None = Field(default=None, ge=1)
+    supports_image_input: bool | None = None
+    reasoning: bool | None = None
+    thinking_level_map: dict[str, str | None] | None = None
+
+    @field_validator("thinking_level_map")
+    @classmethod
+    def validate_thinking_level_map(cls, value: dict[str, str | None] | None):
+        if value is None:
+            return None
+        allowed = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
+        if any(key not in allowed for key in value):
+            raise ValueError("Unsupported thinking level")
+        return value
+
+
 class CandidateInput(BaseModel):
     channel_model_id: str
     priority: int = Field(ge=0)
@@ -197,6 +232,66 @@ class CandidateInput(BaseModel):
 
 class CandidateListInput(BaseModel):
     candidates: list[CandidateInput]
+
+
+class ClaudeMappingInput(BaseModel):
+    claude_model_id: str = Field(min_length=1, max_length=255)
+    display_name: str | None = None
+    upstream_protocol: str = "openai_compatible"
+    upstream_model_id: str = Field(min_length=1, max_length=255)
+    enabled: bool = True
+
+    @field_validator("upstream_protocol")
+    @classmethod
+    def validate_upstream_protocol(cls, value: str):
+        if value not in PROTOCOLS:
+            raise ValueError("Unsupported protocol")
+        return value
+
+
+class ClaudeMappingPatch(BaseModel):
+    claude_model_id: str | None = Field(default=None, min_length=1, max_length=255)
+    display_name: str | None = None
+    upstream_protocol: str | None = None
+    upstream_model_id: str | None = Field(default=None, min_length=1, max_length=255)
+    enabled: bool | None = None
+
+    @field_validator("upstream_protocol")
+    @classmethod
+    def validate_upstream_protocol(cls, value: str | None):
+        if value is not None and value not in PROTOCOLS:
+            raise ValueError("Unsupported protocol")
+        return value
+
+
+class CodexMappingInput(BaseModel):
+    codex_model_id: str = Field(min_length=1, max_length=255)
+    display_name: str | None = None
+    upstream_protocol: str = "openai_compatible"
+    upstream_model_id: str = Field(min_length=1, max_length=255)
+    enabled: bool = True
+
+    @field_validator("upstream_protocol")
+    @classmethod
+    def validate_upstream_protocol(cls, value: str):
+        if value not in PROTOCOLS:
+            raise ValueError("Unsupported protocol")
+        return value
+
+
+class CodexMappingPatch(BaseModel):
+    codex_model_id: str | None = Field(default=None, min_length=1, max_length=255)
+    display_name: str | None = None
+    upstream_protocol: str | None = None
+    upstream_model_id: str | None = Field(default=None, min_length=1, max_length=255)
+    enabled: bool | None = None
+
+    @field_validator("upstream_protocol")
+    @classmethod
+    def validate_upstream_protocol(cls, value: str | None):
+        if value is not None and value not in PROTOCOLS:
+            raise ValueError("Unsupported protocol")
+        return value
 
 
 def provider_json(row: Provider) -> dict:
@@ -319,10 +414,17 @@ async def route_bundle_with_caps_json(session: AsyncSession, rows: list[ModelRou
     return item
 
 
+async def profile_name_for_row(session: AsyncSession, row: ModelCaps | None) -> str | None:
+    if row is None or not row.profile_id:
+        return None
+    profile = await session.get(CapabilityProfile, row.profile_id)
+    return profile.name if profile else None
+
+
 async def get_model_caps(model_id: str, session: AsyncSession) -> dict:
     row = await session.get(ModelCaps, model_id)
     auto_caps = await detect_model_capabilities(session, model_id) if row is None or row.source == "auto" else None
-    return caps_json(row, auto_caps)
+    return caps_json(row, auto_caps, await profile_name_for_row(session, row))
 
 
 async def upsert_model_caps(model_id: str, payload: ModelCapsInput, session: AsyncSession) -> dict:
@@ -333,13 +435,127 @@ async def upsert_model_caps(model_id: str, payload: ModelCapsInput, session: Asy
     row.source = payload.source
     if payload.source == "auto":
         values = await detect_model_capabilities(session, model_id)
+        row.profile_id = None
     else:
         values = payload.model_dump(exclude={"source"})
+        profile_id = values.pop("profile_id", None)
+        if profile_id is not None:
+            profile = await session.get(CapabilityProfile, profile_id)
+            if profile is None:
+                raise HTTPException(404, "Profile not found")
+            row.profile_id = profile.id
+            # 未显式给出的能力字段从档案补齐，成本等字段仍以请求为准。
+            for key in PROFILE_FIELDS:
+                if values.get(key) is None:
+                    values[key] = getattr(profile, key)
+        else:
+            row.profile_id = None
     for key in CAPABILITY_FIELDS:
         setattr(row, key, values.get(key))
     await session.commit()
     await session.refresh(row)
-    return caps_json(row)
+    return caps_json(row, profile_name=await profile_name_for_row(session, row))
+
+
+async def profile_bundle_json(session: AsyncSession, row: CapabilityProfile) -> dict:
+    capabilities = {
+        key: getattr(row, key) for key in PROFILE_FIELDS if getattr(row, key) is not None
+    }
+    used_by = (
+        (await session.execute(select(ModelCaps.requested_model_id).where(ModelCaps.profile_id == row.id)))
+        .scalars()
+        .all()
+    )
+    return {
+        "id": row.id,
+        "name": row.name,
+        "description": row.description,
+        "capabilities": capabilities,
+        "used_by": used_by,
+        "usage_count": len(used_by),
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
+
+
+@router.get("/capability-profiles")
+async def list_capability_profiles(session: AsyncSession = Depends(get_session)):
+    rows = (
+        (await session.execute(select(CapabilityProfile).order_by(CapabilityProfile.name)))
+        .scalars()
+        .all()
+    )
+    items = [await profile_bundle_json(session, row) for row in rows]
+    return {"items": items, "total": len(items)}
+
+
+@router.post("/capability-profiles", status_code=201)
+async def create_capability_profile(
+    payload: CapabilityProfileInput, session: AsyncSession = Depends(get_session)
+):
+    row = CapabilityProfile(**payload.model_dump())
+    session.add(row)
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise HTTPException(409, "Profile name already exists") from exc
+    await session.refresh(row)
+    return await profile_bundle_json(session, row)
+
+
+@router.get("/capability-profiles/{profile_id}")
+async def read_capability_profile(
+    profile_id: str, session: AsyncSession = Depends(get_session)
+):
+    row = await session.get(CapabilityProfile, profile_id)
+    if row is None:
+        raise HTTPException(404, "Profile not found")
+    return await profile_bundle_json(session, row)
+
+
+@router.put("/capability-profiles/{profile_id}")
+async def replace_capability_profile(
+    profile_id: str, payload: CapabilityProfileInput, session: AsyncSession = Depends(get_session)
+):
+    row = await session.get(CapabilityProfile, profile_id)
+    if row is None:
+        raise HTTPException(404, "Profile not found")
+    if payload.name != row.name:
+        duplicate = await session.scalar(
+            select(CapabilityProfile.id).where(
+                CapabilityProfile.name == payload.name, CapabilityProfile.id != profile_id
+            )
+        )
+        if duplicate:
+            raise HTTPException(409, "Profile name already exists")
+    for key, value in payload.model_dump().items():
+        setattr(row, key, value)
+    # 档案变更同步到所有引用它的模型（能力字段；成本仍为各模型独立配置）。
+    await session.execute(
+        update(ModelCaps)
+        .where(ModelCaps.profile_id == profile_id)
+        .values({key: getattr(row, key) for key in PROFILE_FIELDS})
+    )
+    await session.commit()
+    await session.refresh(row)
+    return await profile_bundle_json(session, row)
+
+
+@router.delete("/capability-profiles/{profile_id}", status_code=204)
+async def delete_capability_profile(
+    profile_id: str, session: AsyncSession = Depends(get_session)
+):
+    row = await session.get(CapabilityProfile, profile_id)
+    if row is None:
+        raise HTTPException(404, "Profile not found")
+    # 解绑引用模型（保留它们已应用的能力值），再删除档案。
+    await session.execute(
+        update(ModelCaps).where(ModelCaps.profile_id == profile_id).values(profile_id=None)
+    )
+    await session.delete(row)
+    await session.commit()
+    return Response(status_code=204)
 
 
 async def load_route_bundle(session: AsyncSession, model_id: str) -> list[ModelRoute]:
@@ -884,6 +1100,264 @@ async def delete_channel_model(channel_model_id: str, session: AsyncSession = De
     return Response(status_code=204)
 
 
+async def claude_mapping_json(session: AsyncSession, row: ClaudeModelMapping) -> dict:
+    candidates = await resolve_candidates(
+        session, row.upstream_protocol, row.upstream_model_id, 50
+    )
+    return {
+        "id": row.id,
+        "claude_model_id": row.claude_model_id,
+        "display_name": row.display_name,
+        "upstream_protocol": row.upstream_protocol,
+        "upstream_model_id": row.upstream_model_id,
+        "enabled": row.enabled,
+        "candidates": [
+            {
+                "channel_id": candidate.channel_id,
+                "channel_name": candidate.channel_name,
+                "model_id": candidate.model_id,
+                "priority": candidate.priority,
+            }
+            for candidate in candidates
+        ],
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
+
+
+async def validate_upstream_model(session: AsyncSession, model_id: str, upstream_protocol: str) -> None:
+    model_exists = await session.scalar(
+        select(func.count())
+        .select_from(ChannelModel)
+        .where(ChannelModel.model_id == model_id)
+    )
+    if not model_exists:
+        raise HTTPException(
+            422,
+            "Upstream model must be a model already configured in the system",
+        )
+    route_exists = await session.scalar(
+        select(func.count())
+        .select_from(ModelRoute)
+        .where(
+            ModelRoute.requested_model_id == model_id,
+            ModelRoute.protocol == upstream_protocol,
+            ModelRoute.enabled.is_(True),
+        )
+    )
+    if not route_exists:
+        raise HTTPException(
+            422,
+            "Upstream model must have a route configured for the selected protocol "
+            "(configure it on the model routing page first)",
+        )
+
+
+@router.get("/claude-presets")
+async def list_claude_presets(session: AsyncSession = Depends(get_session)):
+    return await get_claude_presets(session)
+
+
+@router.post("/claude-presets/refresh", status_code=202)
+async def refresh_claude_presets_endpoint(request: Request):
+    asyncio.create_task(refresh_claude_presets(request.app))
+    return {"status": "queued"}
+
+
+@router.get("/claude-mappings")
+async def list_claude_mappings(session: AsyncSession = Depends(get_session)):
+    rows = (
+        (
+            await session.execute(
+                select(ClaudeModelMapping).order_by(ClaudeModelMapping.claude_model_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    items = [await claude_mapping_json(session, row) for row in rows]
+    return {
+        "items": items,
+        "total": len(items),
+        "page": 1,
+        "page_size": len(items),
+    }
+
+
+@router.post("/claude-mappings", status_code=201)
+async def create_claude_mapping(
+    payload: ClaudeMappingInput, session: AsyncSession = Depends(get_session)
+):
+    await validate_upstream_model(session, payload.upstream_model_id, payload.upstream_protocol)
+    row = ClaudeModelMapping(
+        claude_model_id=payload.claude_model_id.strip(),
+        display_name=payload.display_name,
+        upstream_protocol=payload.upstream_protocol,
+        upstream_model_id=payload.upstream_model_id,
+        enabled=payload.enabled,
+    )
+    session.add(row)
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise HTTPException(409, "Claude model mapping already exists") from exc
+    await session.refresh(row)
+    return await claude_mapping_json(session, row)
+
+
+@router.patch("/claude-mappings/{mapping_id}")
+async def patch_claude_mapping(
+    mapping_id: str, payload: ClaudeMappingPatch, session: AsyncSession = Depends(get_session)
+):
+    row = await session.get(ClaudeModelMapping, mapping_id)
+    if not row:
+        raise HTTPException(404, "Claude model mapping not found")
+    values = payload.model_dump(exclude_unset=True)
+    if "claude_model_id" in values:
+        values["claude_model_id"] = values["claude_model_id"].strip()
+    if "upstream_model_id" in values or "upstream_protocol" in values:
+        await validate_upstream_model(
+            session,
+            values.get("upstream_model_id", row.upstream_model_id),
+            values.get("upstream_protocol", row.upstream_protocol),
+        )
+    for key, value in values.items():
+        setattr(row, key, value)
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise HTTPException(409, "Claude model mapping already exists") from exc
+    await session.refresh(row)
+    return await claude_mapping_json(session, row)
+
+
+@router.delete("/claude-mappings/{mapping_id}", status_code=204)
+async def delete_claude_mapping(mapping_id: str, session: AsyncSession = Depends(get_session)):
+    row = await session.get(ClaudeModelMapping, mapping_id)
+    if not row:
+        raise HTTPException(404, "Claude model mapping not found")
+    await session.delete(row)
+    await session.commit()
+    return Response(status_code=204)
+
+
+async def codex_mapping_json(session: AsyncSession, row: CodexModelMapping) -> dict:
+    candidates = await resolve_candidates(
+        session, row.upstream_protocol, row.upstream_model_id, 50
+    )
+    return {
+        "id": row.id,
+        "codex_model_id": row.codex_model_id,
+        "display_name": row.display_name,
+        "upstream_protocol": row.upstream_protocol,
+        "upstream_model_id": row.upstream_model_id,
+        "enabled": row.enabled,
+        "candidates": [
+            {
+                "channel_id": candidate.channel_id,
+                "channel_name": candidate.channel_name,
+                "model_id": candidate.model_id,
+                "priority": candidate.priority,
+            }
+            for candidate in candidates
+        ],
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
+
+
+@router.get("/codex-presets")
+async def list_codex_presets(session: AsyncSession = Depends(get_session)):
+    return await get_codex_presets(session)
+
+
+@router.post("/codex-presets/refresh", status_code=202)
+async def refresh_codex_presets_endpoint(request: Request):
+    asyncio.create_task(refresh_codex_presets(request.app))
+    return {"status": "queued"}
+
+
+@router.get("/codex-mappings")
+async def list_codex_mappings(session: AsyncSession = Depends(get_session)):
+    rows = (
+        (
+            await session.execute(
+                select(CodexModelMapping).order_by(CodexModelMapping.codex_model_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    items = [await codex_mapping_json(session, row) for row in rows]
+    return {
+        "items": items,
+        "total": len(items),
+        "page": 1,
+        "page_size": len(items),
+    }
+
+
+@router.post("/codex-mappings", status_code=201)
+async def create_codex_mapping(
+    payload: CodexMappingInput, session: AsyncSession = Depends(get_session)
+):
+    await validate_upstream_model(session, payload.upstream_model_id, payload.upstream_protocol)
+    row = CodexModelMapping(
+        codex_model_id=payload.codex_model_id.strip(),
+        display_name=payload.display_name,
+        upstream_protocol=payload.upstream_protocol,
+        upstream_model_id=payload.upstream_model_id,
+        enabled=payload.enabled,
+    )
+    session.add(row)
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise HTTPException(409, "Codex model mapping already exists") from exc
+    await session.refresh(row)
+    return await codex_mapping_json(session, row)
+
+
+@router.patch("/codex-mappings/{mapping_id}")
+async def patch_codex_mapping(
+    mapping_id: str, payload: CodexMappingPatch, session: AsyncSession = Depends(get_session)
+):
+    row = await session.get(CodexModelMapping, mapping_id)
+    if not row:
+        raise HTTPException(404, "Codex model mapping not found")
+    values = payload.model_dump(exclude_unset=True)
+    if "codex_model_id" in values:
+        values["codex_model_id"] = values["codex_model_id"].strip()
+    if "upstream_model_id" in values or "upstream_protocol" in values:
+        await validate_upstream_model(
+            session,
+            values.get("upstream_model_id", row.upstream_model_id),
+            values.get("upstream_protocol", row.upstream_protocol),
+        )
+    for key, value in values.items():
+        setattr(row, key, value)
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise HTTPException(409, "Codex model mapping already exists") from exc
+    await session.refresh(row)
+    return await codex_mapping_json(session, row)
+
+
+@router.delete("/codex-mappings/{mapping_id}", status_code=204)
+async def delete_codex_mapping(mapping_id: str, session: AsyncSession = Depends(get_session)):
+    row = await session.get(CodexModelMapping, mapping_id)
+    if not row:
+        raise HTTPException(404, "Codex model mapping not found")
+    await session.delete(row)
+    await session.commit()
+    return Response(status_code=204)
+
+
 @router.get("/routes")
 async def list_routes(session: AsyncSession = Depends(get_session)):
     model_ids = (
@@ -967,14 +1441,34 @@ async def read_model_capabilities(model_id: str, session: AsyncSession = Depends
     return await get_model_caps(model_id, session)
 
 
+async def model_route_or_mapping_exists(session: AsyncSession, model_id: str) -> bool:
+    route_exists = await session.scalar(
+        select(func.count())
+        .select_from(ModelRoute)
+        .where(ModelRoute.requested_model_id == model_id)
+    )
+    if route_exists:
+        return True
+    claude_exists = await session.scalar(
+        select(func.count())
+        .select_from(ClaudeModelMapping)
+        .where(ClaudeModelMapping.claude_model_id == model_id)
+    )
+    if claude_exists:
+        return True
+    codex_exists = await session.scalar(
+        select(func.count())
+        .select_from(CodexModelMapping)
+        .where(CodexModelMapping.codex_model_id == model_id)
+    )
+    return bool(codex_exists)
+
+
 @router.put("/model-capabilities/{model_id:path}")
 async def replace_model_capabilities(
     model_id: str, payload: ModelCapsInput, session: AsyncSession = Depends(get_session)
 ):
-    exists = await session.scalar(
-        select(func.count()).select_from(ModelRoute).where(ModelRoute.requested_model_id == model_id)
-    )
-    if not exists:
+    if not await model_route_or_mapping_exists(session, model_id):
         raise HTTPException(404, "Route not found")
     return await upsert_model_caps(model_id, payload, session)
 
@@ -983,10 +1477,7 @@ async def replace_model_capabilities(
 async def detect_model_capabilities_endpoint(
     model_id: str, session: AsyncSession = Depends(get_session)
 ):
-    exists = await session.scalar(
-        select(func.count()).select_from(ModelRoute).where(ModelRoute.requested_model_id == model_id)
-    )
-    if not exists:
+    if not await model_route_or_mapping_exists(session, model_id):
         raise HTTPException(404, "Route not found")
     payload = ModelCapsInput(source="auto")
     return await upsert_model_caps(model_id, payload, session)
@@ -1093,6 +1584,8 @@ async def list_requests(
     status_code: int | None = None,
     min_duration_ms: int | None = None,
     channel_id: str | None = None,
+    upstream_model_id: str | None = None,
+    upstream_protocol: str | None = None,
     date_from: datetime | None = Query(default=None, alias="from"),
     date_to: datetime | None = Query(default=None, alias="to"),
     page: int = 1,
@@ -1102,6 +1595,17 @@ async def list_requests(
     page_size = min(max(page_size, 1), 200)
     statement = select(RequestLog).options(selectinload(RequestLog.attempts))
     count_statement = select(func.count()).select_from(RequestLog)
+    attempt_conditions = []
+    if upstream_model_id:
+        attempt_conditions.append(RequestAttempt.upstream_model_id == upstream_model_id)
+    if upstream_protocol:
+        attempt_conditions.append(RequestAttempt.upstream_protocol == upstream_protocol)
+    if attempt_conditions:
+        matching_request_ids = select(RequestAttempt.request_id).where(
+            and_(*attempt_conditions)
+        )
+        statement = statement.where(RequestLog.id.in_(matching_request_ids))
+        count_statement = count_statement.where(RequestLog.id.in_(matching_request_ids))
     for condition in [
         RequestLog.protocol == protocol if protocol else None,
         RequestLog.model_id == model_id if model_id else None,
@@ -1149,6 +1653,20 @@ async def list_requests(
         item["response_channels"] = [
             attempt.channel_name for attempt in sorted(row.attempts, key=lambda value: value.attempt_no)
         ]
+        upstream_attempt = next(
+            (
+                attempt
+                for attempt in sorted(row.attempts, key=lambda value: value.attempt_no)
+                if attempt.upstream_protocol or attempt.upstream_model_id
+            ),
+            None,
+        )
+        item["upstream_protocol"] = (
+            upstream_attempt.upstream_protocol if upstream_attempt else None
+        )
+        item["upstream_model_id"] = (
+            upstream_attempt.upstream_model_id if upstream_attempt else None
+        )
         items.append(item)
     return {
         "items": items,
@@ -1261,7 +1779,7 @@ async def stats_summary(session: AsyncSession = Depends(get_session)):
                         0,
                     )
                 ),
-            )
+            ).where(RequestAttempt.response_started.is_(True))
         )
     ).one()
     channels = await session.scalar(select(func.count()).select_from(Channel)) or 0
@@ -1281,6 +1799,7 @@ async def stats_summary(session: AsyncSession = Depends(get_session)):
                 func.sum(RequestAttempt.cache_miss_input_tokens),
             )
             .join(RequestAttempt, RequestAttempt.request_id == RequestLog.id)
+            .where(RequestAttempt.response_started.is_(True))
             .group_by(RequestLog.protocol)
         )
     ).all()
@@ -1355,7 +1874,7 @@ async def stats_cache(session: AsyncSession = Depends(get_session)):
                         0,
                     )
                 ),
-            )
+            ).where(RequestAttempt.response_started.is_(True))
         )
     ).one()
     return {

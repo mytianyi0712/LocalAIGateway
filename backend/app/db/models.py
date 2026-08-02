@@ -146,6 +146,67 @@ class ModelRoute(Base, TimestampMixin):
     )
 
 
+class ClaudeModelMapping(Base, TimestampMixin):
+    """A Claude-standard model name exposed to clients, routed to an existing
+    system model with optional protocol conversion (see app/adapters/convert.py).
+
+    The mapping inherits candidates from the *existing* route of
+    ``upstream_model_id`` in ``upstream_protocol``, so no separate candidate
+    configuration is needed.
+    """
+
+    __tablename__ = "claude_model_mappings"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uuid4)
+    claude_model_id: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String)
+    upstream_protocol: Mapped[str] = mapped_column(String, nullable=False)
+    upstream_model_id: Mapped[str] = mapped_column(String, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
+class CodexModelMapping(Base, TimestampMixin):
+    """A Codex-standard model name (OpenAI Responses API) exposed to clients,
+    routed to an existing system model with optional protocol conversion
+    (see app/adapters/convert.py).
+
+    The mapping inherits candidates from the *existing* route of
+    ``upstream_model_id`` in ``upstream_protocol``, so no separate candidate
+    configuration is needed.
+    """
+
+    __tablename__ = "codex_model_mappings"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uuid4)
+    codex_model_id: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String)
+    upstream_protocol: Mapped[str] = mapped_column(String, nullable=False)
+    upstream_model_id: Mapped[str] = mapped_column(String, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
+class CapabilityProfile(Base, TimestampMixin):
+    """A reusable, named set of model capabilities.
+
+    Multiple models (``model_caps`` rows) can reference the same profile via
+    ``profile_id``, so e.g. GPT-5.6 Sol and GPT-5.6 Terra share one capability
+    set. Editing a profile propagates the capability fields to every model
+    that references it; costs stay per-model because they are pricing, not
+    capability.
+    """
+
+    __tablename__ = "capability_profiles"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uuid4)
+    name: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    description: Mapped[str | None] = mapped_column(String)
+    context_window: Mapped[int | None] = mapped_column(Integer)
+    max_tokens: Mapped[int | None] = mapped_column(Integer)
+    supports_image_input: Mapped[bool | None] = mapped_column(Boolean)
+    reasoning: Mapped[bool | None] = mapped_column(Boolean)
+    thinking_level_map: Mapped[dict | None] = mapped_column(JSON)
+
+
 class ModelCaps(Base, TimestampMixin):
     __tablename__ = "model_caps"
 
@@ -160,6 +221,9 @@ class ModelCaps(Base, TimestampMixin):
     cost_cache_read: Mapped[float | None] = mapped_column(Float)
     cost_cache_write: Mapped[float | None] = mapped_column(Float)
     source: Mapped[str] = mapped_column(String, default="auto", nullable=False)
+    profile_id: Mapped[str | None] = mapped_column(
+        ForeignKey("capability_profiles.id", ondelete="SET NULL")
+    )
 
 
 class RouteCandidate(Base, TimestampMixin):
@@ -237,6 +301,8 @@ class RequestAttempt(Base):
     tps: Mapped[float | None] = mapped_column(Float)
     raw_usage_json: Mapped[dict | None] = mapped_column(JSON)
     response_bytes: Mapped[int | None] = mapped_column(Integer)
+    upstream_protocol: Mapped[str | None] = mapped_column(String)
+    upstream_model_id: Mapped[str | None] = mapped_column(String)
 
     request: Mapped[RequestLog] = relationship(back_populates="attempts")
 

@@ -2,10 +2,66 @@ const API_ROOT = '/api/admin/v1';
 const TOKEN_KEY = 'ai-gateway-admin-token';
 const PROTOCOLS = ['openai_compatible', 'openai_responses', 'claude', 'gemini'];
 
+const MAPPING_KINDS = {
+  claude: {
+    route: '/mappings',
+    title: 'Claude 模型映射助手',
+    description: '以 Claude Code 标准模型名对外提供服务，按模型独立配置上游协议与转换',
+    api: '/claude-mappings',
+    presetsApi: '/claude-presets',
+    modelIdField: 'claude_model_id',
+    modelLabel: 'Claude 标准模型名',
+    tableHead: 'Claude 模型名',
+    placeholder: 'claude-opus-5',
+    displayPlaceholder: 'Claude Opus 5',
+    toolbarTitle: 'Claude 标准模型名',
+    emptyDetail: '添加一个 Claude Code 标准模型名，选择系统中已配置的模型与上游协议即可。',
+    presetLabel: '从 Claude 预设快速选择',
+    presetHelp: '预设来自 Anthropic 当前模型目录（内置默认 + 经已配置的 Claude 渠道实时刷新），选择后自动填充标准模型名与显示名称。',
+    mappingHelp: '客户端（如 Claude Code）请求 /claudecode/v1/messages 时使用的模型名称。',
+    protocolHelp: '请求会被转换为该协议后转发；选择 Claude 原生则不转换，仅替换上游模型名。每个映射可独立设置。',
+    entry: {
+      base: '/claudecode',
+      title: 'Claude Code 接入地址（独立于常规请求）',
+      body: '映射仅在该路径下生效，常规 <code>/v1/*</code> 端点不受影响。在 Claude Code 中设置 <code>ANTHROPIC_BASE_URL={base}</code>，即可从这里探测模型目录并请求映射模型。',
+    },
+  },
+  codex: {
+    route: '/codex-mappings',
+    title: 'Codex 模型映射助手',
+    description: '以 Codex 标准模型名对外提供服务，按模型独立配置上游协议与转换',
+    api: '/codex-mappings',
+    presetsApi: '/codex-presets',
+    modelIdField: 'codex_model_id',
+    modelLabel: 'Codex 标准模型名',
+    tableHead: 'Codex 模型名',
+    placeholder: 'gpt-5-codex',
+    displayPlaceholder: 'GPT-5 Codex',
+    toolbarTitle: 'Codex 标准模型名',
+    emptyDetail: '添加一个 Codex 标准模型名，选择系统中已配置的模型与上游协议即可。',
+    presetLabel: '从 Codex 预设快速选择',
+    presetHelp: '预设来自 OpenAI 当前模型目录（内置默认 + 经已配置的 OpenAI 渠道实时刷新），选择后自动填充标准模型名与显示名称。',
+    mappingHelp: '客户端（如 Codex CLI）请求 /codex/v1/responses 时使用的模型名称。',
+    protocolHelp: '请求会被转换为该协议后转发；选择 OpenAI Responses 原生则不转换，仅替换上游模型名。每个映射可独立设置。',
+    entry: {
+      base: '/codex/v1',
+      title: 'Codex 接入地址（独立于常规请求）',
+      body: '映射仅在该路径下生效，常规 <code>/v1/*</code> 端点不受影响。Codex CLI 会向 base URL 追加 <code>/responses</code> 与 <code>/models</code>，因此 base 需包含 <code>/v1</code>。在 <code>~/.codex/config.toml</code> 中设置 <code>openai_base_url = "{base}"</code>、<code>model = "映射模型名"</code>（如 <code>gpt-5-codex</code>），并设置任意值的 <code>OPENAI_API_KEY</code>，即可从这里探测模型目录并请求映射模型。',
+    },
+  },
+};
+
+function mappingKindForPath(path) {
+  return path === '/codex-mappings' ? 'codex' : 'claude';
+}
+
 const pageMeta = {
   '/': { title: '运行概览', description: '请求、Token 与渠道健康状态' },
   '/providers': { title: '供应商与渠道', description: '上游端点、账号和模型探测目录' },
   '/routes': { title: '模型路由', description: '按模型统一配置候选优先级，请求时按格式过滤' },
+  '/profiles': { title: '能力档案', description: '可复用的模型能力集合，多个模型可共用同一套能力' },
+  '/mappings': { title: MAPPING_KINDS.claude.title, description: MAPPING_KINDS.claude.description },
+  '/codex-mappings': { title: MAPPING_KINDS.codex.title, description: MAPPING_KINDS.codex.description },
   '/logs': { title: '请求日志', description: '请求结果、性能指标与上游尝试' },
   '/settings': { title: '运行设置', description: '访问策略、熔断与超时参数' },
 };
@@ -19,9 +75,13 @@ const state = {
   channels: [],
   channelModels: [],
   routes: [],
+  profiles: [],
+  mappingKind: 'claude',
+  mappings: { claude: [], codex: [] },
+  presets: { claude: null, codex: null },
   summary: null,
   system: null,
-  logs: { page: 1, total: 0, items: [], filters: { protocol: '', model_id: '', outcome: '' } },
+  logs: { page: 1, total: 0, items: [], filters: { protocol: '', upstream_protocol: '', model_id: '', upstream_model_id: '', outcome: '' } },
   settings: null,
   generatedKeys: null,
   drawerRoute: null,
@@ -184,7 +244,15 @@ async function api(path, options = {}) {
   if (options.body && !(options.body instanceof FormData)) headers.set('Content-Type', 'application/json');
   const response = await fetch(`${API_ROOT}${path}`, { ...options, headers });
   if (response.status === 204) return null;
-  const body = await response.json().catch(() => null);
+  let body = null;
+  try {
+    body = await response.json();
+  } catch {
+    // 2xx 却无法解析为 JSON：多半是旧后端进程缺路由，请求被 SPA 回退成
+    // index.html。给出可读错误，而不是让上层报 null.items 这类 TypeError。
+    if (!response.ok) throw new Error(`请求失败 (${response.status})`);
+    throw new Error(`管理 API 返回了非 JSON 响应（HTTP ${response.status}），请确认网关已升级并重启`);
+  }
   if (!response.ok) {
     const error = new Error(body?.detail || body?.error?.message || `请求失败 (${response.status})`);
     error.status = response.status;
@@ -327,6 +395,8 @@ async function renderPage() {
     if (path === '/') await loadDashboard(version);
     else if (path === '/providers') await loadProviders(version);
     else if (path === '/routes') await loadRoutes(version);
+    else if (path === '/profiles') await loadProfiles(version);
+    else if (path === '/mappings' || path === '/codex-mappings') await loadMappings(version);
     else if (path === '/logs') await loadLogs(version);
     else if (path === '/settings') await loadSettings(version);
   } catch (error) {
@@ -626,10 +696,11 @@ function routeOptions() {
 }
 
 async function loadRoutes(version) {
-  const [routeData, modelData] = await Promise.all([get('/routes'), get('/channel-models')]);
+  const [routeData, modelData, profileData] = await Promise.all([get('/routes'), get('/channel-models'), get('/capability-profiles')]);
   if (version !== state.renderVersion) return;
   state.routes = routeData.items;
   state.channelModels = modelData.items;
+  state.profiles = profileData.items || [];
   elements.page.innerHTML = renderRoutesPage();
 }
 
@@ -641,7 +712,8 @@ function capabilitySummary(caps = {}) {
   if (caps.supports_image_input === false) parts.push('仅文本');
   if (caps.reasoning === true) parts.push('思考');
   if (caps.reasoning === false) parts.push('无思考');
-  return `<div class="capability-summary"><span class="capability-source">${caps.source === 'manual' ? '手动' : '自动'}</span>${parts.length ? parts.map((item) => `<span>${escapeHtml(item)}</span>`).join('') : '<span class="subtle-text">未识别</span>'}</div>`;
+  const profileChip = caps.profile_name ? `<span class="capability-profile" title="能力档案">档案：${escapeHtml(caps.profile_name)}</span>` : '';
+  return `<div class="capability-summary"><span class="capability-source">${caps.source === 'manual' ? '手动' : '自动'}</span>${profileChip}${parts.length ? parts.map((item) => `<span>${escapeHtml(item)}</span>`).join('') : '<span class="subtle-text">未识别</span>'}</div>`;
 }
 
 function renderRoutesPage() {
@@ -689,7 +761,9 @@ function capabilityEditorMarkup(route) {
     ${boolOption('false', value === false, '不支持')}
   </select>`;
   const thinkingLevelMap = caps.thinking_level_map ? JSON.stringify(caps.thinking_level_map, null, 2) : '';
+  const profileOptions = state.profiles.map((profile) => `<option value="${escapeAttr(profile.id)}" ${caps.profile_id === profile.id ? 'selected' : ''}>${escapeHtml(profile.name)}${profile.usage_count ? `（${number(profile.usage_count)} 个模型）` : ''}</option>`).join('');
   const body = `<form class="form-stack" id="caps-form" data-form="caps">
+    <section class="drawer-section"><h3>能力档案</h3><div class="form-grid is-two"><div class="field"><label for="caps-profile">复用档案</label><select class="select" id="caps-profile" name="profile_id" data-profile-select><option value="">不使用档案</option>${profileOptions}</select><span class="field-help">选择后自动填充下方能力字段；同一档案可被多个模型共用，修改档案会同步到所有引用模型。</span><div class="caps-preview" data-caps-preview></div></div><div class="field"><label>&nbsp;</label>${button({ action: 'save-as-profile', label: '保存为档案', iconName: 'database' })}</div></div></section>
     <section class="drawer-section"><h3>来源</h3><div class="field"><label for="caps-source">能力来源</label><select class="select" id="caps-source" name="source"><option value="auto" ${caps.source !== 'manual' ? 'selected' : ''}>自动从上游聚合</option><option value="manual" ${caps.source === 'manual' ? 'selected' : ''}>手动配置</option></select></div></section>
     <section class="drawer-section"><h3>上下文与输出</h3><div class="form-grid is-two"><div class="field"><label for="caps-context">上下文 Token</label><input class="number-input" id="caps-context" name="context_window" type="number" min="1" step="1" value="${caps.context_window || ''}" placeholder="自动"></div><div class="field"><label for="caps-max-tokens">最大输出 Token</label><input class="number-input" id="caps-max-tokens" name="max_tokens" type="number" min="1" step="1" value="${caps.max_tokens || ''}" placeholder="自动"></div></div></section>
     <section class="drawer-section"><h3>输入与思考</h3><div class="form-grid is-two"><div class="field"><label>图像输入</label>${boolSelect('supports_image_input', caps.supports_image_input)}</div><div class="field"><label>思考能力</label>${boolSelect('reasoning', caps.reasoning)}</div></div><div class="field"><label for="caps-thinking-map">thinkingLevelMap JSON</label><textarea class="textarea" id="caps-thinking-map" name="thinking_level_map" rows="5" placeholder='{"high":"default","max":"max"}'>${escapeHtml(thinkingLevelMap)}</textarea></div></section>
@@ -708,6 +782,58 @@ function openCapabilityEditor(routeId) {
     subtitle: '模型能力会写入 model catalog 的 x_local_gateway.pi_model_config',
     ...capabilityEditorMarkup(route),
   });
+  refreshCapsPreview();
+}
+
+function costPreviewNumber(value) {
+  return Number(value).toLocaleString('zh-CN', { maximumFractionDigits: 6 });
+}
+
+function refreshCapsPreview() {
+  const container = document.querySelector('[data-caps-preview]');
+  const form = document.getElementById('caps-form');
+  const select = document.getElementById('caps-profile');
+  if (!container || !form || !select) return;
+  const profile = profileById(select.value);
+  const values = new FormData(form);
+  const num = (name) => {
+    const raw = values.get(name);
+    return raw === null || String(raw).trim() === '' ? null : Number(raw);
+  };
+  const bool = (name) => {
+    const raw = values.get(name);
+    return raw === 'true' ? true : raw === 'false' ? false : null;
+  };
+  const parts = [];
+  const ctx = num('context_window');
+  const max = num('max_tokens');
+  if (ctx) parts.push(`上下文 ${number(ctx)}`);
+  if (max) parts.push(`输出 ${number(max)}`);
+  const img = bool('supports_image_input');
+  if (img === true) parts.push('图像输入');
+  if (img === false) parts.push('仅文本');
+  const reas = bool('reasoning');
+  if (reas === true) parts.push('思考');
+  if (reas === false) parts.push('无思考');
+  const rawMap = String(values.get('thinking_level_map') || '').trim();
+  if (rawMap) {
+    try {
+      const map = JSON.parse(rawMap);
+      const keys = Object.keys(map);
+      if (keys.length) parts.push(`思考档 ${keys.join('/')}`);
+    } catch {
+      parts.push('思考档 JSON 无效');
+    }
+  }
+  const costParts = [];
+  for (const [name, label] of [['cost_input', '输入'], ['cost_output', '输出'], ['cost_cache_read', '缓存读'], ['cost_cache_write', '缓存写']]) {
+    const value = num(name);
+    if (value != null) costParts.push(`${label} $${costPreviewNumber(value)}`);
+  }
+  const sourceChip = profile ? `<span class="caps-preview-profile">档案：${escapeHtml(profile.name)}</span>` : '';
+  const chips = parts.length ? parts.map((item) => `<span>${escapeHtml(item)}</span>`).join('') : '<span class="subtle-text">未配置能力字段</span>';
+  const costRow = costParts.length ? `<div class="capability-summary caps-preview-cost">${costParts.map((item) => `<span>${escapeHtml(item)}</span>`).join('')}</div>` : '';
+  container.innerHTML = `<div class="caps-preview-head">应用后预览${sourceChip}</div><div class="capability-summary">${chips}</div>${costRow}`;
 }
 
 function formNumberOrNull(values, name) {
@@ -737,6 +863,7 @@ async function saveCapabilities(form) {
   }
   const payload = {
     source: values.get('source') || 'manual',
+    profile_id: values.get('profile_id') || null,
     context_window: formNumberOrNull(values, 'context_window'),
     max_tokens: formNumberOrNull(values, 'max_tokens'),
     supports_image_input: formBoolOrNull(values, 'supports_image_input'),
@@ -763,6 +890,7 @@ async function detectCapabilities() {
     subtitle: '模型能力会写入 model catalog 的 x_local_gateway.pi_model_config',
     ...capabilityEditorMarkup(route),
   });
+  refreshCapsPreview();
   toast('已重新聚合上游能力，结果已显示在下方表单中');
   await loadRoutes(state.renderVersion);
 }
@@ -847,6 +975,326 @@ async function deleteRoute(routeId) {
   renderPage();
 }
 
+function profileCapabilitySummary(profile) {
+  return capabilitySummary({ source: 'manual', ...(profile.capabilities || {}) });
+}
+
+async function loadProfiles(version) {
+  const data = await get('/capability-profiles');
+  if (version !== state.renderVersion) return;
+  state.profiles = data.items || [];
+  elements.page.innerHTML = renderProfilesPage();
+}
+
+function renderProfilesPage() {
+  const rows = state.profiles.map((profile) => `<tr>
+    <td><strong>${escapeHtml(profile.name)}</strong>${profile.description ? `<div class="subtle-text">${escapeHtml(profile.description)}</div>` : ''}</td>
+    <td>${profileCapabilitySummary(profile)}</td>
+    <td>${profile.usage_count ? `<span title="${escapeAttr(profile.used_by.join(', '))}">${number(profile.usage_count)} 个模型</span>` : '<span class="subtle-text">未使用</span>'}</td>
+    <td class="action-cell"><div class="table-actions">${iconButton({ action: 'edit-profile', iconName: 'pencil', label: '编辑档案', attrs: `data-profile-id="${escapeAttr(profile.id)}"` })}${iconButton({ action: 'delete-profile', iconName: 'trash-2', label: '删除档案', danger: true, attrs: `data-profile-id="${escapeAttr(profile.id)}"` })}</div></td>
+  </tr>`).join('');
+  return `<div class="page-stack">
+    ${toolbar('可复用能力档案', '多个模型可引用同一档案；修改档案会同步到所有引用模型（成本仍为各模型独立配置）', `${button({ action: 'refresh-profiles', label: '刷新', iconName: 'refresh-cw' })}${button({ action: 'open-profile', label: '新建能力档案', iconName: 'plus', primary: true })}`)}
+    ${panel('能力档案', '在「模型路由 → 配置能力」中选择档案即可应用', `<div class="section-body-flush">${state.profiles.length ? `<div class="table-scroll"><table class="data-table"><thead><tr><th>名称</th><th>能力</th><th>引用模型</th><th class="action-cell">操作</th></tr></thead><tbody>${rows}</tbody></table></div>` : emptyState('尚未创建能力档案', '新建一个档案，或在模型能力的配置抽屉中点击「保存为档案」直接创建。', 'database')}</div>`) }
+  </div>`;
+}
+
+function profileForm(profile = null) {
+  const caps = (profile && profile.capabilities) || {};
+  const thinkingLevelMap = caps.thinking_level_map ? JSON.stringify(caps.thinking_level_map, null, 2) : '';
+  openModal({
+    title: profile ? '编辑能力档案' : '新建能力档案',
+    mode: profile ? 'profile-edit' : 'profile-new',
+    body: `<form class="form-stack" id="profile-form" data-form="profile" ${profile ? `data-profile-id="${escapeAttr(profile.id)}"` : ''}>
+      <div class="field"><label for="profile-name">名称</label><input class="text-input" id="profile-name" name="name" type="text" maxlength="255" required value="${escapeAttr(profile?.name || '')}" placeholder="如：GPT-5.6 系列"><span class="field-help">同名的多个模型可共用同一档案。</span></div>
+      <div class="field"><label for="profile-description">描述</label><input class="text-input" id="profile-description" name="description" type="text" maxlength="1000" value="${escapeAttr(profile?.description || '')}" placeholder="可选"></div>
+      <div class="form-grid is-two"><div class="field"><label for="profile-context">上下文 Token</label><input class="number-input" id="profile-context" name="context_window" type="number" min="1" step="1" value="${caps.context_window || ''}" placeholder="自动"></div><div class="field"><label for="profile-max-tokens">最大输出 Token</label><input class="number-input" id="profile-max-tokens" name="max_tokens" type="number" min="1" step="1" value="${caps.max_tokens || ''}" placeholder="自动"></div></div>
+      <div class="form-grid is-two"><div class="field"><label>图像输入</label><select class="select" name="supports_image_input"><option value="" ${caps.supports_image_input == null ? 'selected' : ''}>自动 / 未知</option><option value="true" ${caps.supports_image_input === true ? 'selected' : ''}>支持</option><option value="false" ${caps.supports_image_input === false ? 'selected' : ''}>不支持</option></select></div><div class="field"><label>思考能力</label><select class="select" name="reasoning"><option value="" ${caps.reasoning == null ? 'selected' : ''}>自动 / 未知</option><option value="true" ${caps.reasoning === true ? 'selected' : ''}>支持</option><option value="false" ${caps.reasoning === false ? 'selected' : ''}>不支持</option></select></div></div>
+      <div class="field"><label for="profile-thinking-map">thinkingLevelMap JSON</label><textarea class="textarea" id="profile-thinking-map" name="thinking_level_map" rows="5" placeholder='{"high":"default","max":"max"}'>${escapeHtml(thinkingLevelMap)}</textarea></div>
+    </form>`,
+    footer: `${button({ action: 'close-modal', label: '取消' })}${button({ action: 'submit-profile', label: '保存档案', iconName: 'check', primary: true })}`,
+  });
+}
+
+async function saveProfile(form) {
+  const values = new FormData(form);
+  const name = String(values.get('name') || '').trim();
+  if (!name) throw new Error('请填写档案名称');
+  const rawMap = String(values.get('thinking_level_map') || '').trim();
+  let thinkingLevelMap = null;
+  if (rawMap) {
+    try {
+      thinkingLevelMap = JSON.parse(rawMap);
+    } catch {
+      throw new Error('thinkingLevelMap 必须是有效 JSON');
+    }
+  }
+  const payload = {
+    name,
+    description: String(values.get('description') || '').trim() || null,
+    context_window: formNumberOrNull(values, 'context_window'),
+    max_tokens: formNumberOrNull(values, 'max_tokens'),
+    supports_image_input: formBoolOrNull(values, 'supports_image_input'),
+    reasoning: formBoolOrNull(values, 'reasoning'),
+    thinking_level_map: thinkingLevelMap,
+  };
+  if (state.modalMode === 'profile-edit') {
+    const profile = state.profiles.find((item) => item.id === form.dataset.profileId);
+    if (!profile) throw new Error('档案不存在');
+    await put(`/capability-profiles/${profile.id}`, payload);
+    toast('能力档案已更新，引用它的模型已同步');
+  } else {
+    await post('/capability-profiles', payload);
+    toast('能力档案已创建');
+  }
+  closeModal();
+  await loadProfiles(state.renderVersion);
+}
+
+async function deleteProfile(profileId) {
+  const profile = state.profiles.find((item) => item.id === profileId);
+  if (!await confirmAction({ title: '删除能力档案', message: `删除档案“${profile?.name || ''}”？引用它的模型将解除绑定（已应用的能力值保留）。`, confirmLabel: '删除', danger: true })) return;
+  await remove(`/capability-profiles/${profileId}`);
+  toast('能力档案已删除');
+  await loadProfiles(state.renderVersion);
+}
+
+function profileSelectOptions(selectedId) {
+  return state.profiles.map((profile) => `<option value="${escapeAttr(profile.id)}" ${profile.id === selectedId ? 'selected' : ''}>${escapeHtml(profile.name)}${profile.usage_count ? `（${number(profile.usage_count)} 个模型）` : ''}</option>`).join('');
+}
+
+function syncProfileSelect(selectedId) {
+  const select = document.getElementById('caps-profile');
+  if (!select) return;
+  select.innerHTML = `<option value="">不使用档案</option>${profileSelectOptions(selectedId)}`;
+  select.value = selectedId || '';
+}
+
+function profileById(profileId) {
+  return state.profiles.find((profile) => profile.id === profileId) || null;
+}
+
+function applyProfileToForm(profileId) {
+  const profile = profileById(profileId);
+  if (!profile) return;
+  const caps = profile.capabilities || {};
+  const form = document.getElementById('caps-form');
+  if (!form) return;
+  const setField = (name, value) => {
+    const input = form.querySelector(`[name="${name}"]`);
+    if (input) input.value = value ?? '';
+  };
+  setField('context_window', caps.context_window);
+  setField('max_tokens', caps.max_tokens);
+  setField('supports_image_input', caps.supports_image_input === undefined ? '' : String(caps.supports_image_input));
+  setField('reasoning', caps.reasoning === undefined ? '' : String(caps.reasoning));
+  const mapInput = form.querySelector('[name="thinking_level_map"]');
+  if (mapInput) mapInput.value = caps.thinking_level_map ? JSON.stringify(caps.thinking_level_map, null, 2) : '';
+  refreshCapsPreview();
+  toast(`已应用档案「${profile.name}」的能力，可继续修改后保存`);
+}
+
+async function saveCurrentAsProfile() {
+  const form = document.getElementById('caps-form');
+  if (!form) return;
+  openModal({
+    title: '保存为能力档案',
+    mode: 'save-as-profile',
+    body: `<form class="form-stack" id="save-as-profile-form" data-form="save-as-profile">
+      <div class="field"><label for="save-as-profile-name">档案名称</label><input class="text-input" id="save-as-profile-name" name="name" type="text" maxlength="255" required placeholder="如：GPT-5.6 系列"><span class="field-help">档案保存当前表单中的能力字段（不含成本），创建后其他模型可直接复用。</span></div>
+    </form>`,
+    footer: `${button({ action: 'close-modal', label: '取消' })}${button({ action: 'submit-save-as-profile', label: '创建并复用', iconName: 'check', primary: true })}`,
+  });
+}
+
+async function submitSaveAsProfile(form) {
+  const name = String(new FormData(form).get('name') || '').trim();
+  if (!name) throw new Error('请填写档案名称');
+  const capsForm = document.getElementById('caps-form');
+  if (!capsForm) throw new Error('能力表单已关闭');
+  const values = new FormData(capsForm);
+  const rawMap = String(values.get('thinking_level_map') || '').trim();
+  let thinkingLevelMap = null;
+  if (rawMap) {
+    try {
+      thinkingLevelMap = JSON.parse(rawMap);
+    } catch {
+      throw new Error('thinkingLevelMap 必须是有效 JSON');
+    }
+  }
+  const created = await post('/capability-profiles', {
+    name,
+    description: null,
+    context_window: formNumberOrNull(values, 'context_window'),
+    max_tokens: formNumberOrNull(values, 'max_tokens'),
+    supports_image_input: formBoolOrNull(values, 'supports_image_input'),
+    reasoning: formBoolOrNull(values, 'reasoning'),
+    thinking_level_map: thinkingLevelMap,
+  });
+  closeModal();
+  const data = await get('/capability-profiles');
+  state.profiles = data.items || [];
+  syncProfileSelect(created.id);
+  refreshCapsPreview();
+  toast(`能力档案「${created.name}」已创建，当前模型已关联`);
+}
+
+const PROTOCOL_LABELS = {
+  openai_compatible: 'OpenAI Chat',
+  openai_responses: 'OpenAI Responses',
+  claude: 'Claude 原生',
+  gemini: 'Gemini',
+};
+
+function protocolLabel(protocol) {
+  return PROTOCOL_LABELS[protocol] || protocol;
+}
+
+async function loadMappings(version) {
+  const kind = mappingKindForPath(state.currentPath);
+  const config = MAPPING_KINDS[kind];
+  const [mappingData, modelData, presetData, routeData] = await Promise.all([get(config.api), get('/channel-models'), get(config.presetsApi), get('/routes')]);
+  if (version !== state.renderVersion) return;
+  state.mappingKind = kind;
+  state.mappings[kind] = mappingData?.items || [];
+  state.channelModels = modelData?.items || [];
+  state.presets[kind] = presetData;
+  state.routes = routeData?.items || [];
+  elements.page.innerHTML = renderMappingsPage();
+}
+
+function entryBaseUrl(kind) {
+  return `${window.location.origin}${MAPPING_KINDS[kind].entry.base}`;
+}
+
+function entryBanner(kind) {
+  const config = MAPPING_KINDS[kind];
+  const base = entryBaseUrl(kind);
+  const body = config.entry.body.replace('{base}', base);
+  return `<div class="entry-banner">
+    <div class="entry-banner-copy"><strong>${escapeHtml(config.entry.title)}</strong><p>${body}</p></div>
+    <div class="entry-banner-actions"><code class="mono">${escapeHtml(base)}</code>${iconButton({ action: 'copy-entry-url', iconName: 'copy', label: '复制接入地址', attrs: `data-entry-url="${escapeAttr(base)}"` })}</div>
+  </div>`;
+}
+
+function renderMappingsPage() {
+  const kind = state.mappingKind;
+  const config = MAPPING_KINDS[kind];
+  const mappings = state.mappings[kind] || [];
+  const rows = mappings.map((mapping) => `<tr class="${mapping.enabled ? '' : 'is-disabled-row'}">
+    <td><span class="mono">${escapeHtml(mapping[config.modelIdField])}</span>${mapping.display_name ? `<small class="subtle-text">${escapeHtml(mapping.display_name)}</small>` : ''}</td>
+    <td><span class="protocol">${escapeHtml(protocolLabel(mapping.upstream_protocol))}</span></td>
+    <td><span class="mono">${escapeHtml(mapping.upstream_model_id)}</span></td>
+    <td><div class="route-chain">${mapping.candidates.length ? mapping.candidates.map((candidate) => `<span class="route-candidate"><b>P${number(candidate.priority)}</b>${escapeHtml(candidate.channel_name)}</span>`).join('') : '<span class="subtle-text">该模型暂无可用路由候选</span>'}</div></td>
+    <td>${mapping.enabled ? statusDot('已启用', 'is-success') : statusDot('已停用', 'is-muted')}</td>
+    <td class="action-cell"><div class="table-actions">${iconButton({ action: 'edit-mapping', iconName: 'pencil', label: '编辑映射', attrs: `data-mapping-id="${escapeAttr(mapping.id)}"` })}${iconButton({ action: 'delete-mapping', iconName: 'trash-2', label: '删除映射', danger: true, attrs: `data-mapping-id="${escapeAttr(mapping.id)}"` })}</div></td>
+  </tr>`).join('');
+  return `<div class="page-stack">
+    ${entryBanner(kind)}
+    ${toolbar(config.toolbarTitle, '映射指向系统中已配置的模型，候选渠道直接继承该模型的路由', `${button({ action: 'refresh-mappings', label: '刷新', iconName: 'refresh-cw' })}${button({ action: 'open-mapping', label: '添加映射', iconName: 'plus', primary: true })}`)}
+    ${panel('映射表', '候选渠道取自上游模型在「模型路由」中的配置，无需单独设置', `<div class="section-body-flush">${mappings.length ? `<div class="table-scroll"><table class="data-table mappings-table"><thead><tr><th>${escapeHtml(config.tableHead)}</th><th>上游协议</th><th>上游模型</th><th>候选渠道（继承路由）</th><th>状态</th><th class="action-cell">操作</th></tr></thead><tbody>${rows}</tbody></table></div>` : emptyState('尚未创建模型映射', config.emptyDetail, 'shuffle')}</div>`) }
+  </div>`;
+}
+
+function configuredModelOptions(selected, protocol) {
+  const seen = new Set();
+  const models = (state.routes || [])
+    .filter((route) => route.enabled && (route.protocols || []).includes(protocol) && !seen.has(route.requested_model_id) && seen.add(route.requested_model_id))
+    .map((route) => route.requested_model_id)
+    .sort();
+  if (!models.length) return '<option value="" disabled>该协议暂无已配置路由的模型，请先在「模型路由」页配置</option>';
+  return models.map((model) => `<option value="${escapeAttr(model)}" ${selected === model ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('');
+}
+
+function mappingForm(editing = null) {
+  const kind = state.mappingKind;
+  const config = MAPPING_KINDS[kind];
+  const protocols = Object.keys(PROTOCOL_LABELS);
+  const currentProtocol = editing?.upstream_protocol || 'openai_compatible';
+  const protocolOptions = protocols.map((protocol) => `<option value="${protocol}" ${currentProtocol === protocol ? 'selected' : ''}>${escapeHtml(protocolLabel(protocol))}</option>`).join('');
+  const presets = state.presets[kind]?.items || [];
+  const presetOptions = presets.map((preset) => `<option value="${escapeAttr(preset.id)}">${escapeHtml(preset.display_name || preset.id)}</option>`).join('');
+  openModal({
+    title: editing ? '编辑模型映射' : '新建模型映射',
+    mode: editing ? 'mapping-edit' : 'mapping-create',
+    body: `<form class="form-stack" id="mapping-form" data-form="mapping" data-mapping-id="${escapeAttr(editing?.id || '')}">
+      <div class="field"><label for="mapping-preset">${escapeHtml(config.presetLabel)}</label><div class="preset-row"><select class="select" id="mapping-preset" data-preset-select ${editing ? 'disabled' : ''}><option value="">-- 手动输入或从预设中选择 --</option>${presetOptions}</select>${button({ action: 'refresh-presets', label: '刷新预设', iconName: 'refresh-cw', disabled: Boolean(editing) })}</div><span class="field-help">${escapeHtml(config.presetHelp)}</span></div>
+      <div class="field"><label for="mapping-model-id">${escapeHtml(config.modelLabel)}</label><input class="input" id="mapping-model-id" name="${escapeAttr(config.modelIdField)}" required maxlength="255" placeholder="${escapeAttr(config.placeholder)}" value="${escapeAttr(editing?.[config.modelIdField] || '')}" autocomplete="off"><span class="field-help">${escapeHtml(config.mappingHelp)}</span></div>
+      <div class="field"><label for="mapping-display-name">显示名称</label><input class="input" id="mapping-display-name" name="display_name" maxlength="255" placeholder="${escapeAttr(config.displayPlaceholder)}" value="${escapeAttr(editing?.display_name || '')}" autocomplete="off"><span class="field-help">出现在模型目录中的展示名称，留空则使用模型名。</span></div>
+      <div class="field"><label for="mapping-upstream-protocol">上游协议</label><select class="select" id="mapping-upstream-protocol" name="upstream_protocol" data-upstream-protocol required>${protocolOptions}</select><span class="field-help">${escapeHtml(config.protocolHelp)}</span></div>
+      <div class="field"><label for="mapping-upstream-model">上游模型（已配置路由）</label><select class="select" id="mapping-upstream-model" name="upstream_model_id" required>${configuredModelOptions(editing?.upstream_model_id || '', currentProtocol)}</select><span class="field-help">数据源为「模型路由」页已配置路由的模型，按所选上游协议过滤；候选渠道自动继承该模型的路由配置，无需单独设置。</span></div>
+    </form>`,
+    footer: `${button({ action: 'close-modal', label: '取消' })}${button({ action: 'submit-mapping', label: editing ? '保存' : '创建', iconName: editing ? 'check' : 'plus', primary: true })}`,
+  });
+}
+
+async function saveMapping(form) {
+  const kind = state.mappingKind;
+  const config = MAPPING_KINDS[kind];
+  const values = new FormData(form);
+  const payload = {
+    [config.modelIdField]: values.get(config.modelIdField).trim(),
+    display_name: values.get('display_name').trim() || null,
+    upstream_model_id: values.get('upstream_model_id').trim(),
+    upstream_protocol: values.get('upstream_protocol'),
+  };
+  const mappingId = form.dataset.mappingId;
+  if (mappingId) {
+    const mapping = (state.mappings[kind] || []).find((item) => item.id === mappingId);
+    if (mapping) payload.enabled = mapping.enabled;
+    await patch(`${config.api}/${mappingId}`, payload);
+  } else {
+    await post(config.api, payload);
+  }
+  closeModal();
+  toast(mappingId ? '映射已更新' : '映射已创建，候选渠道继承上游模型路由');
+  await loadMappings(state.renderVersion);
+}
+
+
+async function deleteMapping(mappingId) {
+  const kind = state.mappingKind;
+  const config = MAPPING_KINDS[kind];
+  const mapping = (state.mappings[kind] || []).find((item) => item.id === mappingId);
+  if (!await confirmAction({ title: '删除模型映射', message: `删除映射“${mapping?.[config.modelIdField] || ''}”？其全部候选渠道将一并删除。`, confirmLabel: '删除', danger: true })) return;
+  await remove(`${config.api}/${mappingId}`);
+  toast('映射已删除');
+  renderPage();
+}
+
+async function refreshPresets() {
+  const kind = state.mappingKind;
+  const config = MAPPING_KINDS[kind];
+  try {
+    await post(`${config.presetsApi}/refresh`);
+    toast('预设刷新已开始，正在查询上游渠道…');
+    await new Promise((resolve) => window.setTimeout(resolve, 2500));
+    state.presets[kind] = await get(config.presetsApi);
+    if (state.presets[kind]?.source === 'channels') toast(`已从上游渠道更新预设（${state.presets[kind]?.items?.length ?? 0} 个）`);
+    else toast('未发现可用的上游渠道，保留内置预设', 'warning');
+    const select = document.getElementById('mapping-preset');
+    if (select) {
+      const current = select.value;
+      const options = (state.presets[kind]?.items || []).map((preset) => `<option value="${escapeAttr(preset.id)}">${escapeHtml(preset.display_name || preset.id)}</option>`).join('');
+      select.innerHTML = `<option value="">-- 手动输入或从预设中选择 --</option>${options}`;
+      select.value = current;
+    }
+  } catch (error) {
+    toast(error.message || '预设刷新失败', 'error');
+  }
+}
+
+async function copyEntryUrl(url) {
+  try {
+    await navigator.clipboard.writeText(url);
+    toast('接入地址已复制');
+  } catch {
+    toast('无法访问剪贴板，请手动复制', 'warning');
+  }
+}
+
+
+
 async function loadLogs(version) {
   const { page, filters } = state.logs;
   const query = new URLSearchParams({ page: String(page), page_size: '50' });
@@ -865,6 +1313,7 @@ function renderLogsPage() {
     return `<tr class="log-row" data-log-request-id="${escapeAttr(item.id)}" tabindex="0" aria-label="查看 ${escapeAttr(item.model_id || '请求')} 的详情">
       <td class="logs-cell-time">${escapeHtml(formatLogTime(item.started_at))}</td>
       <td><span class="mono logs-model" title="${escapeAttr(item.model_id || '')}">${escapeHtml(item.model_id)}</span></td>
+      <td class="logs-cell-upstream">${item.upstream_model_id ? `<span class="mono">${escapeHtml(item.upstream_model_id)}</span>${item.upstream_protocol ? `<span class="protocol protocol-upstream">→${escapeHtml(protocolLabel(item.upstream_protocol))}</span>` : ''}` : '<span class="subtle-text">-</span>'}</td>
       <td class="logs-cell-route">${responseChannelTags(item.response_channels || [])}</td>
       <td class="logs-cell-protocol">${protocols([item.protocol])}</td>
       <td>${statusDot(outcome.label, outcome.statusClass)}</td>
@@ -876,11 +1325,13 @@ function renderLogsPage() {
   return `<div class="page-stack">
     ${toolbar('请求与渠道尝试', '查看每一次请求的结果、响应时间与上游尝试', button({ action: 'refresh-logs', label: '刷新', iconName: 'refresh-cw' }))}
     ${panel('请求记录', '', `<form class="filter-bar" data-form="logs-filter"><span class="filter-label">筛选条件</span>
-      <select class="select" name="protocol"><option value="">全部协议</option>${PROTOCOLS.map((protocol) => `<option value="${protocol}" ${filters.protocol === protocol ? 'selected' : ''}>${protocol}</option>`).join('')}</select>
-      <input class="input" name="model_id" value="${escapeAttr(filters.model_id)}" placeholder="模型 ID" autocomplete="off">
-      <select class="select is-outcome" name="outcome"><option value="">全部结果</option>${['success', 'upstream_error', 'gateway_error', 'stream_interrupted', 'cancelled'].map((outcome) => `<option value="${outcome}" ${filters.outcome === outcome ? 'selected' : ''}>${outcomeInfo(outcome).label}</option>`).join('')}</select>
+      <select class="select" name="protocol" aria-label="入口协议"><option value="">全部入口协议</option>${PROTOCOLS.map((protocol) => `<option value="${protocol}" ${filters.protocol === protocol ? 'selected' : ''}>${protocol}</option>`).join('')}</select>
+      <select class="select" name="upstream_protocol" aria-label="上游协议"><option value="">全部上游协议</option>${PROTOCOLS.map((protocol) => `<option value="${protocol}" ${filters.upstream_protocol === protocol ? 'selected' : ''}>${protocol}</option>`).join('')}</select>
+      <input class="input" name="model_id" value="${escapeAttr(filters.model_id)}" placeholder="请求模型" aria-label="请求模型" autocomplete="off">
+      <input class="input" name="upstream_model_id" value="${escapeAttr(filters.upstream_model_id)}" placeholder="上游模型" aria-label="上游模型" autocomplete="off">
+      <select class="select is-outcome" name="outcome" aria-label="请求结果"><option value="">全部结果</option>${['success', 'upstream_error', 'gateway_error', 'stream_interrupted', 'cancelled'].map((outcome) => `<option value="${outcome}" ${filters.outcome === outcome ? 'selected' : ''}>${outcomeInfo(outcome).label}</option>`).join('')}</select>
       ${button({ action: 'submit-log-filter', label: '查询', iconName: 'search', primary: true })}
-    </form><div class="section-body-flush">${items.length ? `<div class="table-scroll"><table class="data-table logs-table" aria-label="请求记录"><thead><tr><th>时间</th><th>模型</th><th>响应渠道</th><th>协议</th><th>结果</th><th class="align-right">HTTP</th><th class="align-right">尝试</th><th class="align-right">耗时</th></tr></thead><tbody>${rows}</tbody></table></div>` : emptyState('暂无请求日志', '发送模型请求后，这里会显示请求与渠道尝试。', 'file-text')}</div><div class="pagination"><span>第 ${page} / ${maxPage} 页，共 ${number(total)} 条</span>${button({ action: 'logs-prev', label: '上一页', iconName: 'chevron-left', disabled: page <= 1 })}${button({ action: 'logs-next', label: '下一页', iconName: 'chevron-right', disabled: page >= maxPage })}</div>`) }
+    </form><div class="section-body-flush">${items.length ? `<div class="table-scroll"><table class="data-table logs-table" aria-label="请求记录"><thead><tr><th>时间</th><th>请求模型</th><th>上游模型</th><th>响应渠道</th><th>入口协议</th><th>结果</th><th class="align-right">HTTP</th><th class="align-right">尝试</th><th class="align-right">耗时</th></tr></thead><tbody>${rows}</tbody></table></div>` : emptyState('暂无请求日志', '发送模型请求后，这里会显示请求与渠道尝试。', 'file-text')}</div><div class="pagination"><span>第 ${page} / ${maxPage} 页，共 ${number(total)} 条</span>${button({ action: 'logs-prev', label: '上一页', iconName: 'chevron-left', disabled: page <= 1 })}${button({ action: 'logs-next', label: '下一页', iconName: 'chevron-right', disabled: page >= maxPage })}</div>`) }
   </div>`;
 }
 
@@ -888,14 +1339,18 @@ async function viewRequest(requestId) {
   const detail = await get(`/requests/${requestId}`);
   const outcome = outcomeInfo(detail.outcome);
   const attempts = detail.attempts || [];
+  const upstream = attempts.find((attempt) => attempt.upstream_protocol || attempt.upstream_model_id) || {};
   const cards = attempts.map((attempt) => {
     const attemptOutcome = outcomeInfo(attempt.outcome);
-    return `<article class="attempt-card"><div class="attempt-head"><div><strong>${escapeHtml(attempt.channel_name || `尝试 ${attempt.attempt_no}`)}</strong><div class="attempt-meta"><span>尝试 ${number(attempt.attempt_no)}</span><span>HTTP ${number(attempt.status_code)}</span><span>首 Token ${duration(attempt.first_token_ms)}</span><span>TPS ${number(attempt.tps, { maximumFractionDigits: 3 })}</span></div></div>${statusDot(attemptOutcome.label, attemptOutcome.statusClass)}</div><div class="attempt-metrics"><div class="attempt-metric"><span>缓存命中</span><strong>${tokenCount(attempt.cache_read_tokens)}</strong></div><div class="attempt-metric"><span>缓存写入</span><strong>${tokenCount(attempt.cache_write_tokens)}</strong></div><div class="attempt-metric"><span>缓存未命中</span><strong>${tokenCount(attempt.cache_miss_input_tokens)}</strong></div><div class="attempt-metric"><span>输出</span><strong>${tokenCount(attempt.output_tokens)}</strong></div></div></article>`;
+    const upstreamMeta = attempt.upstream_model_id
+      ? `<span>上游 ${escapeHtml(attempt.upstream_model_id)}${attempt.upstream_protocol ? ` · ${escapeHtml(protocolLabel(attempt.upstream_protocol))}` : ''}</span>`
+      : '';
+    return `<article class="attempt-card"><div class="attempt-head"><div><strong>${escapeHtml(attempt.channel_name || `尝试 ${attempt.attempt_no}`)}</strong><div class="attempt-meta"><span>尝试 ${number(attempt.attempt_no)}</span><span>HTTP ${number(attempt.status_code)}</span><span>首 Token ${duration(attempt.first_token_ms)}</span><span>TPS ${number(attempt.tps, { maximumFractionDigits: 3 })}</span>${upstreamMeta}</div></div>${statusDot(attemptOutcome.label, attemptOutcome.statusClass)}</div><div class="attempt-metrics"><div class="attempt-metric"><span>缓存命中</span><strong>${tokenCount(attempt.cache_read_tokens)}</strong></div><div class="attempt-metric"><span>缓存写入</span><strong>${tokenCount(attempt.cache_write_tokens)}</strong></div><div class="attempt-metric"><span>缓存未命中</span><strong>${tokenCount(attempt.cache_miss_input_tokens)}</strong></div><div class="attempt-metric"><span>输出</span><strong>${tokenCount(attempt.output_tokens)}</strong></div></div></article>`;
   }).join('');
   openDrawer({
     title: '请求详情',
     subtitle: detail.model_id || '',
-    body: `<div class="detail-grid"><span>请求 ID</span><strong class="mono">${escapeHtml(detail.id)}</strong><span>模型</span><strong class="mono">${escapeHtml(detail.model_id)}</strong><span>结果</span><strong>${statusDot(outcome.label, outcome.statusClass)}</strong><span>总耗时</span><strong>${escapeHtml(duration(detail.total_duration_ms))}</strong></div><section class="drawer-section"><h3>渠道尝试</h3>${cards || emptyState('无上游尝试', '本次请求没有记录到上游渠道尝试。', 'activity')}</section>`,
+    body: `<div class="detail-grid"><span>请求 ID</span><strong class="mono">${escapeHtml(detail.id)}</strong><span>模型</span><strong class="mono">${escapeHtml(detail.model_id)}</strong><span>上游模型</span><strong class="mono">${escapeHtml(upstream.upstream_model_id || '-')}</strong><span>上游协议</span><strong>${escapeHtml(upstream.upstream_protocol ? protocolLabel(upstream.upstream_protocol) : '-')}</strong><span>结果</span><strong>${statusDot(outcome.label, outcome.statusClass)}</strong><span>总耗时</span><strong>${escapeHtml(duration(detail.total_duration_ms))}</strong></div><section class="drawer-section"><h3>渠道尝试</h3>${cards || emptyState('无上游尝试', '本次请求没有记录到上游渠道尝试。', 'activity')}</section>`,
   });
 }
 
@@ -1011,7 +1466,7 @@ async function saveAuth(form) {
 
 async function submitLogFilter(form) {
   const values = new FormData(form);
-  state.logs.filters = { protocol: values.get('protocol') || '', model_id: values.get('model_id')?.trim() || '', outcome: values.get('outcome') || '' };
+  state.logs.filters = { protocol: values.get('protocol') || '', upstream_protocol: values.get('upstream_protocol') || '', model_id: values.get('model_id')?.trim() || '', upstream_model_id: values.get('upstream_model_id')?.trim() || '', outcome: values.get('outcome') || '' };
   state.logs.page = 1;
   await loadLogs(state.renderVersion);
 }
@@ -1045,6 +1500,17 @@ async function handleAction(target) {
     if (action === 'save-caps') return document.getElementById('caps-form')?.requestSubmit();
     if (action === 'detect-caps') return detectCapabilities();
     if (action === 'delete-route') return deleteRoute(target.dataset.routeId);
+    if (action === 'refresh-profiles') return renderPage();
+    if (action === 'open-profile') return profileForm();
+    if (action === 'edit-profile') return profileForm(state.profiles.find((item) => item.id === target.dataset.profileId));
+    if (action === 'delete-profile') return deleteProfile(target.dataset.profileId);
+    if (action === 'save-as-profile') return saveCurrentAsProfile();
+    if (action === 'refresh-mappings') return renderPage();
+    if (action === 'open-mapping') return mappingForm();
+    if (action === 'edit-mapping') return mappingForm((state.mappings[state.mappingKind] || []).find((item) => item.id === target.dataset.mappingId));
+    if (action === 'delete-mapping') return deleteMapping(target.dataset.mappingId);
+    if (action === 'refresh-presets') return refreshPresets();
+    if (action === 'copy-entry-url') return copyEntryUrl(target.dataset.entryUrl);
     if (action === 'refresh-logs') return loadLogs(state.renderVersion);
     if (action === 'logs-prev') { state.logs.page -= 1; return loadLogs(state.renderVersion); }
     if (action === 'logs-next') { state.logs.page += 1; return loadLogs(state.renderVersion); }
@@ -1055,6 +1521,9 @@ async function handleAction(target) {
     if (action === 'submit-provider') return document.getElementById('provider-form')?.requestSubmit();
     if (action === 'submit-channel') return document.getElementById('channel-form')?.requestSubmit();
     if (action === 'submit-route') return document.getElementById('route-form')?.requestSubmit();
+    if (action === 'submit-profile') return document.getElementById('profile-form')?.requestSubmit();
+    if (action === 'submit-save-as-profile') return document.getElementById('save-as-profile-form')?.requestSubmit();
+    if (action === 'submit-mapping') return document.getElementById('mapping-form')?.requestSubmit();
     if (action === 'submit-auth') return document.getElementById('auth-form')?.requestSubmit();
     if (action === 'submit-settings') return document.getElementById('settings-form')?.requestSubmit();
     if (action === 'submit-log-filter') return document.querySelector('[data-form="logs-filter"]')?.requestSubmit();
@@ -1071,6 +1540,9 @@ async function handleSubmit(event) {
     if (form.dataset.form === 'provider') await saveProvider(form);
     else if (form.dataset.form === 'channel') await saveChannel(form);
     else if (form.dataset.form === 'route') await saveRoute(form);
+    else if (form.dataset.form === 'profile') await saveProfile(form);
+    else if (form.dataset.form === 'save-as-profile') await submitSaveAsProfile(form);
+    else if (form.dataset.form === 'mapping') await saveMapping(form);
     else if (form.dataset.form === 'caps') await saveCapabilities(form);
     else if (form.dataset.form === 'auth') await saveAuth(form);
     else if (form.dataset.form === 'settings') await saveSettings(form);
@@ -1088,12 +1560,36 @@ function handleChange(event) {
     if (target.checked) elements.drawerBody.querySelector('[data-candidate-list]').append(row);
     updateCandidateOrder();
   }
+  if (target.matches('[data-preset-select]')) {
+    const presetId = target.value;
+    const preset = (state.presets[state.mappingKind]?.items || []).find((item) => item.id === presetId);
+    if (preset) {
+      const modelInput = document.getElementById('mapping-model-id');
+      const nameInput = document.getElementById('mapping-display-name');
+      if (modelInput) modelInput.value = preset.id;
+      if (nameInput) nameInput.value = preset.display_name || '';
+    }
+  }
+  if (target.matches('[data-upstream-protocol]')) {
+    const modelSelect = document.getElementById('mapping-upstream-model');
+    if (modelSelect) {
+      const current = modelSelect.value;
+      modelSelect.innerHTML = configuredModelOptions(current, target.value);
+      const stillValid = [...modelSelect.options].some((option) => option.value === current);
+      if (!stillValid) modelSelect.value = '';
+    }
+  }
   if (target.matches('[data-trust-toggle]')) {
     const keyArea = document.getElementById('access-keys');
     const description = document.getElementById('trust-description');
     if (keyArea) keyArea.hidden = target.checked;
     if (description) description.textContent = target.checked ? '代理和管理员界面不要求密钥' : '代理和管理员界面要求对应密钥';
   }
+  if (target.matches('[data-profile-select]')) {
+    if (target.value) applyProfileToForm(target.value);
+    return;
+  }
+  if (target.closest('[data-form="caps"]')) refreshCapsPreview();
 }
 
 document.addEventListener('click', (event) => {
@@ -1123,6 +1619,9 @@ document.addEventListener('keydown', (event) => {
 });
 document.addEventListener('submit', handleSubmit);
 document.addEventListener('change', handleChange);
+document.addEventListener('input', (event) => {
+  if (event.target.closest('[data-form="caps"]')) refreshCapsPreview();
+});
 document.addEventListener('dragstart', (event) => {
   const dragHandle = event.target.closest('[data-candidate-drag-handle]');
   if (!dragHandle || dragHandle.disabled) return;

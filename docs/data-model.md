@@ -151,6 +151,40 @@ erDiagram
 
 服务层按模型 ID 接收一份全局渠道优先级，再将每个渠道写入其支持的内部协议路由；同一渠道在各协议路由中保持相同优先级。`channel_models.model_id` 必须等于 `model_routes.requested_model_id`。
 
+### 3.6 `model_caps` 与 `capability_profiles`
+
+#### 3.6.1 `capability_profiles`（能力档案）
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `id` | TEXT | PK | UUID |
+| `name` | TEXT | UNIQUE, NOT NULL | 档案名称，如「GPT-5.6 系列」 |
+| `description` | TEXT | NULL | 描述 |
+| `context_window` | INTEGER | NULL | 上下文 Token |
+| `max_tokens` | INTEGER | NULL | 最大输出 Token |
+| `supports_image_input` | BOOLEAN | NULL | 图像输入 |
+| `reasoning` | BOOLEAN | NULL | 思考能力 |
+| `thinking_level_map` | JSON | NULL | 思考档位映射 |
+| `created_at` | DATETIME | NOT NULL | 创建时间 |
+| `updated_at` | DATETIME | NOT NULL | 更新时间 |
+
+档案只收集功能能力字段，不包含成本：成本属于定价、随模型而异，仍在 `model_caps` 上按模型配置。
+
+#### 3.6.2 `model_caps`
+
+在既有能力字段（`context_window`、`max_tokens`、`supports_image_input`、`reasoning`、`thinking_level_map`、`cost_input`、`cost_output`、`cost_cache_read`、`cost_cache_write`、`source`）之外，新增：
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `profile_id` | TEXT | FK `capability_profiles.id` ON DELETE SET NULL | 引用的能力档案；为空表示未绑定 |
+
+行为约定：
+
+- 应用档案：`PUT /model-capabilities/{model_id}` 携带 `profile_id` 时，档案能力字段回填到模型行并建立引用；请求中显式给出的字段覆盖档案值。
+- 档案更新：`PUT /capability-profiles/{id}` 会把能力字段同步到所有引用该档案的 `model_caps` 行（成本与 `profile_id` 不变）。
+- 档案删除：引用模型解除绑定（`profile_id` 置空），已应用的能力值保留。
+- 手动保存不带 `profile_id` 的完整替换，或切换 `source=auto`，都会解除绑定。
+
 ## 4. 健康状态表
 
 ### 4.1 `channel_health`
