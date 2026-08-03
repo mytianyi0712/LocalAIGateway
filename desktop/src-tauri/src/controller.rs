@@ -2,10 +2,16 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
-use tokio::{sync::{Mutex, RwLock}, task::JoinHandle};
+use tokio::{
+    sync::{Mutex, RwLock},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 
-use crate::{config::{AppConfig, validate_port}, server};
+use crate::{
+    config::{AppConfig, validate_port},
+    server,
+};
 
 #[derive(Clone, Debug, Default)]
 struct RuntimeStatus {
@@ -64,7 +70,9 @@ impl ServerController {
 
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         let mut slot = self.server.lock().await;
-        if slot.is_some() { return Ok(()); }
+        if slot.is_some() {
+            return Ok(());
+        }
         let config = self.config.read().await.clone();
         let router = server::build(config.clone()).await?;
         let listener = server::bind(&config).await?;
@@ -80,7 +88,9 @@ impl ServerController {
             let result = server::serve(listener, router, task_cancel).await;
             let mut runtime = controller.runtime.write().await;
             runtime.running = false;
-            if let Err(error) = result { runtime.error = Some(error.to_string()); }
+            if let Err(error) = result {
+                runtime.error = Some(error.to_string());
+            }
         });
         *slot = Some(RunningServer { cancel, task });
         Ok(())
@@ -97,12 +107,10 @@ impl ServerController {
 
     pub fn request_stop(&self) {
         if let Ok(slot) = self.server.try_lock() {
-            if let Some(running) = slot.as_ref() { running.cancel.cancel(); }
+            if let Some(running) = slot.as_ref() {
+                running.cancel.cancel();
+            }
         }
-    }
-
-    pub async fn toggle(self: &Arc<Self>) -> Result<()> {
-        if self.runtime.read().await.running { self.stop().await; Ok(()) } else { self.start().await }
     }
 
     pub async fn set_port(self: &Arc<Self>, port: u16) -> Result<()> {
@@ -122,9 +130,13 @@ impl ServerController {
 
     pub async fn open_dashboard(&self) -> Result<()> {
         let state = self.state().await;
-        if !state.running { anyhow::bail!("网关尚未运行"); }
+        if !state.running {
+            anyhow::bail!("网关尚未运行");
+        }
         open::that(&state.url).context("无法打开系统浏览器")
     }
 
-    pub fn platform_data_dir(&self) -> &PathBuf { &self.platform_data_dir }
+    pub fn platform_data_dir(&self) -> &PathBuf {
+        &self.platform_data_dir
+    }
 }

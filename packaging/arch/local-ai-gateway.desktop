@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Local AI Gateway
+Comment=Local AI protocol gateway and routing manager
+Exec=local-ai-gateway
+Icon=local-ai-gateway
+Categories=Development;Network;
+Terminal=false
+StartupNotify=true

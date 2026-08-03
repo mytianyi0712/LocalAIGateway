@@ -22,7 +22,12 @@ pub struct RoutableModel {
     pub created_at: String,
 }
 
-pub async fn resolve_candidates(state: &AppState, protocol: &str, model_id: &str, limit: i64) -> Result<Vec<Candidate>> {
+pub async fn resolve_candidates(
+    state: &AppState,
+    protocol: &str,
+    model_id: &str,
+    limit: i64,
+) -> Result<Vec<Candidate>> {
     Ok(sqlx::query_as::<_, Candidate>(
         "SELECT rc.id AS candidate_id, c.id AS channel_id, c.name AS channel_name, \
                 rc.priority, p.base_url, c.api_key_encrypted, cm.model_id \
@@ -39,7 +44,10 @@ pub async fn resolve_candidates(state: &AppState, protocol: &str, model_id: &str
     ).bind(protocol).bind(model_id).bind(limit).fetch_all(state.db.pool()).await?)
 }
 
-pub async fn list_routable_models(state: &AppState, protocol: Option<&str>) -> Result<Vec<RoutableModel>> {
+pub async fn list_routable_models(
+    state: &AppState,
+    protocol: Option<&str>,
+) -> Result<Vec<RoutableModel>> {
     let rows = sqlx::query_as::<_, RoutableModel>(
         "SELECT mr.requested_model_id AS id, mr.requested_model_id AS display_name, MIN(mr.created_at) AS created_at \
          FROM model_routes mr \
@@ -74,5 +82,7 @@ pub async fn list_mapping_models(state: &AppState, kind: &str) -> Result<Vec<Rou
              AND mr.enabled = 1 AND rc.enabled = 1 AND cm.available = 1 AND c.manual_enabled = 1 AND ch.state = 'active') \
          ORDER BY m.{id_column}"
     );
-    Ok(sqlx::query_as::<_, RoutableModel>(&sql).fetch_all(state.db.pool()).await?)
+    Ok(sqlx::query_as::<_, RoutableModel>(&sql)
+        .fetch_all(state.db.pool())
+        .await?)
 }

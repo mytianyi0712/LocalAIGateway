@@ -1,7 +1,10 @@
 use std::{path::Path, str::FromStr, time::Duration};
 
 use anyhow::{Context, Result};
-use sqlx::{SqlitePool, sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions}};
+use sqlx::{
+    SqlitePool,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+};
 
 #[derive(Clone)]
 pub struct Database {
@@ -20,9 +23,12 @@ impl Database {
             .min_connections(1)
             .max_connections(8)
             .acquire_timeout(Duration::from_secs(10))
-            .connect_with(options).await
+            .connect_with(options)
+            .await
             .with_context(|| format!("无法打开数据库 {}", path.display()))?;
-        sqlx::migrate!("./migrations").run(&pool).await
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
             .context("无法初始化数据库结构")?;
         let database = Self { pool };
         database.ensure_legacy_columns().await?;
@@ -30,25 +36,43 @@ impl Database {
         Ok(database)
     }
 
-    pub fn pool(&self) -> &SqlitePool { &self.pool }
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
 
     async fn ensure_legacy_columns(&self) -> Result<()> {
-        self.add_column_if_missing("model_caps", "profile_id", "TEXT REFERENCES capability_profiles(id) ON DELETE SET NULL").await?;
-        self.add_column_if_missing("request_attempts", "upstream_protocol", "TEXT").await?;
-        self.add_column_if_missing("request_attempts", "upstream_model_id", "TEXT").await?;
-        self.add_column_if_missing("claude_model_mappings", "upstream_model_id", "TEXT").await?;
+        self.add_column_if_missing(
+            "model_caps",
+            "profile_id",
+            "TEXT REFERENCES capability_profiles(id) ON DELETE SET NULL",
+        )
+        .await?;
+        self.add_column_if_missing("request_attempts", "upstream_protocol", "TEXT")
+            .await?;
+        self.add_column_if_missing("request_attempts", "upstream_model_id", "TEXT")
+            .await?;
+        self.add_column_if_missing("claude_model_mappings", "upstream_model_id", "TEXT")
+            .await?;
         sqlx::query("UPDATE claude_model_mappings SET upstream_model_id = claude_model_id WHERE upstream_model_id IS NULL")
             .execute(&self.pool).await?;
         Ok(())
     }
 
-    async fn add_column_if_missing(&self, table: &str, column: &str, declaration: &str) -> Result<()> {
+    async fn add_column_if_missing(
+        &self,
+        table: &str,
+        column: &str,
+        declaration: &str,
+    ) -> Result<()> {
         let pragma = format!("PRAGMA table_info({table})");
-        let columns: Vec<(i64, String, String, i64, Option<String>, i64)> = sqlx::query_as(&pragma)
-            .fetch_all(&self.pool).await?;
+        let columns: Vec<(i64, String, String, i64, Option<String>, i64)> =
+            sqlx::query_as(&pragma).fetch_all(&self.pool).await?;
         if !columns.iter().any(|(_, name, _, _, _, _)| name == column) {
-            sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} {declaration}"))
-                .execute(&self.pool).await?;
+            sqlx::query(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+            ))
+            .execute(&self.pool)
+            .await?;
         }
         Ok(())
     }
@@ -70,8 +94,10 @@ impl Database {
              WHERE cp.protocol IN ('openai_compatible', 'openai_responses') \
                AND EXISTS (SELECT 1 FROM channel_model_protocols current \
                            WHERE current.channel_model_id = cm.id \
-                             AND current.protocol IN ('openai_compatible', 'openai_responses'))"
-        ).execute(&mut *tx).await?;
+                             AND current.protocol IN ('openai_compatible', 'openai_responses'))",
+        )
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }

@@ -1,0 +1,120 @@
+name: Desktop bundles
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  package:
+    name: Package ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-22.04
+            os: ubuntu-22.04
+            kind: linux
+            bundles: deb,appimage
+            artifact_path: desktop/src-tauri/target/release/bundle/**
+          - name: ubuntu-24.04
+            os: ubuntu-24.04
+            kind: linux
+            bundles: deb
+            artifact_path: desktop/src-tauri/target/release/bundle/**
+          - name: windows-x64
+            os: windows-latest
+            kind: windows-native
+            bundles: nsis
+            artifact_path: desktop/src-tauri/target/release/bundle/**
+          - name: windows-wine-x64
+            os: ubuntu-24.04
+            kind: windows-wine
+            bundles: nsis
+            artifact_path: desktop/src-tauri/target/x86_64-pc-windows-gnu/release/bundle/**
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux bundling dependencies
+        if: matrix.kind == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+
+      - name: Install Wine cross-build dependencies
+        if: matrix.kind == 'windows-wine'
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y wine wine64 gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 unzip
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --locked --version "^2"
+
+      - name: Build Linux packages
+        if: matrix.kind == 'linux'
+        working-directory: desktop/src-tauri
+        env:
+          BUNDLES: ${{ matrix.bundles }}
+          NO_STRIP: "true"
+        run: ../scripts/build-appimage.sh
+
+      - name: Build Windows installer through Wine
+        if: matrix.kind == 'windows-wine'
+        run: ./packaging/build-windows-wine.sh
+
+      - name: Build native Windows installer
+        if: matrix.kind == 'windows-native'
+        working-directory: desktop/src-tauri
+        run: cargo tauri build --bundles "${{ matrix.bundles }}"
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-ai-gateway-${{ matrix.name }}
+          path: ${{ matrix.artifact_path }}
+          if-no-files-found: error
+
+  arch:
+    name: Package Arch Linux
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Arch package in Arch Linux
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+        run: |
+          docker run --rm \
+            --interactive \
+            --volume "${GITHUB_WORKSPACE}:/workspace" \
+            --workdir /workspace \
+            archlinux:base-devel \
+            bash -s <<'INNER'
+          set -euo pipefail
+          pacman -Syu --noconfirm --needed \
+            ca-certificates curl git python rust cargo \
+            webkit2gtk-4.1 gtk3 libayatana-appindicator librsvg patchelf
+          useradd --create-home builder
+          chown -R builder:builder /workspace
+          su builder -c './packaging/build-arch.sh'
+          INNER
+
+      - name: Upload Arch package
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-ai-gateway-arch
+          path: desktop/src-tauri/target/packages/arch/*.pkg.tar.*
+          if-no-files-found: error

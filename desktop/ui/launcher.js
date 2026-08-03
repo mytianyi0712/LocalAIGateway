@@ -4,21 +4,25 @@ const elements = {
   dot: document.querySelector('#status-dot'),
   label: document.querySelector('#status-label'),
   detail: document.querySelector('#status-detail'),
+  error: document.querySelector('#status-error'),
   port: document.querySelector('#port'),
   hint: document.querySelector('#port-hint'),
-  toggle: document.querySelector('#toggle'),
   open: document.querySelector('#open-dashboard'),
   form: document.querySelector('#port-form'),
-  version: document.querySelector('#version'),
 };
 
+let savedPort = '';
+let portDirty = false;
+
 function render(state) {
-  elements.port.value = state.port;
-  elements.version.textContent = state.version;
+  const nextSavedPort = String(state.port);
+  if (!portDirty) elements.port.value = nextSavedPort;
+  savedPort = nextSavedPort;
   elements.dot.className = `status-dot ${state.running ? 'running' : state.error ? 'failed' : ''}`;
-  elements.label.textContent = state.running ? '网关运行中' : state.error ? '启动失败' : '网关已停止';
-  elements.detail.textContent = state.error || (state.running ? state.url : '点击启动服务恢复本地网关');
-  elements.toggle.textContent = state.running ? '停止服务' : '启动服务';
+  elements.label.textContent = state.running ? '运行中' : state.error ? '启动失败' : '正在启动';
+  elements.detail.textContent = state.url;
+  elements.error.textContent = state.error || '';
+  elements.error.hidden = !state.error;
   elements.open.disabled = !state.running;
 }
 
@@ -40,13 +44,19 @@ async function withBusy(button, task) {
   }
 }
 
-elements.form.addEventListener('submit', (event) => {
-  event.preventDefault();
-  const port = Number(elements.port.value);
-  withBusy(event.submitter, () => invoke('set_port', { port }));
+elements.port.addEventListener('input', () => {
+  portDirty = elements.port.value !== savedPort;
 });
 
-elements.toggle.addEventListener('click', () => withBusy(elements.toggle, () => invoke('toggle_server')));
+elements.form.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const port = Number(elements.port.value);
+  await withBusy(event.submitter, async () => {
+    await invoke('set_port', { port });
+    portDirty = elements.port.value !== String(port);
+  });
+});
+
 elements.open.addEventListener('click', () => withBusy(elements.open, () => invoke('open_dashboard')));
 
 await refresh();

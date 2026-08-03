@@ -21,7 +21,7 @@
 - 创建渠道后可以手动进行模型探测，会自动从上游探测可用模型。
 - 必须在路由中配置模型以及路由规则，才能在v1/models端点检索到模型，并通过对应端点调用。
 - 模型能力（上下文、最大输出、图像/思考支持、成本）可在「模型路由 → 配置能力」中手动配置；内置「能力档案」页可创建可复用的能力集合，在配置能力抽屉中选择档案即可一键应用并建立关联（如 GPT-5.6 Sol/Terra/Luna 共用一套），也可直接点「保存为档案」把当前表单存为新档案，修改档案会同步到所有引用它的模型。
-- 本项目只对请求进行简单转发，不进行任何额外处理，因此在配置渠道端点时务必确保上游支持所选端点。
+- 本项目模型路由只对请求进行简单转发，不进行任何额外处理，因此在配置渠道端点时务必确保上游支持所选端点。
 - Claude 模型映射助手（Claude Code 标准名 → 系统中已配置的模型，独立于常规请求）：
   1. 先在供应商与渠道页配置好上游渠道并探测/登记模型，再到「模型路由」页为上游模型配置候选优先级（候选渠道直接在系统中已配置的模型里选择，映射无需单独配置候选）。
   2. 打开「Claude 映射」页，点击「添加映射」：可从预设下拉快速选择 Anthropic 当前模型名（如 `claude-opus-5`，内置默认 + 经已配置的 Claude 渠道实时刷新），再从「上游模型」下拉选择——数据源直接来自「模型路由」页已配置路由的模型，并按所选上游协议自动过滤；再选择该模型独立使用的上游协议（OpenAI Chat / OpenAI Responses / Claude 原生 / Gemini）。
@@ -121,6 +121,26 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 
 聚合目录保持 OpenAI 标准的 `object: "list"` 和 `data[].id` 结构，额外字段可被 CC Switch 等只读取标准字段的客户端忽略。`GET /v1/models` 也接受 `X-Local-Gateway-Protocol` 显式选择单个协议池。
 
+## 桌面打包
+
+桌面端基于 Tauri 2。先安装 Rust 与 Tauri CLI：
+
+```bash
+cargo install --locked tauri-cli --version '^2'
+```
+
+在 Arch Linux 上可按目标单独打包，也可一次完成全部目标：
+
+```bash
+make package-appimage       # 本机 .deb + AppImage
+make package-arch           # Arch .pkg.tar.zst
+make package-ubuntu         # Docker 内构建 Ubuntu 22.04 / 24.04 .deb
+make package-windows-wine   # MinGW 交叉编译 + Wine 生成 NSIS 安装包
+make package-all            # 依次执行以上全部流程
+```
+
+Arch 包需要 `makepkg`、GTK/WebKitGTK 与 Ayatana AppIndicator 开发环境；Ubuntu 系列构建需要可用的 Docker；Windows 交叉构建需要 Wine、MinGW-w64、Rustup 和 `unzip`，脚本会自动安装 Rust Windows GNU target 并缓存便携版 NSIS。产物分别写入 `desktop/src-tauri/target/release/bundle/`、`desktop/src-tauri/target/packages/arch/`、`target/packages/ubuntu/` 和 `target/packages/windows-wine/`。发布标签也会通过 `.github/workflows/desktop.yml` 构建相同平台矩阵。
+
 ## 开发与验证
 
 ```bash
@@ -151,7 +171,7 @@ sudo systemctl enable --now local-ai-gateway
 ## 核心边界
 
 - 支持 OpenAI Compatible、OpenAI Responses、Claude、Gemini 四种协议。
-- 只在完全相同的协议内进行故障转移，不做跨协议转换。
+- 模型路由功能只在完全相同的协议内进行故障转移，不做跨协议转换。
 - 用户请求体、上游响应体和最终上游 HTTP 错误保持原始字节不变。
 - 网关只处理路由、认证替换、逐跳头处理、故障转移、旁路统计和健康检查。
 - 不进行价格或费用计算。

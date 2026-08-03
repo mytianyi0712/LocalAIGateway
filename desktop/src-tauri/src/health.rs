@@ -6,7 +6,9 @@ use tokio::time::{Duration, timeout};
 use crate::{protocol, server::AppState};
 
 pub async fn queue(state: AppState, channel_id: String) -> Result<()> {
-    tokio::spawn(async move { let _=probe(&state,&channel_id).await; });
+    tokio::spawn(async move {
+        let _ = probe(&state, &channel_id).await;
+    });
     Ok(())
 }
 
@@ -20,24 +22,48 @@ async fn probe(state: &AppState, channel_id: &str) -> Result<()> {
         None => sqlx::query_scalar("SELECT model_id FROM channel_models WHERE channel_id=? AND available=1 ORDER BY model_id LIMIT 1")
             .bind(channel_id).fetch_optional(state.db.pool()).await?.unwrap_or_default(),
     };
-    if model.is_empty() { return Ok(()); }
-    let key = state.secrets.decrypt(&row.try_get::<Vec<u8>, _>("api_key_encrypted")?)?;
+    if model.is_empty() {
+        return Ok(());
+    }
+    let key = state
+        .secrets
+        .decrypt(&row.try_get::<Vec<u8>, _>("api_key_encrypted")?)?;
     let base: String = row.try_get("base_url")?;
     let (path, body): (String, serde_json::Value) = match protocol_name.as_str() {
-        "openai_compatible" => ("/v1/chat/completions".to_owned(), json!({"model":model,"messages":[{"role":"user","content":"Reply only OK"}],"max_tokens":2})),
-        "openai_responses" => ("/v1/responses".to_owned(), json!({"model":model,"input":"Reply only OK","max_output_tokens":2})),
-        "claude" => ("/v1/messages".to_owned(), json!({"model":model,"max_tokens":2,"messages":[{"role":"user","content":"Reply only OK"}]})),
-        "gemini" => (format!("/v1beta/models/{model}:generateContent"), json!({"contents":[{"parts":[{"text":"Reply only OK"}]}],"generationConfig":{"maxOutputTokens":2}})),
+        "openai_compatible" => (
+            "/v1/chat/completions".to_owned(),
+            json!({"model":model,"messages":[{"role":"user","content":"Reply only OK"}],"max_tokens":2}),
+        ),
+        "openai_responses" => (
+            "/v1/responses".to_owned(),
+            json!({"model":model,"input":"Reply only OK","max_output_tokens":2}),
+        ),
+        "claude" => (
+            "/v1/messages".to_owned(),
+            json!({"model":model,"max_tokens":2,"messages":[{"role":"user","content":"Reply only OK"}]}),
+        ),
+        "gemini" => (
+            format!("/v1beta/models/{model}:generateContent"),
+            json!({"contents":[{"parts":[{"text":"Reply only OK"}]}],"generationConfig":{"maxOutputTokens":2}}),
+        ),
         _ => return Ok(()),
     };
     let url = protocol::upstream_url(&base, &path, None, &protocol_name)?;
     let headers = protocol::outbound_headers(&axum::http::HeaderMap::new(), &protocol_name, &key)?;
     let started = std::time::Instant::now();
-    let result = timeout(Duration::from_secs(20), state.http.post(url).headers(headers).json(&body).send()).await;
+    let result = timeout(
+        Duration::from_secs(20),
+        state.http.post(url).headers(headers).json(&body).send(),
+    )
+    .await;
     let (success, status, error_kind) = match result {
-        Ok(Ok(response)) => { let status=response.status(); let _=response.bytes().await; (status.is_success(),Some(status.as_u16() as i64),None) }
-        Ok(Err(error)) => (false,None,Some(error.to_string())),
-        Err(_) => (false,None,Some("timeout".into())),
+        Ok(Ok(response)) => {
+            let status = response.status();
+            let _ = response.bytes().await;
+            (status.is_success(), Some(status.as_u16() as i64), None)
+        }
+        Ok(Err(error)) => (false, None, Some(error.to_string())),
+        Err(_) => (false, None, Some("timeout".into())),
     };
     let time = chrono::Utc::now().to_rfc3339();
     sqlx::query("INSERT INTO health_probe_logs(id,channel_id,model_id,started_at,duration_ms,success,status_code,error_kind,next_probe_at) VALUES(?,?,?,?,?,?,?,?,?)")

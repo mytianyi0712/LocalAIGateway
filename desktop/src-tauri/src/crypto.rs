@@ -1,4 +1,7 @@
-use std::{io::ErrorKind, path::{Path, PathBuf}};
+use std::{
+    io::ErrorKind,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use fernet::Fernet;
@@ -23,13 +26,27 @@ impl SecretStore {
 
     pub fn decrypt(&self, value: &[u8]) -> Result<String> {
         let token = std::str::from_utf8(value).context("密钥密文不是 UTF-8")?;
-        let plain = self.cipher.decrypt(token).context("无法解密已保存的 API Key")?;
+        let plain = self
+            .cipher
+            .decrypt(token)
+            .context("无法解密已保存的 API Key")?;
         String::from_utf8(plain).context("API Key 解密结果不是 UTF-8")
     }
 
     pub fn hint(value: &str) -> String {
-        let suffix: String = value.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
-        if value.chars().count() >= 4 { format!("...{suffix}") } else { "...".into() }
+        let suffix: String = value
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        if value.chars().count() >= 4 {
+            format!("...{suffix}")
+        } else {
+            "...".into()
+        }
     }
 }
 
@@ -40,12 +57,21 @@ async fn load_or_create_key(path: PathBuf) -> Result<Vec<u8>> {
             return Ok(key);
         }
         Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(error).with_context(|| format!("无法读取主密钥 {}", path.display())),
+        Err(error) => {
+            return Err(error).with_context(|| format!("无法读取主密钥 {}", path.display()));
+        }
     }
-    if let Some(parent) = path.parent() { fs::create_dir_all(parent).await?; }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
     let key = Fernet::generate_key();
     let temporary = path.with_extension("key.tmp");
-    match fs::OpenOptions::new().write(true).create_new(true).open(&temporary).await {
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .await
+    {
         Ok(mut file) => {
             use tokio::io::AsyncWriteExt;
             file.write_all(key.as_bytes()).await?;
@@ -58,7 +84,11 @@ async fn load_or_create_key(path: PathBuf) -> Result<Vec<u8>> {
         }
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {
             let _ = fs::remove_file(&temporary).await;
-            if path.exists() { fs::read(&path).await.map_err(Into::into) } else { bail!("主密钥初始化冲突") }
+            if path.exists() {
+                fs::read(&path).await.map_err(Into::into)
+            } else {
+                bail!("主密钥初始化冲突")
+            }
         }
         Err(error) => Err(error.into()),
     }
@@ -72,7 +102,9 @@ async fn secure_permissions(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-async fn secure_permissions(_path: &Path) -> Result<()> { Ok(()) }
+async fn secure_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

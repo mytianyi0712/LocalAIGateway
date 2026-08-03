@@ -26,3 +26,5 @@ frontend/dist/
 # Machine-specific deployment unit; commit the template instead.
 deploy/local-ai-gateway.service
 desktop/src-tauri/target/
+/target/
+/releases/

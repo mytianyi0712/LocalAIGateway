@@ -1,0 +1,32 @@
+# Maintainer: Local AI Gateway contributors
+pkgname=local-ai-gateway
+pkgver=0.2.0
+pkgrel=1
+pkgdesc='Cross-platform local AI gateway and routing manager'
+arch=('x86_64')
+url='https://github.com/mytianyi0712/LocalAIGateway'
+license=('MIT')
+depends=('webkit2gtk-4.1' 'libayatana-appindicator')
+makedepends=('rust')
+# Cargo controls Rust LTO; makepkg's C LTO breaks the bundled SQLite archive.
+options=('!lto' '!debug')
+source=()
+sha256sums=()
+
+_repo_root="${startdir}/repo"
+
+build() {
+  cd "${_repo_root}/desktop/src-tauri"
+  cargo build --release --locked
+}
+
+package() {
+  install -Dm755 "${_repo_root}/desktop/src-tauri/target/release/local-ai-gateway" \
+    "${pkgdir}/usr/bin/local-ai-gateway"
+  install -Dm644 "${_repo_root}/packaging/arch/local-ai-gateway.desktop" \
+    "${pkgdir}/usr/share/applications/local-ai-gateway.desktop"
+  install -Dm644 "${_repo_root}/desktop/src-tauri/icons/128x128.png" \
+    "${pkgdir}/usr/share/icons/hicolor/128x128/apps/local-ai-gateway.png"
+  install -Dm644 "${_repo_root}/LICENSE" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}
