@@ -35,32 +35,30 @@ run_target() {
 
 collect_artifacts() {
   local target="$1"
-  local patterns=()
+  local files=()
   case "$target" in
     appimage)
-      patterns=(
+      files=(
         "${ROOT_DIR}/desktop/src-tauri/target/release/bundle/deb/"*.deb
         "${ROOT_DIR}/desktop/src-tauri/target/release/bundle/appimage/"*.AppImage
       )
       ;;
     arch)
-      patterns=("${ROOT_DIR}/desktop/src-tauri/target/packages/arch/"*.pkg.tar.*)
+      files=("${ROOT_DIR}/desktop/src-tauri/target/packages/arch/"*.pkg.tar.*)
       ;;
     windows-wine)
-      patterns=("${ROOT_DIR}/target/packages/windows-wine/"*.exe)
+      files=("${ROOT_DIR}/target/packages/windows-wine/"*.exe)
       ;;
   esac
   mkdir -p "${RELEASES_DIR}"
   local copied=0
   local file
-  for pattern in "${patterns[@]}"; do
-    for file in ${pattern}; do
-      if [[ -f "${file}" ]]; then
-        cp -- "${file}" "${RELEASES_DIR}/"
-        echo "  -> releases/$(basename "${file}")"
-        copied=$((copied + 1))
-      fi
-    done
+  for file in "${files[@]}"; do
+    if [[ -f "${file}" ]]; then
+      cp -- "${file}" "${RELEASES_DIR}/"
+      echo "  -> releases/$(basename "${file}")"
+      copied=$((copied + 1))
+    fi
   done
   if ((copied == 0)); then
     echo "warning: no artifacts produced by ${target}" >&2

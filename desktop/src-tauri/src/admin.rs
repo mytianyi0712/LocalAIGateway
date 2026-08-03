@@ -1628,24 +1628,22 @@ async fn get_request(
             .await?;
     let attempt_values=attempts.iter().map(|a|json!({"id":a.get::<String,_>("id"),"channel_id":a.get::<Option<String>,_>("channel_id"),"channel_name":a.get::<String,_>("channel_name"),"attempt_no":a.get::<i64,_>("attempt_no"),"priority_snapshot":a.get::<i64,_>("priority_snapshot"),"started_at":a.get::<String,_>("started_at"),"finished_at":a.get::<Option<String>,_>("finished_at"),"status_code":a.get::<Option<i64>,_>("status_code"),"outcome":a.get::<String,_>("outcome"),"error_kind":a.get::<Option<String>,_>("error_kind"),"failover_eligible":a.get::<bool,_>("failover_eligible"),"response_started":a.get::<bool,_>("response_started"),"first_byte_ms":a.get::<Option<i64>,_>("first_byte_ms"),"first_token_ms":a.get::<Option<i64>,_>("first_token_ms"),"duration_ms":a.get::<Option<i64>,_>("duration_ms"),"input_tokens":a.get::<Option<i64>,_>("input_tokens"),"cache_read_tokens":a.get::<Option<i64>,_>("cache_read_tokens"),"cache_write_tokens":a.get::<Option<i64>,_>("cache_write_tokens"),"cache_miss_input_tokens":a.get::<Option<i64>,_>("cache_miss_input_tokens"),"output_tokens":a.get::<Option<i64>,_>("output_tokens"),"tps":a.get::<Option<f64>,_>("tps"),"raw_usage_json":a.get::<Option<String>,_>("raw_usage_json"),"response_bytes":a.get::<Option<i64>,_>("response_bytes"),"upstream_protocol":a.get::<Option<String>,_>("upstream_protocol"),"upstream_model_id":a.get::<Option<String>,_>("upstream_model_id")})).collect::<Vec<_>>();
     let mut value = Map::new();
-    for column in [
-        "id",
-        "protocol",
-        "model_id",
-        "endpoint",
-        "stream",
-        "started_at",
-        "finished_at",
-        "total_duration_ms",
-        "final_status_code",
-        "outcome",
-        "attempt_count",
-        "final_channel_id",
-        "request_bytes",
-        "response_bytes",
-    ] {
-        value.insert(column.into(), row.try_get(column).unwrap_or(Value::Null));
-    }
+    // The SQLite driver cannot decode columns directly into serde_json::Value;
+    // extract each field with its concrete type instead.
+    value.insert("id".into(), json!(row.get::<String, _>("id")));
+    value.insert("protocol".into(), json!(row.get::<String, _>("protocol")));
+    value.insert("model_id".into(), json!(row.get::<Option<String>, _>("model_id")));
+    value.insert("endpoint".into(), json!(row.get::<String, _>("endpoint")));
+    value.insert("stream".into(), json!(row.get::<Option<bool>, _>("stream")));
+    value.insert("started_at".into(), json!(row.get::<String, _>("started_at")));
+    value.insert("finished_at".into(), json!(row.get::<Option<String>, _>("finished_at")));
+    value.insert("total_duration_ms".into(), json!(row.get::<Option<i64>, _>("total_duration_ms")));
+    value.insert("final_status_code".into(), json!(row.get::<Option<i64>, _>("final_status_code")));
+    value.insert("outcome".into(), json!(row.get::<String, _>("outcome")));
+    value.insert("attempt_count".into(), json!(row.get::<i64, _>("attempt_count")));
+    value.insert("final_channel_id".into(), json!(row.get::<Option<String>, _>("final_channel_id")));
+    value.insert("request_bytes".into(), json!(row.get::<Option<i64>, _>("request_bytes")));
+    value.insert("response_bytes".into(), json!(row.get::<Option<i64>, _>("response_bytes")));
     value.insert("attempts".into(), json!(attempt_values));
     Ok(ok(Value::Object(value)))
 }
