@@ -10,7 +10,7 @@ use axum::{
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use sqlx::{FromRow, Row};
+use sqlx::{FromRow, QueryBuilder, Row};
 use uuid::Uuid;
 
 use crate::{
@@ -1412,7 +1412,7 @@ fn default_codex_presets() -> Value {
     json!({"items":[{"id":"gpt-5-codex","display_name":"GPT-5 Codex（默认）"},{"id":"gpt-5","display_name":"GPT-5"},{"id":"gpt-5-mini","display_name":"GPT-5 Mini"},{"id":"gpt-5-nano","display_name":"GPT-5 Nano"},{"id":"o3","display_name":"o3"},{"id":"o4-mini","display_name":"o4-mini"},{"id":"gpt-4.1","display_name":"GPT-4.1"},{"id":"gpt-4o","display_name":"GPT-4o"}],"source":"defaults","refreshed_at":null})
 }
 async fn presets(state: &AppState, key: &str, defaults: Value) -> Result<Value, ApiError> {
-    let raw: Option<String> = sqlx::query_scalar("SELECT value_json FROM settings WHERE key=?")
+    let raw: Option<String> = sqlx::query_scalar("SELECT CAST(value_json AS TEXT) FROM settings WHERE key=?")
         .bind(key)
         .fetch_optional(state.db.pool())
         .await?;
@@ -1541,7 +1541,7 @@ async fn generate_access_keys(_: AdminAuth, State(state): State<AppState>) -> Ap
 async fn system_status(_: AdminAuth, State(state): State<AppState>) -> ApiResult {
     let policy = settings::access_policy(&state).await?;
     Ok(ok(
-        json!({"status":"ok","database":"ok","telemetry_queue_size":state.telemetry.queue_size(),"telemetry_dropped":state.telemetry.dropped(),"protocols":PROTOCOL_ORDER,"trust_local_network":policy.trust_local_network}),
+        json!({"status":"ok","database":"ok","host":state.config.host,"port":state.config.port,"telemetry_queue_size":state.telemetry.queue_size(),"telemetry_dropped":state.telemetry.dropped(),"protocols":PROTOCOL_ORDER,"trust_local_network":policy.trust_local_network}),
     ))
 }
 async fn system_protocols(_: AdminAuth) -> ApiResult {
@@ -1563,8 +1563,47 @@ async fn list_requests(
 ) -> ApiResult {
     let page = query.page.unwrap_or(1).max(1);
     let size = query.page_size.unwrap_or(50).clamp(1, 200);
-    let rows=sqlx::query("SELECT id,protocol,model_id,endpoint,stream,started_at,finished_at,total_duration_ms,final_status_code,outcome,attempt_count,final_channel_id,request_bytes,response_bytes FROM request_logs WHERE (? IS NULL OR protocol=?) AND (? IS NULL OR model_id=?) ORDER BY started_at DESC LIMIT ? OFFSET ?").bind(&query.protocol).bind(&query.protocol).bind(&query.model_id).bind(&query.model_id).bind(size).bind((page-1)*size).fetch_all(state.db.pool()).await?;
-    let items=rows.iter().map(|row|json!({"id":row.get::<String,_>("id"),"protocol":row.get::<String,_>("protocol"),"model_id":row.get::<Option<String>,_>("model_id"),"endpoint":row.get::<String,_>("endpoint"),"stream":row.get::<Option<bool>,_>("stream"),"started_at":row.get::<String,_>("started_at"),"finished_at":row.get::<Option<String>,_>("finished_at"),"total_duration_ms":row.get::<Option<i64>,_>("total_duration_ms"),"final_status_code":row.get::<Option<i64>,_>("final_status_code"),"outcome":row.get::<String,_>("outcome"),"attempt_count":row.get::<i64,_>("attempt_count"),"final_channel_id":row.get::<Option<String>,_>("final_channel_id"),"request_bytes":row.get::<Option<i64>,_>("request_bytes"),"response_bytes":row.get::<Option<i64>,_>("response_bytes")})).collect::<Vec<_>>();
+    let rows = sqlx::query("SELECT id,protocol,model_id,endpoint,stream,started_at,finished_at,total_duration_ms,final_status_code,outcome,attempt_count,final_channel_id,request_bytes,response_bytes FROM request_logs WHERE (? IS NULL OR protocol=?) AND (? IS NULL OR model_id=?) ORDER BY started_at DESC LIMIT ? OFFSET ?").bind(&query.protocol).bind(&query.protocol).bind(&query.model_id).bind(&query.model_id).bind(size).bind((page-1)*size).fetch_all(state.db.pool()).await?;
+    let ids: Vec<String> = rows.iter().map(|row| row.get::<String, _>("id")).collect();
+    // Aggregate per-request attempt metadata (channels, upstream identity) the
+    // same way the Python backend does, so the log list can show the responding
+    // channel and upstream model without opening the detail view.
+    let mut attempts_by_request: HashMap<String, Vec<(String, Option<String>, Option<String>)>> =
+        HashMap::new();
+    if !ids.is_empty() {
+        let mut builder = QueryBuilder::new(
+            "SELECT request_id, channel_name, upstream_protocol, upstream_model_id FROM request_attempts WHERE request_id IN (",
+        );
+        let mut separated = builder.separated(", ");
+        for id in &ids {
+            separated.push_bind(id);
+        }
+        builder.push(") ORDER BY request_id, attempt_no");
+        let attempts = builder.build().fetch_all(state.db.pool()).await?;
+        for attempt in attempts {
+            let request_id: String = attempt.get("request_id");
+            attempts_by_request
+                .entry(request_id)
+                .or_default()
+                .push((
+                    attempt.get::<String, _>("channel_name"),
+                    attempt.get::<Option<String>, _>("upstream_protocol"),
+                    attempt.get::<Option<String>, _>("upstream_model_id"),
+                ));
+        }
+    }
+    let items = rows.iter().map(|row| {
+        let id: String = row.get("id");
+        let attempts = attempts_by_request.get(&id).cloned().unwrap_or_default();
+        let response_channels: Vec<String> =
+            attempts.iter().map(|(name, _, _)| name.clone()).collect();
+        let upstream = attempts
+            .iter()
+            .find(|(_, protocol, model)| protocol.is_some() || model.is_some());
+        let upstream_protocol = upstream.and_then(|(_, protocol, _)| protocol.clone());
+        let upstream_model_id = upstream.and_then(|(_, _, model)| model.clone());
+        json!({"id":id,"protocol":row.get::<String,_>("protocol"),"model_id":row.get::<Option<String>,_>("model_id"),"endpoint":row.get::<String,_>("endpoint"),"stream":row.get::<Option<bool>,_>("stream"),"started_at":row.get::<String,_>("started_at"),"finished_at":row.get::<Option<String>,_>("finished_at"),"total_duration_ms":row.get::<Option<i64>,_>("total_duration_ms"),"final_status_code":row.get::<Option<i64>,_>("final_status_code"),"outcome":row.get::<String,_>("outcome"),"attempt_count":row.get::<i64,_>("attempt_count"),"final_channel_id":row.get::<Option<String>,_>("final_channel_id"),"request_bytes":row.get::<Option<i64>,_>("request_bytes"),"response_bytes":row.get::<Option<i64>,_>("response_bytes"),"response_channels":response_channels,"upstream_protocol":upstream_protocol,"upstream_model_id":upstream_model_id})
+    }).collect::<Vec<_>>();
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_logs")
         .fetch_one(state.db.pool())
         .await?;
@@ -1638,6 +1677,22 @@ async fn list_health_probes(_: AdminAuth, State(state): State<AppState>) -> ApiR
     let items=rows.iter().map(|row|json!({"id":row.get::<String,_>("id"),"channel_id":row.get::<String,_>("channel_id"),"model_id":row.get::<String,_>("model_id"),"started_at":row.get::<String,_>("started_at"),"duration_ms":row.get::<Option<i64>,_>("duration_ms"),"success":row.get::<bool,_>("success"),"status_code":row.get::<Option<i64>,_>("status_code"),"error_kind":row.get::<Option<String>,_>("error_kind"),"next_probe_at":row.get::<Option<String>,_>("next_probe_at")})).collect::<Vec<_>>();
     Ok(ok(json!({"items":items,"total":items.len()})))
 }
+const CACHE_PROVIDER_PROTOCOLS: [(&str, &str); 4] = [
+    ("openai_compatible", "OpenAI"),
+    ("openai_responses", "OpenAI"),
+    ("claude", "Claude"),
+    ("gemini", "Gemini"),
+];
+const CACHE_PROVIDER_ORDER: [&str; 3] = ["OpenAI", "Claude", "Gemini"];
+
+fn cache_provider(protocol: &str) -> String {
+    CACHE_PROVIDER_PROTOCOLS
+        .iter()
+        .find(|(id, _)| *id == protocol)
+        .map(|(_, provider)| (*provider).to_string())
+        .unwrap_or_else(|| protocol.to_string())
+}
+
 async fn stats_summary(_: AdminAuth, State(state): State<AppState>) -> ApiResult {
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_logs")
         .fetch_one(state.db.pool())
@@ -1646,12 +1701,107 @@ async fn stats_summary(_: AdminAuth, State(state): State<AppState>) -> ApiResult
         sqlx::query_scalar("SELECT COUNT(*) FROM request_logs WHERE outcome='success'")
             .fetch_one(state.db.pool())
             .await?;
-    let failed = total - success;
-    let output: Option<i64> = sqlx::query_scalar("SELECT SUM(output_tokens) FROM request_attempts")
+    let avg_duration: Option<f64> = sqlx::query_scalar("SELECT AVG(total_duration_ms) FROM request_logs")
         .fetch_one(state.db.pool())
         .await?;
+    let token_row = sqlx::query(
+        "SELECT \
+         SUM(cache_read_tokens), SUM(cache_write_tokens), SUM(cache_miss_input_tokens), \
+         SUM(output_tokens), AVG(first_token_ms), \
+         SUM(CASE WHEN output_tokens IS NOT NULL AND duration_ms > 0 THEN output_tokens ELSE 0 END), \
+         SUM(CASE WHEN output_tokens IS NOT NULL AND duration_ms > 0 THEN duration_ms ELSE 0 END) \
+         FROM request_attempts WHERE response_started = 1",
+    )
+    .fetch_one(state.db.pool())
+    .await?;
+    let cache_read: Option<i64> = token_row.try_get(0)?;
+    let cache_write: Option<i64> = token_row.try_get(1)?;
+    let cache_miss: Option<i64> = token_row.try_get(2)?;
+    let output_tokens: Option<i64> = token_row.try_get(3)?;
+    let avg_first_token: Option<f64> = token_row.try_get(4)?;
+    let token_sum: i64 = token_row.try_get(5)?;
+    let duration_sum: i64 = token_row.try_get(6)?;
+    let channels: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM channels")
+        .fetch_one(state.db.pool())
+        .await?;
+    let active_channels: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM channel_health WHERE state='active'",
+    )
+    .fetch_one(state.db.pool())
+    .await?;
+    let cache_rows = sqlx::query(
+        "SELECT l.protocol, COUNT(DISTINCT a.request_id), \
+         SUM(a.cache_read_tokens), SUM(a.cache_write_tokens), SUM(a.cache_miss_input_tokens) \
+         FROM request_logs l JOIN request_attempts a ON a.request_id = l.id \
+         WHERE a.response_started = 1 GROUP BY l.protocol",
+    )
+    .fetch_all(state.db.pool())
+    .await?;
+    let mut by_provider: HashMap<String, (i64, i64, i64, i64)> = HashMap::new();
+    for row in cache_rows {
+        let protocol: String = row.get(0);
+        let request_count: i64 = row.get(1);
+        let read: i64 = row.get::<Option<i64>, _>(2).unwrap_or(0);
+        let write: i64 = row.get::<Option<i64>, _>(3).unwrap_or(0);
+        let miss: i64 = row.get::<Option<i64>, _>(4).unwrap_or(0);
+        let provider = cache_provider(&protocol);
+        let entry = by_provider.entry(provider).or_insert((0, 0, 0, 0));
+        entry.0 += request_count;
+        entry.1 += read;
+        entry.2 += write;
+        entry.3 += miss;
+    }
+    let mut extra: Vec<String> = by_provider
+        .keys()
+        .filter(|provider| !CACHE_PROVIDER_ORDER.contains(&provider.as_str()))
+        .cloned()
+        .collect();
+    extra.sort_unstable();
+    let cache_provider_items: Vec<Value> = CACHE_PROVIDER_ORDER
+        .iter()
+        .map(|provider| provider.to_string())
+        .chain(extra)
+        .filter_map(|provider| {
+            let (request_count, read, write, miss) = by_provider.get(&provider).copied()?;
+            let total_input = read + write + miss;
+            Some(json!({
+                "provider": provider,
+                "request_count": request_count,
+                "cache_read_tokens": read,
+                "cache_write_tokens": write,
+                "cache_miss_input_tokens": miss,
+                "total_input_tokens": total_input,
+                "cache_hit_rate": if total_input > 0 {
+                    Some((read as f64 / total_input as f64 * 10000.0).round() / 10000.0)
+                } else {
+                    None
+                },
+            }))
+        })
+        .collect();
     Ok(ok(
-        json!({"total_requests":total,"successful_requests":success,"failed_requests":failed,"output_tokens":output.unwrap_or(0),"telemetry_dropped":state.telemetry.dropped()}),
+        json!({
+            "requests": total,
+            "success_rate": if total > 0 {
+                Some((success as f64 / total as f64 * 10000.0).round() / 10000.0)
+            } else {
+                None
+            },
+            "average_duration_ms": avg_duration.map(|value| (value * 100.0).round() / 100.0),
+            "average_first_token_ms": avg_first_token.map(|value| (value * 100.0).round() / 100.0),
+            "average_tps": if duration_sum > 0 {
+                Some((token_sum as f64 * 1000.0 / duration_sum as f64 * 1000.0).round() / 1000.0)
+            } else {
+                None
+            },
+            "cache_read_tokens": cache_read.unwrap_or(0),
+            "cache_write_tokens": cache_write.unwrap_or(0),
+            "cache_miss_input_tokens": cache_miss.unwrap_or(0),
+            "output_tokens": output_tokens.unwrap_or(0),
+            "cache_by_provider": cache_provider_items,
+            "channels": channels,
+            "active_channels": active_channels,
+        }),
     ))
 }
 async fn stats_cache(_: AdminAuth, State(state): State<AppState>) -> ApiResult {

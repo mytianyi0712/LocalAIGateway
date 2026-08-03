@@ -1,4 +1,8 @@
 fn main() {
+    if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
+        println!("Local AI Gateway {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();

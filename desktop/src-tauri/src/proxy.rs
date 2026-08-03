@@ -1,4 +1,4 @@
-use std::{convert::Infallible, time::Duration};
+use std::{convert::Infallible, pin::Pin, sync::Arc, sync::atomic::{AtomicBool, Ordering}, task::{Context, Poll}, time::Duration};
 
 use anyhow::Result;
 use async_stream::stream;
@@ -22,6 +22,44 @@ use crate::{
 };
 
 const MAX_REQUEST_BODY: usize = 8 * 1024 * 1024;
+
+/// Wraps an upstream byte stream so a client-side disconnect (which drops the
+/// response body without polling it to completion) still records a cancelled
+/// attempt instead of leaving the request permanently pending.
+struct CancelAware<S> {
+    inner: S,
+    completed: Arc<AtomicBool>,
+    responded: Arc<AtomicBool>,
+    on_cancel: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl<S: futures_util::Stream + Unpin> futures_util::Stream for CancelAware<S> {
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(item)) => {
+                self.responded.store(true, Ordering::SeqCst);
+                Poll::Ready(Some(item))
+            }
+            Poll::Ready(None) => {
+                self.completed.store(true, Ordering::SeqCst);
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S> Drop for CancelAware<S> {
+    fn drop(&mut self) {
+        if !self.completed.load(Ordering::SeqCst) {
+            if let Some(callback) = self.on_cancel.take() {
+                callback();
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 struct MappingTarget {
@@ -161,13 +199,16 @@ fn attempt_event(
     request_id: &str,
     candidate: &Candidate,
     attempt_no: i64,
-    started_at: String,
-    finished_at: String,
+    started_at: chrono::DateTime<chrono::Utc>,
+    finished_at: chrono::DateTime<chrono::Utc>,
     status: Option<i64>,
     outcome: &str,
     error_kind: Option<String>,
     failover: bool,
     response_started: bool,
+    first_byte_ms: Option<i64>,
+    first_token_ms: Option<i64>,
+    usage: Usage,
     response_bytes: i64,
     upstream_protocol: Option<String>,
     upstream_model_id: Option<String>,
@@ -179,19 +220,144 @@ fn attempt_event(
         channel_name: candidate.channel_name.clone(),
         attempt_no,
         priority: candidate.priority,
-        started_at,
-        finished_at,
+        started_at: started_at.to_rfc3339(),
+        finished_at: finished_at.to_rfc3339(),
         status,
         outcome: outcome.to_owned(),
         error_kind,
         failover,
         response_started,
-        first_byte_ms: None,
-        duration_ms: 0,
-        usage: Usage::default(),
+        first_byte_ms,
+        first_token_ms,
+        duration_ms: finished_at.signed_duration_since(started_at).num_milliseconds(),
+        usage,
         response_bytes,
         upstream_protocol,
         upstream_model_id,
+    }
+}
+
+/// Extracts the per-protocol usage object from a streamed SSE value or a
+/// non-streamed response root, mirroring the Python adapters.
+fn stream_usage_value(protocol: &str, value: &Value) -> Option<Value> {
+    match protocol {
+        "claude" => value
+            .get("message")
+            .and_then(|message| message.get("usage"))
+            .cloned()
+            .or_else(|| value.get("usage").cloned()),
+        "gemini" => value.get("usageMetadata").cloned(),
+        _ => value.get("usage").cloned(),
+    }
+}
+
+/// Normalizes a raw usage object into the gateway's Usage model, mirroring the
+/// Python adapters (OpenAI chat/completions, OpenAI responses, Claude, Gemini).
+fn normalize_usage(protocol: &str, usage: &Value) -> Usage {
+    let raw = Some(usage.clone());
+    match protocol {
+        "claude" => {
+            let read = usage.get("cache_read_input_tokens").and_then(Value::as_i64);
+            let write = usage.get("cache_creation_input_tokens").and_then(Value::as_i64);
+            let miss = usage.get("input_tokens").and_then(Value::as_i64);
+            let total = if miss.is_some() || read.is_some() || write.is_some() {
+                Some(miss.unwrap_or(0) + read.unwrap_or(0) + write.unwrap_or(0))
+            } else {
+                None
+            };
+            Usage {
+                input_tokens: total,
+                cache_read_tokens: read,
+                cache_write_tokens: write,
+                cache_miss_input_tokens: miss,
+                output_tokens: usage.get("output_tokens").and_then(Value::as_i64),
+                raw,
+            }
+        }
+        "gemini" => {
+            let total = usage.get("promptTokenCount").and_then(Value::as_i64);
+            let cache = usage.get("cachedContentTokenCount").and_then(Value::as_i64);
+            let miss = total.map(|value| (value - cache.unwrap_or(0)).max(0));
+            Usage {
+                input_tokens: total,
+                cache_read_tokens: cache,
+                cache_write_tokens: None,
+                cache_miss_input_tokens: miss,
+                output_tokens: usage.get("candidatesTokenCount").and_then(Value::as_i64),
+                raw,
+            }
+        }
+        _ => {
+            let details = usage
+                .get("prompt_tokens_details")
+                .or_else(|| usage.get("input_tokens_details"));
+            let total_input = usage
+                .get("prompt_tokens")
+                .and_then(Value::as_i64)
+                .or_else(|| usage.get("input_tokens").and_then(Value::as_i64));
+            let cache_read = details
+                .and_then(|item| item.get("cached_tokens"))
+                .and_then(Value::as_i64);
+            let cache_write = details
+                .and_then(|item| {
+                    item.get("cache_write_tokens")
+                        .or_else(|| item.get("cached_write_tokens"))
+                })
+                .and_then(Value::as_i64);
+            let miss = match (total_input, cache_read) {
+                (Some(total), Some(read)) => Some((total - read - cache_write.unwrap_or(0)).max(0)),
+                _ => None,
+            };
+            let output = usage
+                .get("completion_tokens")
+                .and_then(Value::as_i64)
+                .or_else(|| usage.get("output_tokens").and_then(Value::as_i64));
+            Usage {
+                input_tokens: total_input,
+                cache_read_tokens: cache_read,
+                cache_write_tokens: cache_write,
+                cache_miss_input_tokens: miss,
+                output_tokens: output,
+                raw,
+            }
+        }
+    }
+}
+
+/// Parses a non-streamed upstream response body into Usage.
+fn usage_from_body(protocol: &str, body: &[u8]) -> Usage {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return Usage::default();
+    };
+    match stream_usage_value(protocol, &value) {
+        Some(usage) => normalize_usage(protocol, &usage),
+        None => Usage::default(),
+    }
+}
+
+/// True when a streamed chunk carries the first generated content token.
+fn chunk_has_content(protocol: &str, value: &Value) -> bool {
+    match protocol {
+        "claude" => value
+            .get("delta")
+            .and_then(|delta| delta.get("text"))
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty()),
+        "gemini" => value
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|candidate| candidate.get("content").and_then(|content| content.get("parts")))
+            .and_then(Value::as_array)
+            .is_some_and(|parts| parts.iter().any(|part| part.get("text").is_some())),
+        "openai_responses" => value.get("delta").is_some(),
+        _ => value
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|choice| choice.get("delta"))
+            .and_then(|delta| delta.get("content").and_then(Value::as_str))
+            .is_some_and(|text| !text.is_empty()),
     }
 }
 
@@ -370,13 +536,16 @@ async fn proxy(
                     &request_id,
                     candidate,
                     attempts,
-                    attempt_started.to_rfc3339(),
-                    chrono::Utc::now().to_rfc3339(),
+                    attempt_started,
+                    chrono::Utc::now(),
                     None,
                     "transport_error",
                     Some("key_decrypt_error".into()),
                     attempts < candidates.len() as i64,
                     false,
+                    None,
+                    None,
+                    Usage::default(),
                     0,
                     Some(upstream_protocol.into()),
                     Some(upstream_model.into()),
@@ -436,13 +605,16 @@ async fn proxy(
                     &request_id,
                     candidate,
                     attempts,
-                    attempt_started.to_rfc3339(),
-                    finished.to_rfc3339(),
+                    attempt_started,
+                    finished,
                     None,
                     "transport_error",
                     Some(error.to_string()),
                     attempts < candidates.len() as i64,
                     false,
+                    None,
+                    None,
+                    Usage::default(),
                     0,
                     Some(upstream_protocol.into()),
                     Some(upstream_model.into()),
@@ -463,13 +635,16 @@ async fn proxy(
                     &request_id,
                     candidate,
                     attempts,
-                    attempt_started.to_rfc3339(),
-                    finished.to_rfc3339(),
+                    attempt_started,
+                    finished,
                     None,
                     "transport_error",
                     Some("timeout".into()),
                     attempts < candidates.len() as i64,
                     false,
+                    None,
+                    None,
+                    Usage::default(),
                     0,
                     Some(upstream_protocol.into()),
                     Some(upstream_model.into()),
@@ -488,19 +663,125 @@ async fn proxy(
                 let candidate_stream = candidate.clone();
                 let upstream_protocol_stream = upstream_protocol.to_owned();
                 let upstream_model_stream = upstream_model.to_owned();
+                let stream_protocol = upstream_protocol_stream.clone();
+                let cancel_completed = Arc::new(AtomicBool::new(false));
+                let cancel_responded = Arc::new(AtomicBool::new(false));
+                let cancel_telemetry = state.telemetry.clone();
+                let cancel_request_id = request_id.clone();
+                let cancel_candidate = candidate.clone();
+                let cancel_attempt_no = attempts;
+                let cancel_attempt_started = attempt_started;
+                let cancel_status = status.as_u16() as i64;
+                let cancel_upstream_protocol = upstream_protocol_stream.clone();
+                let cancel_upstream_model = upstream_model_stream.clone();
+                let cancel_responded_flag = cancel_responded.clone();
+                let on_cancel: Box<dyn FnOnce() + Send> = Box::new(move || {
+                    let finished = chrono::Utc::now();
+                    cancel_telemetry.emit(attempt_event(
+                        &cancel_request_id,
+                        &cancel_candidate,
+                        cancel_attempt_no,
+                        cancel_attempt_started,
+                        finished,
+                        Some(cancel_status),
+                        "cancelled",
+                        None,
+                        false,
+                        cancel_responded_flag.load(Ordering::SeqCst),
+                        None,
+                        None,
+                        Usage::default(),
+                        0,
+                        Some(cancel_upstream_protocol),
+                        Some(cancel_upstream_model),
+                    ));
+                    cancel_telemetry.emit(Event::RequestFinish {
+                        id: cancel_request_id,
+                        finished_at: finished.to_rfc3339(),
+                        duration_ms: finished
+                            .signed_duration_since(cancel_attempt_started)
+                            .num_milliseconds(),
+                        status: Some(cancel_status),
+                        outcome: "cancelled".into(),
+                        attempts: cancel_attempt_no,
+                        channel_id: Some(cancel_candidate.channel_id),
+                        response_bytes: 0,
+                    });
+                });
+                let cancel_aware = CancelAware {
+                    inner: upstream_stream,
+                    completed: cancel_completed,
+                    responded: cancel_responded,
+                    on_cancel: Some(on_cancel),
+                };
                 let stream_body = stream! {
-                    let mut upstream_stream = upstream_stream;
+                    let mut upstream_stream = cancel_aware;
                     let mut response_bytes = 0i64;
                     let mut ok = true;
+                    let mut pending: Vec<u8> = Vec::new();
+                    let mut first_byte_ms: Option<i64> = None;
+                    let mut first_token_ms: Option<i64> = None;
+                    let mut usage: Usage = Usage::default();
                     while let Some(chunk) = upstream_stream.next().await {
-                        match chunk { Ok(chunk) => { response_bytes += chunk.len() as i64; yield Ok::<Bytes, Infallible>(chunk); }, Err(_) => { ok = false; break; } }
+                        match chunk {
+                            Ok(chunk) => {
+                                response_bytes += chunk.len() as i64;
+                                let now = chrono::Utc::now();
+                                if first_byte_ms.is_none() {
+                                    first_byte_ms = Some(
+                                        now.signed_duration_since(attempt_started).num_milliseconds(),
+                                    );
+                                }
+                                pending.extend_from_slice(&chunk);
+                                let mut consumed = 0usize;
+                                while let Some(offset) =
+                                    pending[consumed..].iter().position(|byte| *byte == b'\n')
+                                {
+                                    let end = consumed + offset;
+                                    let line = &pending[consumed..end];
+                                    consumed = end + 1;
+                                    let line = String::from_utf8_lossy(line);
+                                    let line = line.trim_end_matches('\r');
+                                    let Some(data) = line.strip_prefix("data:") else {
+                                        continue;
+                                    };
+                                    let data = data.trim();
+                                    if data.is_empty() || data == "[DONE]" {
+                                        continue;
+                                    }
+                                    let Ok(value) = serde_json::from_str::<Value>(data) else {
+                                        continue;
+                                    };
+                                    if first_token_ms.is_none()
+                                        && chunk_has_content(&stream_protocol, &value)
+                                    {
+                                        first_token_ms = Some(
+                                            now.signed_duration_since(attempt_started)
+                                                .num_milliseconds(),
+                                        );
+                                    }
+                                    if let Some(raw_usage) =
+                                        stream_usage_value(&stream_protocol, &value)
+                                    {
+                                        usage = normalize_usage(&stream_protocol, &raw_usage);
+                                    }
+                                }
+                                pending.drain(..consumed);
+                                yield Ok::<Bytes, Infallible>(chunk);
+                            }
+                            Err(_) => {
+                                ok = false;
+                                break;
+                            }
+                        }
                     }
-                    let finished = chrono::Utc::now().to_rfc3339();
+                    let finished = chrono::Utc::now();
+                    let finished_str = finished.to_rfc3339();
                     let outcome = if ok { "success" } else { "stream_interrupted" };
                     if ok { telemetry.emit(Event::ChannelSuccess { channel_id:candidate_stream.channel_id.clone() }); }
                     else { telemetry.emit(Event::ChannelFailure { channel_id:candidate_stream.channel_id.clone(), error_kind:"stream_interrupted".into(), status:Some(status.as_u16() as i64), threshold:3, open_seconds:900, countable:true }); }
-                    telemetry.emit(attempt_event(&request_id_stream,&candidate_stream,attempts,attempt_started.to_rfc3339(),finished.clone(),Some(status.as_u16() as i64),outcome, if ok {None}else{Some("stream_interrupted".into())},false,true,response_bytes,Some(upstream_protocol_stream),Some(upstream_model_stream)));
-                    telemetry.emit(Event::RequestFinish { id:request_id_stream, finished_at:finished, duration_ms:chrono::Utc::now().signed_duration_since(started).num_milliseconds(), status:Some(status.as_u16() as i64), outcome:outcome.into(), attempts, channel_id:Some(candidate_stream.channel_id), response_bytes });
+                    telemetry.emit(attempt_event(&request_id_stream,&candidate_stream,attempts,attempt_started,finished,Some(status.as_u16() as i64),outcome, if ok {None}else{Some("stream_interrupted".into())},false,true,first_byte_ms,first_token_ms,usage,response_bytes,Some(upstream_protocol_stream),Some(upstream_model_stream)));
+                    telemetry.emit(Event::RequestFinish { id:request_id_stream, finished_at:finished_str, duration_ms:chrono::Utc::now().signed_duration_since(started).num_milliseconds(), status:Some(status.as_u16() as i64), outcome:outcome.into(), attempts, channel_id:Some(candidate_stream.channel_id), response_bytes });
                 };
                 let mut result = Response::new(Body::from_stream(stream_body));
                 *result.status_mut() = status;
@@ -526,6 +807,7 @@ async fn proxy(
                     continue;
                 }
             };
+            let usage = usage_from_body(upstream_protocol, &raw);
             let result_body = if let Some(value) = mapping.as_ref() {
                 if stream_requested {
                     convert::convert_stream(
@@ -562,17 +844,21 @@ async fn proxy(
             state.telemetry.emit(Event::ChannelSuccess {
                 channel_id: candidate.channel_id.clone(),
             });
+            let finished_at = chrono::Utc::now();
             state.telemetry.emit(attempt_event(
                 &request_id,
                 candidate,
                 attempts,
-                attempt_started.to_rfc3339(),
-                chrono::Utc::now().to_rfc3339(),
+                attempt_started,
+                finished_at,
                 Some(status.as_u16() as i64),
                 "success",
                 None,
                 false,
-                false,
+                true,
+                None,
+                None,
+                usage,
                 result_body.len() as i64,
                 Some(upstream_protocol.into()),
                 Some(upstream_model.into()),
@@ -609,17 +895,21 @@ async fn proxy(
             open_seconds: runtime.circuit_open_seconds,
             countable,
         });
+        let finished = chrono::Utc::now();
         state.telemetry.emit(attempt_event(
             &request_id,
             candidate,
             attempts,
-            attempt_started.to_rfc3339(),
-            chrono::Utc::now().to_rfc3339(),
+            attempt_started,
+            finished,
             Some(status.as_u16() as i64),
             "http_error",
             Some(kind.into()),
             attempts < candidates.len() as i64,
             false,
+            None,
+            None,
+            Usage::default(),
             raw.len() as i64,
             Some(upstream_protocol.into()),
             Some(upstream_model.into()),

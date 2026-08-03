@@ -1,4 +1,4 @@
-.PHONY: install build test run desktop-icons desktop-build-linux desktop-build-windows package-appimage package-arch package-ubuntu package-windows-wine package-all
+.PHONY: install build test run desktop-icons desktop-build-linux desktop-build-windows package-appimage package-arch package-windows-wine package-all
 
 install:
 	cd backend && uv sync --extra test
@@ -27,9 +27,6 @@ package-appimage:
 
 package-arch:
 	./packaging/build.sh arch
-
-package-ubuntu:
-	./packaging/build.sh ubuntu
 
 package-windows-wine:
 	./packaging/build.sh windows-wine

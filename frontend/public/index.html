@@ -7,6 +7,7 @@
     <meta name="theme-color" content="#f4f7f5" />
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; connect-src 'self'; font-src 'self'; form-action 'self'; frame-ancestors 'none'; img-src 'self' data:; object-src 'none'; script-src 'self'; style-src 'self'" />
     <title>Local AI Gateway</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='7'%20fill='%231f5135'/%3E%3Ctext%20x='16'%20y='22'%20font-family='sans-serif'%20font-size='14'%20font-weight='700'%20fill='%23f7fff7'%20text-anchor='middle'%3ELG%3C/text%3E%3C/svg%3E" />
     <link rel="stylesheet" href="/assets/app.css" />
   </head>
   <body>
@@ -74,7 +75,7 @@
           <button class="icon-button mobile-menu" type="button" data-action="open-sidebar" aria-label="打开导航" title="打开导航"><svg class="icon"><use href="#i-menu"></use></svg></button>
           <div class="topbar-heading"><h1 id="page-title">运行概览</h1><p id="page-description">请求、Token 与渠道健康状态</p></div>
           <div class="topbar-meta" aria-label="网关连接状态">
-            <span class="topbar-endpoint">0.0.0.0:3000</span>
+            <span class="topbar-endpoint" id="top-endpoint"></span>
             <span class="topbar-state" id="top-status"><i></i>连接中</span>
           </div>
         </header>

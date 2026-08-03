@@ -49,7 +49,7 @@ impl RuntimeSettings {
 
 pub async fn runtime_settings(state: &AppState) -> Result<RuntimeSettings> {
     let mut value = RuntimeSettings::default().as_value();
-    let rows = sqlx::query("SELECT key, value_json FROM settings WHERE key NOT IN ('admin_access_key', 'gateway_access_key')")
+    let rows = sqlx::query("SELECT key, CAST(value_json AS TEXT) value_json FROM settings WHERE key NOT IN ('admin_access_key', 'gateway_access_key')")
         .fetch_all(state.db.pool()).await?;
     for row in rows {
         let key: String = row.try_get("key")?;
@@ -69,7 +69,7 @@ pub struct AccessPolicy {
 
 pub async fn access_policy(state: &AppState) -> Result<AccessPolicy> {
     let settings = runtime_settings(state).await?;
-    let rows = sqlx::query("SELECT key, value_json FROM settings WHERE key IN ('admin_access_key', 'gateway_access_key')")
+    let rows = sqlx::query("SELECT key, CAST(value_json AS TEXT) value_json FROM settings WHERE key IN ('admin_access_key', 'gateway_access_key')")
         .fetch_all(state.db.pool()).await?;
     let mut keys = HashMap::new();
     for row in rows {

@@ -96,6 +96,7 @@ const elements = {
   sideStatus: document.getElementById('side-status'),
   sideMode: document.getElementById('side-mode'),
   topStatus: document.getElementById('top-status'),
+  topEndpoint: document.querySelector('.topbar-endpoint'),
   lockButton: document.getElementById('lock-button'),
   sidebar: document.getElementById('sidebar'),
   sidebarScrim: document.getElementById('sidebar-scrim'),
@@ -341,6 +342,10 @@ async function checkConnection({ renderAfter = false } = {}) {
   try {
     const system = await get('/system/status');
     state.system = system;
+    if (elements.topEndpoint) {
+      elements.topEndpoint.textContent =
+        (system.host || location.hostname) + ':' + (system.port ?? (location.port || '3000'));
+    }
     setConnection(true, Boolean(system.trust_local_network));
     if (renderAfter) renderPage();
     return system;

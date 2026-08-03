@@ -14,15 +14,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: ubuntu-22.04
-            os: ubuntu-22.04
-            kind: linux
-            bundles: deb,appimage
-            artifact_path: desktop/src-tauri/target/release/bundle/**
-          - name: ubuntu-24.04
+          - name: linux-appimage
             os: ubuntu-24.04
             kind: linux
-            bundles: deb
+            bundles: appimage
             artifact_path: desktop/src-tauri/target/release/bundle/**
           - name: windows-x64
             os: windows-latest

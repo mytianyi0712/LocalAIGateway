@@ -50,6 +50,7 @@ pub enum Event {
         failover: bool,
         response_started: bool,
         first_byte_ms: Option<i64>,
+        first_token_ms: Option<i64>,
         duration_ms: i64,
         usage: Usage,
         response_bytes: i64,
@@ -150,6 +151,7 @@ async fn write_event(db: &Database, event: Event) -> anyhow::Result<()> {
             failover,
             response_started,
             first_byte_ms,
+            first_token_ms,
             duration_ms,
             usage,
             response_bytes,
@@ -160,8 +162,8 @@ async fn write_event(db: &Database, event: Event) -> anyhow::Result<()> {
                 (Some(tokens), ms) if ms > 0 => Some(tokens as f64 * 1000.0 / ms as f64),
                 _ => None,
             };
-            sqlx::query("INSERT INTO request_attempts(id, request_id, channel_id, channel_name, attempt_no, priority_snapshot, started_at, finished_at, status_code, outcome, error_kind, failover_eligible, response_started, first_byte_ms, duration_ms, input_tokens, cache_read_tokens, cache_write_tokens, cache_miss_input_tokens, output_tokens, tps, raw_usage_json, response_bytes, upstream_protocol, upstream_model_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-                .bind(id).bind(request_id).bind(channel_id).bind(channel_name).bind(attempt_no).bind(priority).bind(started_at).bind(finished_at).bind(status).bind(outcome).bind(error_kind).bind(failover).bind(response_started).bind(first_byte_ms).bind(duration_ms)
+            sqlx::query("INSERT INTO request_attempts(id, request_id, channel_id, channel_name, attempt_no, priority_snapshot, started_at, finished_at, status_code, outcome, error_kind, failover_eligible, response_started, first_byte_ms, first_token_ms, duration_ms, input_tokens, cache_read_tokens, cache_write_tokens, cache_miss_input_tokens, output_tokens, tps, raw_usage_json, response_bytes, upstream_protocol, upstream_model_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+                .bind(id).bind(request_id).bind(channel_id).bind(channel_name).bind(attempt_no).bind(priority).bind(started_at).bind(finished_at).bind(status).bind(outcome).bind(error_kind).bind(failover).bind(response_started).bind(first_byte_ms).bind(first_token_ms).bind(duration_ms)
                 .bind(usage.input_tokens).bind(usage.cache_read_tokens).bind(usage.cache_write_tokens).bind(usage.cache_miss_input_tokens).bind(usage.output_tokens).bind(tps).bind(usage.raw.map(|v| serde_json::to_string(&v).unwrap_or_default())).bind(response_bytes).bind(upstream_protocol).bind(upstream_model_id).execute(db.pool()).await?;
         }
         Event::ChannelSuccess { channel_id } => {

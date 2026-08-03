@@ -134,12 +134,11 @@ cargo install --locked tauri-cli --version '^2'
 ```bash
 make package-appimage       # 本机 .deb + AppImage
 make package-arch           # Arch .pkg.tar.zst
-make package-ubuntu         # Docker 内构建 Ubuntu 22.04 / 24.04 .deb
 make package-windows-wine   # MinGW 交叉编译 + Wine 生成 NSIS 安装包
 make package-all            # 依次执行以上全部流程
 ```
 
-Arch 包需要 `makepkg`、GTK/WebKitGTK 与 Ayatana AppIndicator 开发环境；Ubuntu 系列构建需要可用的 Docker；Windows 交叉构建需要 Wine、MinGW-w64、Rustup 和 `unzip`，脚本会自动安装 Rust Windows GNU target 并缓存便携版 NSIS。产物分别写入 `desktop/src-tauri/target/release/bundle/`、`desktop/src-tauri/target/packages/arch/`、`target/packages/ubuntu/` 和 `target/packages/windows-wine/`。发布标签也会通过 `.github/workflows/desktop.yml` 构建相同平台矩阵。
+Arch 包需要 `makepkg`、GTK/WebKitGTK 与 Ayatana AppIndicator 开发环境；Windows 交叉构建需要 Wine、MinGW-w64、Rustup 和 `unzip`，脚本会自动安装 Rust Windows GNU target 并缓存便携版 NSIS。所有目标的产物会自动复制到仓库根目录的 `releases/` 文件夹（原始构建输出仍在各自的 target 目录）。发布标签也会通过 `.github/workflows/desktop.yml` 构建相同平台矩阵。
 
 ## 开发与验证
 
