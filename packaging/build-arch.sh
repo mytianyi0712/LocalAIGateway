@@ -26,6 +26,9 @@ if not match:
 print(match.group(1))
 PY
 )"
+# Arch pkgver forbids hyphens (allowed: alphanumerics, ., _, +); map the
+# semver prerelease separator to an underscore, e.g. 0.2.0-fix1 -> 0.2.0_fix1.
+VERSION="${VERSION//-/_}"
 
 chmod -R u+rwX "${BUILD_DIR}" 2>/dev/null || true
 rm -rf "${BUILD_DIR}"

@@ -1,6 +1,6 @@
 [package]
 name = "local-ai-gateway"
-version = "0.2.0"
+version = "0.2.0-fix1"
 edition = "2024"
 description = "Cross-platform local AI gateway"
 license = "MIT"

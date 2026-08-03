@@ -1,4 +1,4 @@
-use std::{convert::Infallible, pin::Pin, sync::Arc, sync::atomic::{AtomicBool, Ordering}, task::{Context, Poll}, time::Duration};
+use std::{collections::HashMap, convert::Infallible, pin::Pin, sync::Arc, sync::atomic::{AtomicBool, Ordering}, task::{Context, Poll}, time::Duration};
 
 use anyhow::Result;
 use async_stream::stream;
@@ -11,7 +11,7 @@ use axum::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use sqlx::Row;
+use sqlx::{QueryBuilder, Row};
 
 use crate::{
     convert, protocol,
@@ -1023,9 +1023,71 @@ pub async fn models(
             json!({"models":items.iter().map(|item|json!({"name":format!("models/{}",item.id),"displayName":item.display_name,"supportedGenerationMethods":["generateContent"]})).collect::<Vec<_>>() }),
         )
     } else {
+        // Attach stored capability metadata (context window, max tokens, reasoning,
+        // image input, costs) under x_local_gateway.capabilities so catalog
+        // consumers such as the omp extension can use real values instead of
+        // their built-in defaults. Models without a capability row omit the field.
+        let ids: Vec<&str> = items.iter().map(|item| item.id.as_str()).collect();
+        let mut caps: HashMap<String, (Option<i64>, Option<i64>, Option<bool>, Option<bool>, Option<Value>, Option<f64>, Option<f64>, Option<f64>, Option<f64>)> =
+            HashMap::new();
+        if !ids.is_empty() {
+            let mut builder = QueryBuilder::new(
+                "SELECT requested_model_id, context_window, max_tokens, supports_image_input, reasoning, thinking_level_map, cost_input, cost_output, cost_cache_read, cost_cache_write FROM model_caps WHERE requested_model_id IN (",
+            );
+            let mut separated = builder.separated(", ");
+            for id in &ids {
+                separated.push_bind(id);
+            }
+            builder.push(")");
+            let rows = match builder.build().fetch_all(state.db.pool()).await {
+                Ok(rows) => rows,
+                Err(error) => {
+                    return gateway_error(
+                        protocol,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "database_error",
+                        &error.to_string(),
+                        "catalog",
+                    );
+                }
+            };
+            for row in rows {
+                let reasoning: Option<bool> = row.get(4);
+                let thinking_raw: Option<String> = row.get(5);
+                let thinking_level_map = thinking_raw
+                    .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+                caps.insert(
+                    row.get(0),
+                    (
+                        row.get(1),
+                        row.get(2),
+                        row.get(3),
+                        reasoning,
+                        thinking_level_map,
+                        row.get(6),
+                        row.get(7),
+                        row.get(8),
+                        row.get(9),
+                    ),
+                );
+            }
+        }
         json_response(
             StatusCode::OK,
-            json!({"object":"list","data":items.iter().map(|item|json!({"id":item.id,"object":"model","owned_by":"local-gateway","created":item.created_at})).collect::<Vec<_>>() }),
+            json!({"object":"list","data":items.iter().map(|item|{
+                let mut value = json!({"id":item.id,"object":"model","owned_by":"local-gateway","created":item.created_at});
+                if let Some((context_window, max_tokens, supports_image, reasoning, thinking_level_map, cost_input, cost_output, cost_cache_read, cost_cache_write)) = caps.get(&item.id) {
+                    value["x_local_gateway"] = json!({"capabilities":{
+                        "context_window": context_window,
+                        "max_tokens": max_tokens,
+                        "reasoning": reasoning,
+                        "thinking_level_map": thinking_level_map,
+                        "supports_image_input": supports_image,
+                        "cost":{"input":cost_input,"output":cost_output,"cacheRead":cost_cache_read,"cacheWrite":cost_cache_write}
+                    }});
+                }
+                value
+            }).collect::<Vec<_>>() }),
         )
     }
 }
