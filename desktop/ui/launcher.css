@@ -1,0 +1,48 @@
+:root {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #17211b;
+  background: #f2f5f0;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; background: radial-gradient(circle at 100% 0, #dfeadf 0, transparent 44%), #f2f5f0; }
+button, input { font: inherit; }
+.shell { min-height: 100vh; display: flex; flex-direction: column; gap: 20px; padding: 28px; }
+.hero { display: grid; grid-template-columns: 56px 1fr; gap: 16px; align-items: start; }
+.mark { display: grid; place-items: center; width: 56px; height: 56px; border-radius: 16px; color: #f7fff7; background: #1f5135; font-weight: 800; letter-spacing: -0.05em; box-shadow: 0 10px 30px rgb(31 81 53 / 22%); }
+.eyebrow { margin: 2px 0 4px; color: #55705f; font-size: 11px; font-weight: 750; letter-spacing: .14em; }
+h1 { margin: 0; font-size: 25px; letter-spacing: -.035em; }
+.intro { margin: 7px 0 0; color: #627068; font-size: 13px; line-height: 1.55; }
+.status-card { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 16px; border: 1px solid #d7ded8; border-radius: 15px; background: rgb(255 255 255 / 72%); }
+.status-line { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.status-line strong { display: block; font-size: 14px; }
+.status-line p { margin: 3px 0 0; color: #738078; font-size: 12px; overflow-wrap: anywhere; }
+.status-dot { flex: none; width: 10px; height: 10px; border-radius: 999px; background: #d39b35; box-shadow: 0 0 0 5px rgb(211 155 53 / 13%); }
+.status-dot.running { background: #2f9d5b; box-shadow: 0 0 0 5px rgb(47 157 91 / 13%); }
+.status-dot.failed { background: #c95050; box-shadow: 0 0 0 5px rgb(201 80 80 / 13%); }
+.port-form { display: grid; gap: 8px; }
+.port-form label { font-size: 13px; font-weight: 700; }
+.port-row { display: grid; grid-template-columns: 1fr auto; gap: 9px; }
+input { min-width: 0; height: 42px; padding: 0 13px; color: inherit; background: #fff; border: 1px solid #cbd5cd; border-radius: 10px; outline: none; }
+input:focus { border-color: #2e774d; box-shadow: 0 0 0 3px rgb(46 119 77 / 13%); }
+.hint { min-height: 17px; margin: 0; color: #758079; font-size: 11px; }
+.hint.error { color: #a63939; }
+.button { border: 0; border-radius: 10px; cursor: pointer; font-weight: 700; transition: transform .12s ease, background .12s ease; }
+.button:active { transform: translateY(1px); }
+.button:disabled { cursor: wait; opacity: .6; }
+.button.primary { width: 100%; padding: 13px 16px; color: #fff; background: #1f5135; }
+.button.primary:hover { background: #173f29; }
+.button.secondary { padding: 0 16px; color: #fff; background: #3b6d4e; }
+.button.ghost { flex: none; padding: 9px 11px; color: #385344; background: #e6ece7; }
+footer { display: flex; justify-content: space-between; margin-top: auto; color: #7b867e; font-size: 11px; }
+
+@media (prefers-color-scheme: dark) {
+  :root { color: #e6eee8; background: #151b17; }
+  body { background: radial-gradient(circle at 100% 0, #20382a 0, transparent 44%), #151b17; }
+  .intro, .status-line p, .hint, footer { color: #9eaaa2; }
+  .eyebrow { color: #94b09d; }
+  .status-card { border-color: #34443a; background: rgb(31 41 34 / 78%); }
+  input { color: #eef5ef; background: #202a23; border-color: #3d5143; }
+  .button.ghost { color: #d8e5dc; background: #304139; }
+}

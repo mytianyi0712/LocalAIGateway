@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Local AI Gateway",
+  "version": "0.2.0",
+  "identifier": "io.github.mytianyi.local-ai-gateway",
+  "build": {
+    "frontendDist": "../ui",
+    "removeUnusedCommands": true
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Local AI Gateway",
+        "width": 500,
+        "height": 430,
+        "minWidth": 460,
+        "minHeight": 400,
+        "resizable": false,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb", "appimage", "nsis"],
+    "shortDescription": "多供应商本地 AI 网关",
+    "longDescription": "跨平台的本地 AI 协议网关与路由管理工具。",
+    "resources": []
+  }
+}

@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Local AI Gateway</title>
+  <link rel="stylesheet" href="./launcher.css">
+  <script type="module" src="./launcher.js"></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <div class="mark" aria-hidden="true">LG</div>
+      <div>
+        <p class="eyebrow">LOCAL CONTROL PLANE</p>
+        <h1>Local AI Gateway</h1>
+        <p class="intro">一个进程连接多家模型服务。桌面端管理运行状态，完整配置在浏览器中完成。</p>
+      </div>
+    </header>
+
+    <section class="status-card" aria-live="polite">
+      <div class="status-line">
+        <span id="status-dot" class="status-dot"></span>
+        <div>
+          <strong id="status-label">正在启动</strong>
+          <p id="status-detail">正在初始化本地数据库与网关服务…</p>
+        </div>
+      </div>
+      <button id="toggle" class="button ghost" type="button">停止服务</button>
+    </section>
+
+    <form id="port-form" class="port-form">
+      <label for="port">本地网关端口</label>
+      <div class="port-row">
+        <input id="port" name="port" type="number" min="1024" max="65535" inputmode="numeric" required>
+        <button class="button secondary" type="submit">保存并重启</button>
+      </div>
+      <p id="port-hint" class="hint">端口范围 1024–65535。修改后服务自动重启。</p>
+    </form>
+
+    <button id="open-dashboard" class="button primary" type="button">在浏览器中打开管理界面</button>
+
+    <footer>
+      <span>v<span id="version">0.2.0</span></span>
+      <span>Windows · Linux</span>
+    </footer>
+  </main>
+</body>
+</html>
