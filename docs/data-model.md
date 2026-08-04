@@ -282,6 +282,29 @@ erDiagram
 
 所有 Token 字段允许 `NULL`。`0` 只表示上游明确报告为零，不能表示未知。
 
+### 5.3 `token_usage`（Token 统计快照）
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `attempt_id` | TEXT PK | 去重键，对应 `request_attempts.id`，无外键 |
+| `occurred_at` | TEXT | 请求实际开始时间，UTC RFC3339 固定毫秒 `YYYY-MM-DDTHH:MM:SS.sssZ` |
+| `bucket` | TEXT | UTC 整点 `YYYY-MM-DDTHH:00:00Z`，供小时聚合 |
+| `protocol` | TEXT | 入口协议快照 |
+| `model_id` | TEXT | 请求模型快照，未知为空串 |
+| `input_tokens` | INTEGER NULL | 总输入 Token |
+| `cache_read_tokens` | INTEGER NULL | 缓存读取 Token |
+| `cache_write_tokens` | INTEGER NULL | 缓存写入 Token |
+| `cache_miss_input_tokens` | INTEGER NULL | 归一化非缓存输入 Token |
+| `output_tokens` | INTEGER NULL | 输出 Token |
+| `first_token_ms` | INTEGER NULL | 首内容 Token 延迟 |
+| `duration_ms` | INTEGER NULL | 尝试总耗时 |
+
+- Token 字段保持 `NULL` 语义：聚合时忽略 `null`，`0` 只表示上游明确报告为零。
+- 只有 `response_started = 1` 的尝试进入该表，与统计口径一致。
+- 与日志表之间没有任何外键，日志清理、过期或渠道删除都不会级联影响 token 统计；token 统计无限期保留。
+- 写入与 `request_attempts` 在同一事务中完成，按 `attempt_id` 幂等去重。
+- `occurred_at` 固定为单一 UTC 表示（固定毫秒、`Z` 后缀），保证 TEXT 范围比较与索引正确；查询边界必须先转换为同一表示。
+
 ## 6. 设置与任务表
 
 ### 6.1 `settings`
@@ -312,6 +335,7 @@ erDiagram
 
 - 请求日志到期时先删除 `request_attempts`，再删除 `request_logs`，使用外键级联完成。
 - 健康探测和发现任务日志采用同一保留周期。
+- `token_usage` 不参与任何日志清理：清空日志（`DELETE /logs`）与保留期过期都只影响日志表，token 统计独立无限期保留。
 - 删除渠道前，如果它仍属于路由候选，管理 API 返回 `409` 并列出关联数量。
 - 删除渠道后历史请求日志中的 `channel_id` 使用 `ON DELETE SET NULL`，同时保留渠道名称快照字段作为后续迁移选项。
 - 删除供应商前必须先删除其渠道。

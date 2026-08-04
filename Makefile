@@ -1,4 +1,4 @@
-.PHONY: install build test run desktop-icons desktop-build-linux desktop-build-windows package-appimage package-arch package-windows-wine package-all
+.PHONY: install build test run desktop-icons desktop-build-linux desktop-build-windows package-appimage package-arch package-windows-wine package-all version version-set version-check
 
 install:
 	cd backend && uv sync --extra test
@@ -33,3 +33,12 @@ package-windows-wine:
 
 package-all:
 	./packaging/build.sh all
+
+version:             ## Show the authoritative project version (VERSION)
+	./scripts/version.sh show
+
+version-set:         ## Bump the project version everywhere: make version-set VERSION=0.3.0-rc.1
+	./scripts/version.sh set "$(VERSION)"
+
+version-check:       ## Verify all first-party version declarations agree (CI-safe, exit 0/1)
+	./scripts/version.sh check

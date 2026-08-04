@@ -255,6 +255,9 @@ button:disabled { cursor: not-allowed; }
 .filter-bar .select { width: 180px; }
 .filter-bar .input { width: 220px; }
 .filter-bar .select.is-outcome { width: 150px; }
+.filter-bar .input[type="datetime-local"] { width: 240px; }
+.filter-sep { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.dashboard-filter-panel .filter-bar { border-bottom: 0; }
 .pagination { display: flex; align-items: center; justify-content: flex-end; gap: 12px; padding: 12px 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
 .pagination .button { min-height: 32px; padding: 0 10px; }
 
@@ -393,6 +396,7 @@ button:disabled { cursor: not-allowed; }
   .filter-bar { align-items: stretch; padding: 14px; }
   .filter-label { width: 100%; }
   .filter-bar .select, .filter-bar .input { width: 100%; }
+  .filter-bar .input[type="datetime-local"] { width: 100%; }
   .filter-bar .button { flex: 1; }
   .form-grid, .form-grid.is-two { grid-template-columns: 1fr; }
   .overview-strip { align-items: flex-start; gap: 14px; padding: 16px 16px 16px 13px; }

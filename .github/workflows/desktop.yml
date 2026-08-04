@@ -33,6 +33,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Verify version consistency
+        shell: bash
+        run: ./scripts/version.sh check
+
+      - name: Verify tag matches VERSION
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          test "$(cat VERSION)" = "${GITHUB_REF_NAME#v}" \
+            || { echo "::error::tag ${GITHUB_REF_NAME} does not match VERSION ($(cat VERSION))"; exit 1; }
+
       - name: Install Linux bundling dependencies
         if: matrix.kind == 'linux'
         run: |
@@ -102,6 +113,7 @@ jobs:
           pacman -Syu --noconfirm --needed \
             ca-certificates curl git python rust cargo \
             webkit2gtk-4.1 gtk3 libayatana-appindicator librsvg patchelf
+          ./scripts/version.sh check
           useradd --create-home builder
           chown -R builder:builder /workspace
           su builder -c './packaging/build-arch.sh'

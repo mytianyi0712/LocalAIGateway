@@ -82,6 +82,7 @@ const state = {
   summary: null,
   system: null,
   logs: { page: 1, total: 0, items: [], filters: { protocol: '', upstream_protocol: '', model_id: '', upstream_model_id: '', outcome: '' } },
+  dashboard: { filters: { range: 'all', start: '', end: '' } },
   settings: null,
   generatedKeys: null,
   drawerRoute: null,
@@ -451,8 +452,98 @@ function channelRows(channels, includeProvider = true) {
   }).join('');
 }
 
+const DASHBOARD_RANGES = [
+  ['all', '全部历史'],
+  ['today', '今天'],
+  ['yesterday', '昨天'],
+  ['last7', '近 7 天'],
+  ['last30', '近 30 天'],
+  ['custom', '自定义'],
+];
+
+function localMidnight(offsetDays = 0) {
+  const now = new Date();
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate() + offsetDays);
+}
+
+function parseDateTimeLocal(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function dashboardBounds(filters) {
+  if (filters.range === 'today') return [localMidnight(0), localMidnight(1)];
+  if (filters.range === 'yesterday') return [localMidnight(-1), localMidnight(0)];
+  if (filters.range === 'last7') return [localMidnight(-6), localMidnight(1)];
+  if (filters.range === 'last30') return [localMidnight(-29), localMidnight(1)];
+  if (filters.range === 'custom') {
+    const start = parseDateTimeLocal(filters.start);
+    const end = parseDateTimeLocal(filters.end);
+    return start && end && start < end ? [start, end] : null;
+  }
+  return null;
+}
+
+function dashboardQuery() {
+  const query = new URLSearchParams();
+  const bounds = dashboardBounds(state.dashboard.filters);
+  if (bounds) {
+    query.set('from', bounds[0].toISOString());
+    query.set('to', bounds[1].toISOString());
+  }
+  return query;
+}
+
+function formatRangeTime(date) {
+  const pad = (item) => String(item).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function dashboardRangeText() {
+  const bounds = dashboardBounds(state.dashboard.filters);
+  return bounds ? `${formatRangeTime(bounds[0])} ~ ${formatRangeTime(bounds[1])}（本机时区）` : '';
+}
+
+function renderDashboardFilter() {
+  const { range, start, end } = state.dashboard.filters;
+  const custom = range === 'custom';
+  const disabledAttr = custom ? '' : ' disabled';
+  return `<form class="filter-bar dashboard-filter" data-form="dashboard-filter">
+    <span class="filter-label">统计范围</span>
+    <select class="select" name="range" data-range-select aria-label="Token 统计范围">${DASHBOARD_RANGES.map(([value, label]) => `<option value="${value}" ${range === value ? 'selected' : ''}>${label}</option>`).join('')}</select>
+    <input class="input" name="start" type="datetime-local" aria-label="开始时间" value="${escapeAttr(start)}"${disabledAttr}>
+    <span class="filter-sep">至（不含）</span>
+    <input class="input" name="end" type="datetime-local" aria-label="结束时间（不含）" value="${escapeAttr(end)}"${disabledAttr}>
+    ${button({ action: 'submit-dashboard-filter', label: '应用', iconName: 'search', primary: true })}
+  </form>`;
+}
+
+async function submitDashboardFilter(form) {
+  const values = new FormData(form);
+  const range = String(values.get('range') || 'all');
+  const start = String(values.get('start') || '').trim();
+  const end = String(values.get('end') || '').trim();
+  if (range === 'custom') {
+    const startDate = parseDateTimeLocal(start);
+    const endDate = parseDateTimeLocal(end);
+    if (!startDate || !endDate) {
+      toast('请填写自定义范围的开始与结束时间', 'error');
+      return;
+    }
+    if (!(startDate < endDate)) {
+      toast('开始时间必须早于结束时间', 'error');
+      return;
+    }
+  }
+  state.dashboard.filters = { range, start, end };
+  await loadDashboard(state.renderVersion);
+}
+
 async function loadDashboard(version) {
-  const [summary, channelData, system] = await Promise.all([get('/stats/summary'), get('/channels'), get('/system/status')]);
+  const query = dashboardQuery();
+  const summaryPath = query.toString() ? `/stats/summary?${query}` : '/stats/summary';
+  const [summary, channelData, system] = await Promise.all([get(summaryPath), get('/channels'), get('/system/status')]);
   if (version !== state.renderVersion) return;
   state.summary = summary;
   state.channels = channelData.items;
@@ -471,6 +562,8 @@ function renderDashboard() {
   const hasChannels = configuredChannels > 0;
   const channelState = hasChannels ? `${activeChannels} / ${configuredChannels} 渠道可用` : '尚未配置渠道';
   const systemHealthy = system.database === 'ok';
+  const rangeText = dashboardRangeText();
+  const scopeLabel = rangeText ? '当前统计范围内' : '独立保存的全部历史';
   return `<div class="page-stack">
     ${toolbar('实时状态', '当前日志保留期内的运行汇总', button({ action: 'refresh-dashboard', label: '刷新数据', iconName: 'refresh-cw' }))}
     <section class="overview-strip" aria-label="网关状态">
@@ -483,11 +576,12 @@ function renderDashboard() {
     <section class="metric-grid metric-grid--summary" aria-label="核心指标">
       ${metric('请求总数', number(summary.requests), '本地日志保留期内', 'is-accent', 'activity')}
       ${metric('成功率', percent(summary.success_rate), '最终返回成功的请求', 'is-info', 'check')}
-      ${metric('平均首 Token', `${number(summary.average_first_token_ms)}<small>${summary.average_first_token_ms == null ? '' : 'ms'}</small>`, '仅统计可识别的流式响应', 'is-warning', 'server')}
-      ${metric('平均 TPS', number(summary.average_tps, { maximumFractionDigits: 3 }), '按完整响应耗时计算', 'is-violet', 'activity')}
+      ${metric('平均首 Token', `${number(summary.average_first_token_ms)}<small>${summary.average_first_token_ms == null ? '' : 'ms'}</small>`, `${scopeLabel} · 仅统计可识别的流式响应`, 'is-warning', 'server')}
+      ${metric('平均 TPS', number(summary.average_tps, { maximumFractionDigits: 3 }), `${scopeLabel} · 按完整响应耗时计算`, 'is-violet', 'activity')}
     </section>
+    ${panel('统计范围', '筛选 Token、首 Token、TPS 与缓存统计；请求总数与成功率不受影响', renderDashboardFilter(), 'dashboard-filter-panel')}
     <section class="dashboard-token-section" aria-labelledby="token-usage-title">
-      <div class="dashboard-section-heading"><div><h2 id="token-usage-title">Token 使用</h2><p>当前日志保留期内的累计用量</p></div></div>
+      <div class="dashboard-section-heading"><div><h2 id="token-usage-title">Token 使用</h2><p>${rangeText ? `当前统计范围：${rangeText}` : '独立保存的全部历史累计用量'}</p></div></div>
       <div class="token-grid">
         ${tokenMetric('缓存命中', tokenCount(summary.cache_read_tokens), 'is-accent', 'database')}
         ${tokenMetric('缓存写入', tokenCount(summary.cache_write_tokens), 'is-info', 'server')}
@@ -496,7 +590,7 @@ function renderDashboard() {
       </div>
     </section>
     <section class="cache-hit-section" aria-labelledby="cache-hit-title">
-      <div class="dashboard-section-heading"><div><h2 id="cache-hit-title">缓存命中率</h2><p>按协议类别汇总缓存使用情况</p></div></div>
+      <div class="dashboard-section-heading"><div><h2 id="cache-hit-title">缓存命中率</h2><p>${rangeText ? `按协议类别汇总缓存使用情况 · ${rangeText}` : '按协议类别汇总缓存使用情况'}</p></div></div>
       <div class="cache-hit-grid">
         ${cacheHitCard('OpenAI', cacheByProvider.get('OpenAI'))}
         ${cacheHitCard('Claude', cacheByProvider.get('Claude'))}
@@ -1531,6 +1625,7 @@ async function handleAction(target) {
     if (action === 'submit-mapping') return document.getElementById('mapping-form')?.requestSubmit();
     if (action === 'submit-auth') return document.getElementById('auth-form')?.requestSubmit();
     if (action === 'submit-settings') return document.getElementById('settings-form')?.requestSubmit();
+    if (action === 'submit-dashboard-filter') return document.querySelector('[data-form="dashboard-filter"]')?.requestSubmit();
     if (action === 'submit-log-filter') return document.querySelector('[data-form="logs-filter"]')?.requestSubmit();
   } catch (error) {
     toast(error.message || '操作失败', 'error');
@@ -1551,6 +1646,7 @@ async function handleSubmit(event) {
     else if (form.dataset.form === 'caps') await saveCapabilities(form);
     else if (form.dataset.form === 'auth') await saveAuth(form);
     else if (form.dataset.form === 'settings') await saveSettings(form);
+    else if (form.dataset.form === 'dashboard-filter') await submitDashboardFilter(form);
     else if (form.dataset.form === 'logs-filter') await submitLogFilter(form);
   } catch (error) {
     toast(error.message || '保存失败', 'error');
@@ -1559,6 +1655,12 @@ async function handleSubmit(event) {
 
 function handleChange(event) {
   const target = event.target;
+  if (target.matches('[data-range-select]')) {
+    const form = target.closest('[data-form="dashboard-filter"]');
+    if (!form) return;
+    const custom = target.value === 'custom';
+    form.querySelectorAll('[name="start"], [name="end"]').forEach((input) => { input.disabled = !custom; });
+  }
   if (target.matches('[data-channel-toggle]')) toggleChannel(target.dataset.channelId, target.checked);
   if (target.matches('[data-candidate-selected]')) {
     const row = target.closest('.candidate-row');

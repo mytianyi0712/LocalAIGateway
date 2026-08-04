@@ -1412,10 +1412,11 @@ fn default_codex_presets() -> Value {
     json!({"items":[{"id":"gpt-5-codex","display_name":"GPT-5 Codex（默认）"},{"id":"gpt-5","display_name":"GPT-5"},{"id":"gpt-5-mini","display_name":"GPT-5 Mini"},{"id":"gpt-5-nano","display_name":"GPT-5 Nano"},{"id":"o3","display_name":"o3"},{"id":"o4-mini","display_name":"o4-mini"},{"id":"gpt-4.1","display_name":"GPT-4.1"},{"id":"gpt-4o","display_name":"GPT-4o"}],"source":"defaults","refreshed_at":null})
 }
 async fn presets(state: &AppState, key: &str, defaults: Value) -> Result<Value, ApiError> {
-    let raw: Option<String> = sqlx::query_scalar("SELECT CAST(value_json AS TEXT) FROM settings WHERE key=?")
-        .bind(key)
-        .fetch_optional(state.db.pool())
-        .await?;
+    let raw: Option<String> =
+        sqlx::query_scalar("SELECT CAST(value_json AS TEXT) FROM settings WHERE key=?")
+            .bind(key)
+            .fetch_optional(state.db.pool())
+            .await?;
     if let Some(raw) = raw {
         if let Ok(stored) = serde_json::from_str::<Value>(&raw) {
             let mut merged = defaults
@@ -1582,14 +1583,11 @@ async fn list_requests(
         let attempts = builder.build().fetch_all(state.db.pool()).await?;
         for attempt in attempts {
             let request_id: String = attempt.get("request_id");
-            attempts_by_request
-                .entry(request_id)
-                .or_default()
-                .push((
-                    attempt.get::<String, _>("channel_name"),
-                    attempt.get::<Option<String>, _>("upstream_protocol"),
-                    attempt.get::<Option<String>, _>("upstream_model_id"),
-                ));
+            attempts_by_request.entry(request_id).or_default().push((
+                attempt.get::<String, _>("channel_name"),
+                attempt.get::<Option<String>, _>("upstream_protocol"),
+                attempt.get::<Option<String>, _>("upstream_model_id"),
+            ));
         }
     }
     let items = rows.iter().map(|row| {
@@ -1632,18 +1630,45 @@ async fn get_request(
     // extract each field with its concrete type instead.
     value.insert("id".into(), json!(row.get::<String, _>("id")));
     value.insert("protocol".into(), json!(row.get::<String, _>("protocol")));
-    value.insert("model_id".into(), json!(row.get::<Option<String>, _>("model_id")));
+    value.insert(
+        "model_id".into(),
+        json!(row.get::<Option<String>, _>("model_id")),
+    );
     value.insert("endpoint".into(), json!(row.get::<String, _>("endpoint")));
     value.insert("stream".into(), json!(row.get::<Option<bool>, _>("stream")));
-    value.insert("started_at".into(), json!(row.get::<String, _>("started_at")));
-    value.insert("finished_at".into(), json!(row.get::<Option<String>, _>("finished_at")));
-    value.insert("total_duration_ms".into(), json!(row.get::<Option<i64>, _>("total_duration_ms")));
-    value.insert("final_status_code".into(), json!(row.get::<Option<i64>, _>("final_status_code")));
+    value.insert(
+        "started_at".into(),
+        json!(row.get::<String, _>("started_at")),
+    );
+    value.insert(
+        "finished_at".into(),
+        json!(row.get::<Option<String>, _>("finished_at")),
+    );
+    value.insert(
+        "total_duration_ms".into(),
+        json!(row.get::<Option<i64>, _>("total_duration_ms")),
+    );
+    value.insert(
+        "final_status_code".into(),
+        json!(row.get::<Option<i64>, _>("final_status_code")),
+    );
     value.insert("outcome".into(), json!(row.get::<String, _>("outcome")));
-    value.insert("attempt_count".into(), json!(row.get::<i64, _>("attempt_count")));
-    value.insert("final_channel_id".into(), json!(row.get::<Option<String>, _>("final_channel_id")));
-    value.insert("request_bytes".into(), json!(row.get::<Option<i64>, _>("request_bytes")));
-    value.insert("response_bytes".into(), json!(row.get::<Option<i64>, _>("response_bytes")));
+    value.insert(
+        "attempt_count".into(),
+        json!(row.get::<i64, _>("attempt_count")),
+    );
+    value.insert(
+        "final_channel_id".into(),
+        json!(row.get::<Option<String>, _>("final_channel_id")),
+    );
+    value.insert(
+        "request_bytes".into(),
+        json!(row.get::<Option<i64>, _>("request_bytes")),
+    );
+    value.insert(
+        "response_bytes".into(),
+        json!(row.get::<Option<i64>, _>("response_bytes")),
+    );
     value.insert("attempts".into(), json!(attempt_values));
     Ok(ok(Value::Object(value)))
 }
@@ -1691,7 +1716,79 @@ fn cache_provider(protocol: &str) -> String {
         .unwrap_or_else(|| protocol.to_string())
 }
 
-async fn stats_summary(_: AdminAuth, State(state): State<AppState>) -> ApiResult {
+#[derive(Deserialize, Default)]
+struct SummaryQuery {
+    from: Option<String>,
+    to: Option<String>,
+}
+
+struct TokenWindow {
+    from: chrono::DateTime<Utc>,
+    to: chrono::DateTime<Utc>,
+}
+
+/// Parses an offset-aware RFC3339 timestamp and normalizes it to UTC.
+/// Naive timestamps without a timezone offset are rejected.
+fn parse_utc_rfc3339(value: &str) -> Result<chrono::DateTime<Utc>, ()> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|_| ())
+}
+
+/// Formats a UTC instant in the canonical representation used by
+/// `token_usage.occurred_at`: fixed milliseconds, Z suffix. Range comparisons
+/// are only exact when bounds share this representation.
+fn format_utc_millis(value: chrono::DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// Resolves the optional token time window. Both bounds must be provided
+/// together (an unbounded half-open range would be ambiguous), and the range
+/// must be non-empty. All bounds are normalized to UTC.
+fn resolve_token_window(query: &SummaryQuery) -> Result<Option<TokenWindow>, ApiError> {
+    match (&query.from, &query.to) {
+        (None, None) => Ok(None),
+        (Some(from), Some(to)) => {
+            let from = parse_utc_rfc3339(from).map_err(|_| {
+                ApiError::validation("from must be an RFC3339 timestamp with timezone")
+            })?;
+            let to = parse_utc_rfc3339(to).map_err(|_| {
+                ApiError::validation("to must be an RFC3339 timestamp with timezone")
+            })?;
+            if from >= to {
+                return Err(ApiError::validation("from must be earlier than to"));
+            }
+            Ok(Some(TokenWindow { from, to }))
+        }
+        _ => Err(ApiError::validation(
+            "from and to must be provided together",
+        )),
+    }
+}
+
+/// Appends the `[from, to)` filter on `token_usage.occurred_at` to a query
+/// builder, using the same canonical representation as stored values so the
+/// index stays usable.
+fn push_token_window<'a>(
+    builder: &mut QueryBuilder<'a, sqlx::Sqlite>,
+    window: &Option<TokenWindow>,
+) {
+    if let Some(window) = window {
+        builder.push(" WHERE occurred_at >= ");
+        builder.push_bind(format_utc_millis(window.from));
+        builder.push(" AND occurred_at < ");
+        builder.push_bind(format_utc_millis(window.to));
+    }
+}
+
+async fn stats_summary(
+    _: AdminAuth,
+    State(state): State<AppState>,
+    Query(query): Query<SummaryQuery>,
+) -> ApiResult {
+    let window = resolve_token_window(&query)?;
+    // requests / success_rate / average_duration stay log-scoped: they are
+    // intentionally NOT filtered by the token window.
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_logs")
         .fetch_one(state.db.pool())
         .await?;
@@ -1699,42 +1796,49 @@ async fn stats_summary(_: AdminAuth, State(state): State<AppState>) -> ApiResult
         sqlx::query_scalar("SELECT COUNT(*) FROM request_logs WHERE outcome='success'")
             .fetch_one(state.db.pool())
             .await?;
-    let avg_duration: Option<f64> = sqlx::query_scalar("SELECT AVG(total_duration_ms) FROM request_logs")
-        .fetch_one(state.db.pool())
-        .await?;
-    let token_row = sqlx::query(
+    let avg_duration: Option<f64> =
+        sqlx::query_scalar("SELECT AVG(total_duration_ms) FROM request_logs")
+            .fetch_one(state.db.pool())
+            .await?;
+    // Token-derived fields come from the log-independent token_usage table, so
+    // they survive log cleanup/expiry. The optional window filters them only.
+    let mut token_query = QueryBuilder::new(
         "SELECT \
-         SUM(cache_read_tokens), SUM(cache_write_tokens), SUM(cache_miss_input_tokens), \
-         SUM(output_tokens), AVG(first_token_ms), \
-         SUM(CASE WHEN output_tokens IS NOT NULL AND duration_ms > 0 THEN output_tokens ELSE 0 END), \
-         SUM(CASE WHEN output_tokens IS NOT NULL AND duration_ms > 0 THEN duration_ms ELSE 0 END) \
-         FROM request_attempts WHERE response_started = 1",
-    )
-    .fetch_one(state.db.pool())
-    .await?;
-    let cache_read: Option<i64> = token_row.try_get(0)?;
-    let cache_write: Option<i64> = token_row.try_get(1)?;
-    let cache_miss: Option<i64> = token_row.try_get(2)?;
-    let output_tokens: Option<i64> = token_row.try_get(3)?;
-    let avg_first_token: Option<f64> = token_row.try_get(4)?;
-    let token_sum: i64 = token_row.try_get(5)?;
-    let duration_sum: i64 = token_row.try_get(6)?;
+         COALESCE(SUM(cache_read_tokens),0) cache_read, \
+         COALESCE(SUM(cache_write_tokens),0) cache_write, \
+         COALESCE(SUM(cache_miss_input_tokens),0) cache_miss, \
+         COALESCE(SUM(output_tokens),0) output_tokens, \
+         AVG(first_token_ms) avg_first_token, \
+         COALESCE(SUM(CASE WHEN output_tokens IS NOT NULL AND duration_ms > 0 THEN output_tokens ELSE 0 END),0) tps_tokens, \
+         COALESCE(SUM(CASE WHEN output_tokens IS NOT NULL AND duration_ms > 0 THEN duration_ms ELSE 0 END),0) tps_duration \
+         FROM token_usage",
+    );
+    push_token_window(&mut token_query, &window);
+    let token_row = token_query.build().fetch_one(state.db.pool()).await?;
+    let cache_read: i64 = token_row.try_get("cache_read")?;
+    let cache_write: i64 = token_row.try_get("cache_write")?;
+    let cache_miss: i64 = token_row.try_get("cache_miss")?;
+    let output_tokens: i64 = token_row.try_get("output_tokens")?;
+    let avg_first_token: Option<f64> = token_row.try_get("avg_first_token")?;
+    let token_sum: i64 = token_row.try_get("tps_tokens")?;
+    let duration_sum: i64 = token_row.try_get("tps_duration")?;
     let channels: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM channels")
         .fetch_one(state.db.pool())
         .await?;
-    let active_channels: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM channel_health WHERE state='active'",
-    )
-    .fetch_one(state.db.pool())
-    .await?;
-    let cache_rows = sqlx::query(
-        "SELECT l.protocol, COUNT(DISTINCT a.request_id), \
-         SUM(a.cache_read_tokens), SUM(a.cache_write_tokens), SUM(a.cache_miss_input_tokens) \
-         FROM request_logs l JOIN request_attempts a ON a.request_id = l.id \
-         WHERE a.response_started = 1 GROUP BY l.protocol",
-    )
-    .fetch_all(state.db.pool())
-    .await?;
+    let active_channels: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM channel_health WHERE state='active'")
+            .fetch_one(state.db.pool())
+            .await?;
+    let mut cache_query = QueryBuilder::new(
+        "SELECT protocol, COUNT(*) request_count, \
+         COALESCE(SUM(cache_read_tokens),0) cache_read, \
+         COALESCE(SUM(cache_write_tokens),0) cache_write, \
+         COALESCE(SUM(cache_miss_input_tokens),0) cache_miss \
+         FROM token_usage",
+    );
+    push_token_window(&mut cache_query, &window);
+    cache_query.push(" GROUP BY protocol");
+    let cache_rows = cache_query.build().fetch_all(state.db.pool()).await?;
     let mut by_provider: HashMap<String, (i64, i64, i64, i64)> = HashMap::new();
     for row in cache_rows {
         let protocol: String = row.get(0);
@@ -1777,35 +1881,40 @@ async fn stats_summary(_: AdminAuth, State(state): State<AppState>) -> ApiResult
             }))
         })
         .collect();
-    Ok(ok(
-        json!({
-            "requests": total,
-            "success_rate": if total > 0 {
-                Some((success as f64 / total as f64 * 10000.0).round() / 10000.0)
-            } else {
-                None
-            },
-            "average_duration_ms": avg_duration.map(|value| (value * 100.0).round() / 100.0),
-            "average_first_token_ms": avg_first_token.map(|value| (value * 100.0).round() / 100.0),
-            "average_tps": if duration_sum > 0 {
-                Some((token_sum as f64 * 1000.0 / duration_sum as f64 * 1000.0).round() / 1000.0)
-            } else {
-                None
-            },
-            "cache_read_tokens": cache_read.unwrap_or(0),
-            "cache_write_tokens": cache_write.unwrap_or(0),
-            "cache_miss_input_tokens": cache_miss.unwrap_or(0),
-            "output_tokens": output_tokens.unwrap_or(0),
-            "cache_by_provider": cache_provider_items,
-            "channels": channels,
-            "active_channels": active_channels,
-        }),
-    ))
+    Ok(ok(json!({
+        "requests": total,
+        "success_rate": if total > 0 {
+            Some((success as f64 / total as f64 * 10000.0).round() / 10000.0)
+        } else {
+            None
+        },
+        "average_duration_ms": avg_duration.map(|value| (value * 100.0).round() / 100.0),
+        "average_first_token_ms": avg_first_token.map(|value| (value * 100.0).round() / 100.0),
+        "average_tps": if duration_sum > 0 {
+            Some((token_sum as f64 * 1000.0 / duration_sum as f64 * 1000.0).round() / 1000.0)
+        } else {
+            None
+        },
+        "cache_read_tokens": cache_read,
+        "cache_write_tokens": cache_write,
+        "cache_miss_input_tokens": cache_miss,
+        "output_tokens": output_tokens,
+        "cache_by_provider": cache_provider_items,
+        "channels": channels,
+        "active_channels": active_channels,
+        "token_range": window.as_ref().map(|window| json!({
+            "from": format_utc_millis(window.from),
+            "to": format_utc_millis(window.to),
+        })),
+    })))
 }
 async fn stats_cache(_: AdminAuth, State(state): State<AppState>) -> ApiResult {
-    let row=sqlx::query("SELECT COALESCE(SUM(cache_read_tokens),0) cache_read,COALESCE(SUM(cache_write_tokens),0) cache_write,COALESCE(SUM(cache_miss_input_tokens),0) cache_miss FROM request_attempts").fetch_one(state.db.pool()).await?;
+    // Token counts come from the log-independent token_usage table: clearing
+    // or expiring request logs never erases them. unknown_attempts counts
+    // responded attempts whose usage carried no token field at all.
+    let row=sqlx::query("SELECT COALESCE(SUM(cache_read_tokens),0) cache_read,COALESCE(SUM(cache_write_tokens),0) cache_write,COALESCE(SUM(cache_miss_input_tokens),0) cache_miss,COALESCE(SUM(output_tokens),0) output_tokens,COALESCE(SUM(CASE WHEN input_tokens IS NULL AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL AND cache_miss_input_tokens IS NULL AND output_tokens IS NULL THEN 1 ELSE 0 END),0) unknown FROM token_usage").fetch_one(state.db.pool()).await?;
     Ok(ok(
-        json!({"cache_read_tokens":row.get::<i64,_>("cache_read"),"cache_write_tokens":row.get::<i64,_>("cache_write"),"cache_miss_input_tokens":row.get::<i64,_>("cache_miss")}),
+        json!({"cache_read_tokens":row.get::<i64,_>("cache_read"),"cache_write_tokens":row.get::<i64,_>("cache_write"),"cache_miss_input_tokens":row.get::<i64,_>("cache_miss"),"output_tokens":row.get::<i64,_>("output_tokens"),"unknown_attempts":row.get::<i64,_>("unknown")}),
     ))
 }
 async fn stats_models(_: AdminAuth, State(state): State<AppState>) -> ApiResult {
@@ -1902,4 +2011,131 @@ async fn list_discovery_runs(
     .await?;
     let items=rows.iter().map(|row|json!({"id":row.get::<String,_>("id"),"channel_id":row.get::<String,_>("channel_id"),"trigger":row.get::<String,_>("trigger"),"started_at":row.get::<String,_>("started_at"),"finished_at":row.get::<Option<String>,_>("finished_at"),"success":row.get::<Option<bool>,_>("success"),"model_count":row.get::<Option<i64>,_>("model_count"),"status_code":row.get::<Option<i64>,_>("status_code"),"error_kind":row.get::<Option<String>,_>("error_kind")})).collect::<Vec<_>>();
     Ok(ok(json!({"items":items,"total":items.len()})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(from: &str, to: &str) -> SummaryQuery {
+        SummaryQuery {
+            from: Some(from.to_owned()),
+            to: Some(to.to_owned()),
+        }
+    }
+
+    #[test]
+    fn utc_plus_8_local_midnight_maps_to_previous_day_16z() {
+        let from = parse_utc_rfc3339("2026-08-04T00:00:00+08:00").unwrap();
+        assert_eq!(format_utc_millis(from), "2026-08-03T16:00:00.000Z");
+    }
+
+    #[test]
+    fn arbitrary_offsets_and_fractional_seconds_normalize_to_utc() {
+        let from = parse_utc_rfc3339("2026-08-04T08:30:00Z").unwrap();
+        assert_eq!(format_utc_millis(from), "2026-08-04T08:30:00.000Z");
+        let from = parse_utc_rfc3339("2026-08-04T08:30:00.125+05:30").unwrap();
+        assert_eq!(format_utc_millis(from), "2026-08-04T03:00:00.125Z");
+        let from = parse_utc_rfc3339("2026-08-04T23:59:59.999-07:00").unwrap();
+        assert_eq!(format_utc_millis(from), "2026-08-05T06:59:59.999Z");
+    }
+
+    #[test]
+    fn naive_timestamp_without_timezone_is_rejected() {
+        assert!(parse_utc_rfc3339("2026-08-04T08:30:00").is_err());
+        assert!(parse_utc_rfc3339("2026-08-04").is_err());
+    }
+
+    #[test]
+    fn canonical_occurred_at_format_is_lexicographically_ordered() {
+        let values = [
+            "2026-08-03T15:59:59.999Z",
+            "2026-08-03T16:00:00.000Z",
+            "2026-08-03T16:00:00.001Z",
+            "2026-08-03T16:00:01.000Z",
+        ];
+        let mut sorted = values.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted, values,
+            "fixed-millis Z format must sort chronologically"
+        );
+        // The half-open window start must compare equal to a stored value at
+        // the same instant.
+        let window = resolve_token_window(&window(
+            "2026-08-04T00:00:00+08:00",
+            "2026-08-05T00:00:00+08:00",
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(format_utc_millis(window.from), "2026-08-03T16:00:00.000Z");
+        assert_eq!(format_utc_millis(window.to), "2026-08-04T16:00:00.000Z");
+    }
+
+    #[test]
+    fn omitted_range_means_all_history() {
+        assert!(
+            resolve_token_window(&SummaryQuery::default())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn partial_range_is_rejected() {
+        let both = resolve_token_window(&window(
+            "2026-08-04T00:00:00+08:00",
+            "2026-08-05T00:00:00+08:00",
+        ));
+        assert!(both.is_ok());
+        assert!(
+            resolve_token_window(&SummaryQuery {
+                from: Some("2026-08-04T00:00:00Z".into()),
+                to: None
+            })
+            .is_err()
+        );
+        assert!(
+            resolve_token_window(&SummaryQuery {
+                from: None,
+                to: Some("2026-08-05T00:00:00Z".into())
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn empty_or_reversed_range_is_rejected() {
+        let equal = resolve_token_window(&window("2026-08-04T00:00:00Z", "2026-08-04T00:00:00Z"));
+        assert!(equal.is_err());
+        let reversed = resolve_token_window(&window(
+            "2026-08-05T00:00:00+08:00",
+            "2026-08-04T00:00:00+08:00",
+        ));
+        assert!(reversed.is_err());
+    }
+
+    #[test]
+    fn boundary_values_keep_half_open_semantics() {
+        // A stored occurred_at exactly at `from` must compare >= the bound,
+        // and one exactly at `to` must compare < the bound.
+        let window = resolve_token_window(&window(
+            "2026-08-03T16:00:00.000Z",
+            "2026-08-04T16:00:00.000Z",
+        ))
+        .unwrap()
+        .unwrap();
+        let from = format_utc_millis(window.from);
+        let to = format_utc_millis(window.to);
+        assert!("2026-08-03T16:00:00.000Z" >= from.as_str());
+        assert!("2026-08-04T15:59:59.999Z" < to.as_str());
+        assert!(
+            "2026-08-04T16:00:00.000Z" >= to.as_str(),
+            "end is exclusive"
+        );
+        assert!(
+            "2026-08-03T15:59:59.999Z" < from.as_str(),
+            "start is inclusive"
+        );
+    }
 }

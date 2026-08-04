@@ -140,6 +140,22 @@ make package-all            # 依次执行以上全部流程
 
 Arch 包需要 `makepkg`、GTK/WebKitGTK 与 Ayatana AppIndicator 开发环境；Windows 交叉构建需要 Wine、MinGW-w64、Rustup 和 `unzip`，脚本会自动安装 Rust Windows GNU target 并缓存便携版 NSIS。所有目标的产物会自动复制到仓库根目录的 `releases/` 文件夹（原始构建输出仍在各自的 target 目录）。发布标签也会通过 `.github/workflows/desktop.yml` 构建相同平台矩阵。
 
+## 版本管理
+
+项目版本遵循 SemVer，唯一权威源是仓库根目录的 `VERSION` 文件。所有第一方版本声明都从它同步或派生：`desktop/src-tauri/Cargo.toml`、`tauri.conf.json`、`Cargo.lock`、`backend/pyproject.toml`、`uv.lock`、`backend/app/main.py` 中 FastAPI 的 `version`，以及 `packaging/arch/PKGBUILD` 的 `pkgver`（Arch 规则不允许连字符，预发布段映射为下划线，如 `0.3.0-rc.1 -> 0.3.0_rc.1`）。依赖版本、第三方锁文件条目与 `releases/` 历史产物绝不被改动。
+
+发布新版本只需一个命令：
+
+```bash
+make version-set VERSION=0.3.0-rc.1   # 或 ./scripts/version.sh set 0.3.0-rc.1
+make version-check                     # 本地或 CI 校验各声明一致（退出码 0/1）
+make version                           # 查看当前版本
+```
+
+- `set` 只接受严格 SemVer（如 `0.2.1`、`0.3.0-rc.1`），非法输入在任何写入前即失败；重复设置同一版本是幂等空操作。锁文件由 `cargo metadata` / `uv lock` 重新解析更新，不做手工全文替换。
+- 取舍说明：Tauri CLI 在 `tauri.conf.json` 缺省 `version` 时会回退到 Cargo.toml，但 `tauri-build` 的 Windows 可执行文件版本资源（FileVersion/ProductVersion）只读取 `tauri.conf.json`，因此保留并同步该字段，避免 Windows 构建丢失版本元数据。`PKGBUILD` 模板中的 `pkgver` 由本工具保持可读一致，构建时 `packaging/build-arch.sh` 还会从 Cargo.toml 覆盖，两条路径由 `check` 保证结果相同。
+- 自校验：`./scripts/test-version.sh`（沙箱内验证 set/check、非法输入零写入、幂等、预发布支持、锁文件解析与打包文件名版本解析，无需构建安装包）。CI 的 `desktop.yml` 在打包前也会执行 `version.sh check`，并在 tag 推送时对账 `v$(cat VERSION)`。
+
 ## 开发与验证
 
 ```bash

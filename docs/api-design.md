@@ -354,6 +354,16 @@ DELETE /api/admin/v1/logs?before=2026-07-01T00:00:00Z&confirm=true
 
 通用参数为 `from`、`to` 和可选的 `protocol`、`model_id`、`channel_id`。`timeseries` 额外接受 `interval=hour|day`。
 
+### 8.1 `GET /stats/summary` 的 token 时间窗
+
+`from`、`to` 为可选参数，前端筛选主页 Token 统计时使用，格式为带时区的 RFC3339（如 `2026-08-04T00:00:00+08:00` 或 `2026-08-03T16:00:00Z`）。约定：
+
+- 两个参数必须同时提供或同时省略；只提供一个返回 `422`。
+- 带时区的时间先归一化为 UTC，再对独立 token 表的 `occurred_at` 做半开区间 `[from, to)`；`from >= to`（含相等）返回 `422`；无时区的裸时间返回 `422`。
+- 时间窗只作用于 token 派生字段：`cache_read_tokens`、`cache_write_tokens`、`cache_miss_input_tokens`、`output_tokens`、`average_first_token_ms`、`average_tps`、`cache_by_provider`。`requests`、`success_rate`、`average_duration_ms` 与渠道相关字段保持日志/状态语义，不受时间窗影响。
+- Token 数据独立持久化（见数据模型 `token_usage`），清空或过期请求日志不会丢失或重置 token 统计；token 统计无过期策略。
+- 响应新增 `token_range`：未筛选时为 `null`，筛选时为归一化后的 UTC 边界 `{"from": "2026-08-03T16:00:00.000Z", "to": "2026-08-04T16:00:00.000Z"}`（固定毫秒 `Z` 格式），用于前端校验本地日期到 UTC 的换算。现有字段不受影响。
+
 缓存统计响应：
 
 ```json
