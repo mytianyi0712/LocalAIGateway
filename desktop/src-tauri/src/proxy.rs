@@ -247,7 +247,12 @@ fn stream_usage_value(protocol: &str, value: &Value) -> Option<Value> {
             .cloned()
             .or_else(|| value.get("usage").cloned()),
         "gemini" => value.get("usageMetadata").cloned(),
-        _ => value.get("usage").cloned(),
+        // OpenAI Responses API carries streamed usage inside the
+        // response.completed event's response object, not at the top level.
+        _ => value
+            .get("usage")
+            .cloned()
+            .or_else(|| value.get("response").and_then(|item| item.get("usage")).cloned()),
     }
 }
 
@@ -417,17 +422,27 @@ async fn proxy(
             &request_id,
         );
     };
-    let mapping = match resolve_mapping(&state, entry_protocol, &entry_model).await {
-        Ok(value) => value,
-        Err(error) => {
-            return gateway_error(
-                entry_protocol,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "database_error",
-                &error.to_string(),
-                &request_id,
-            );
+    // Model mappings only apply to the dedicated mapping entry points
+    // (/codex/v1/responses, /claudecode/v1/messages); the regular protocol
+    // endpoints (/v1/responses, /v1/messages) are always routed directly,
+    // mirroring the Python gateway.
+    let is_mapped_entry = (entry_protocol == "openai_responses" && path.starts_with("/codex/"))
+        || (entry_protocol == "claude" && path.starts_with("/claudecode/"));
+    let mapping = if is_mapped_entry {
+        match resolve_mapping(&state, entry_protocol, &entry_model).await {
+            Ok(value) => value,
+            Err(error) => {
+                return gateway_error(
+                    entry_protocol,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "database_error",
+                    &error.to_string(),
+                    &request_id,
+                );
+            }
         }
+    } else {
+        None
     };
     let upstream_protocol = mapping
         .as_ref()

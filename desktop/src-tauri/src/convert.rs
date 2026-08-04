@@ -335,6 +335,11 @@ pub fn convert_response(
     mapped_model: &str,
     body: &[u8],
 ) -> Result<Vec<u8>> {
+    // Same-protocol mapping is a pure pass-through: re-synthesizing would drop
+    // tool calls, reasoning items and usage (mirrors the Python adapters).
+    if entry == upstream_protocol {
+        return Ok(body.to_vec());
+    }
     let data = object(body)?;
     let converted = match entry {
         "claude" => to_claude(mapped_model, &data),
@@ -395,6 +400,11 @@ pub fn convert_stream(
     mapped_model: &str,
     body: &[u8],
 ) -> Result<Vec<u8>> {
+    // Same-protocol mapping streams upstream SSE unchanged (Python:
+    // PassthroughStreamToResponses / PassthroughStreamToClaude).
+    if entry == upstream_protocol {
+        return Ok(body.to_vec());
+    }
     let joined = stream_text(upstream_protocol, body);
     if entry == "claude" {
         let mut output = String::new();
