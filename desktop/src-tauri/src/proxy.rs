@@ -1,4 +1,4 @@
-use std::{collections::HashMap, convert::Infallible, pin::Pin, sync::Arc, sync::atomic::{AtomicBool, Ordering}, task::{Context, Poll}, time::Duration};
+use std::{convert::Infallible, pin::Pin, sync::Arc, sync::atomic::{AtomicBool, Ordering}, task::{Context, Poll}, time::Duration};
 
 use anyhow::Result;
 use async_stream::stream;
@@ -11,10 +11,10 @@ use axum::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use sqlx::{QueryBuilder, Row};
+use sqlx::Row;
 
 use crate::{
-    convert, protocol,
+    capabilities, convert, protocol,
     routing::{self, Candidate},
     server::AppState,
     settings,
@@ -340,32 +340,6 @@ fn usage_from_body(protocol: &str, body: &[u8]) -> Usage {
     }
 }
 
-/// True when a streamed chunk carries the first generated content token.
-fn chunk_has_content(protocol: &str, value: &Value) -> bool {
-    match protocol {
-        "claude" => value
-            .get("delta")
-            .and_then(|delta| delta.get("text"))
-            .and_then(Value::as_str)
-            .is_some_and(|text| !text.is_empty()),
-        "gemini" => value
-            .get("candidates")
-            .and_then(Value::as_array)
-            .and_then(|items| items.first())
-            .and_then(|candidate| candidate.get("content").and_then(|content| content.get("parts")))
-            .and_then(Value::as_array)
-            .is_some_and(|parts| parts.iter().any(|part| part.get("text").is_some())),
-        "openai_responses" => value.get("delta").is_some(),
-        _ => value
-            .get("choices")
-            .and_then(Value::as_array)
-            .and_then(|items| items.first())
-            .and_then(|choice| choice.get("delta"))
-            .and_then(|delta| delta.get("content").and_then(Value::as_str))
-            .is_some_and(|text| !text.is_empty()),
-    }
-}
-
 async fn read_body(
     request: Request,
 ) -> Result<(axum::http::HeaderMap, String, Option<String>, Vec<u8>)> {
@@ -444,6 +418,38 @@ async fn proxy(
     } else {
         None
     };
+    // C1: a mapped entry with an unknown or disabled mapping must fail with a
+    // clear 404 (Python: `unknown_mapped_model`) instead of silently routing
+    // the request as a regular protocol request.
+    if is_mapped_entry && mapping.is_none() {
+        let finished = chrono::Utc::now();
+        state.telemetry.emit(Event::RequestStart {
+            id: request_id.clone(),
+            protocol: entry_protocol.to_owned(),
+            model_id: Some(entry_model.clone()),
+            endpoint: path.clone(),
+            stream: stream_requested,
+            started_at: started_at.clone(),
+            request_bytes: body.len() as i64,
+        });
+        state.telemetry.emit(Event::RequestFinish {
+            id: request_id.clone(),
+            finished_at: finished.to_rfc3339(),
+            duration_ms: finished.signed_duration_since(started).num_milliseconds(),
+            status: Some(404),
+            outcome: "gateway_error".into(),
+            attempts: 0,
+            channel_id: None,
+            response_bytes: 0,
+        });
+        return gateway_error(
+            entry_protocol,
+            StatusCode::NOT_FOUND,
+            "unknown_mapped_model",
+            &format!("Model '{entry_model}' is not a configured model mapping."),
+            &request_id,
+        );
+    }
     let upstream_protocol = mapping
         .as_ref()
         .map(|value| value.upstream_protocol.as_str())
@@ -679,6 +685,8 @@ async fn proxy(
                 let upstream_protocol_stream = upstream_protocol.to_owned();
                 let upstream_model_stream = upstream_model.to_owned();
                 let stream_protocol = upstream_protocol_stream.clone();
+                let failure_threshold = runtime.failure_threshold;
+                let circuit_open_seconds = runtime.circuit_open_seconds;
                 let cancel_completed = Arc::new(AtomicBool::new(false));
                 let cancel_responded = Arc::new(AtomicBool::new(false));
                 let cancel_telemetry = state.telemetry.clone();
@@ -768,7 +776,7 @@ async fn proxy(
                                         continue;
                                     };
                                     if first_token_ms.is_none()
-                                        && chunk_has_content(&stream_protocol, &value)
+                                        && convert::chunk_has_content(&stream_protocol, &value)
                                     {
                                         first_token_ms = Some(
                                             now.signed_duration_since(attempt_started)
@@ -794,13 +802,384 @@ async fn proxy(
                     let finished_str = finished.to_rfc3339();
                     let outcome = if ok { "success" } else { "stream_interrupted" };
                     if ok { telemetry.emit(Event::ChannelSuccess { channel_id:candidate_stream.channel_id.clone() }); }
-                    else { telemetry.emit(Event::ChannelFailure { channel_id:candidate_stream.channel_id.clone(), error_kind:"stream_interrupted".into(), status:Some(status.as_u16() as i64), threshold:3, open_seconds:900, countable:true }); }
+                    else { telemetry.emit(Event::ChannelFailure { channel_id:candidate_stream.channel_id.clone(), error_kind:"stream_interrupted".into(), status:Some(status.as_u16() as i64), threshold:failure_threshold, open_seconds:circuit_open_seconds, countable:true }); }
                     telemetry.emit(attempt_event(&request_id_stream,&candidate_stream,attempts,attempt_started,finished,Some(status.as_u16() as i64),outcome, if ok {None}else{Some("stream_interrupted".into())},false,true,first_byte_ms,first_token_ms,usage,response_bytes,Some(upstream_protocol_stream),Some(upstream_model_stream)));
                     telemetry.emit(Event::RequestFinish { id:request_id_stream, finished_at:finished_str, duration_ms:chrono::Utc::now().signed_duration_since(started).num_milliseconds(), status:Some(status.as_u16() as i64), outcome:outcome.into(), attempts, channel_id:Some(candidate_stream.channel_id), response_bytes });
                 };
                 let mut result = Response::new(Body::from_stream(stream_body));
                 *result.status_mut() = status;
                 *result.headers_mut() = response_headers_for_client;
+                return result;
+            }
+            // C2: mapped entries stream through an incremental converter. A
+            // short prelude is buffered first so a 200 response whose body is
+            // actually an upstream error can still fail over, and
+            // `first_token_timeout_seconds` is honored like the Python
+            // gateway. The remaining body is converted event-by-event so the
+            // client sees a live stream.
+            if stream_requested {
+                let failure_threshold = runtime.failure_threshold;
+                let circuit_open_seconds = runtime.circuit_open_seconds;
+                let first_token_timeout =
+                    Duration::from_secs(runtime.first_token_timeout_seconds.max(1) as u64);
+                let stream_idle_timeout =
+                    Duration::from_secs(runtime.stream_idle_timeout_seconds.max(1) as u64);
+                let mut upstream_stream = response.bytes_stream();
+                let mut prelude: Vec<Bytes> = Vec::new();
+                let mut prelude_bytes = 0usize;
+                let mut scan = convert::StreamScan::new(upstream_protocol);
+                let prelude_outcome = tokio::time::timeout(
+                    first_token_timeout,
+                    async {
+                        loop {
+                            match upstream_stream.next().await {
+                                Some(Ok(chunk)) => {
+                                    prelude_bytes += chunk.len();
+                                    prelude.push(chunk.clone());
+                                    if let Some(message) =
+                                        scan.feed(upstream_protocol, &chunk)
+                                    {
+                                        break Err(message);
+                                    }
+                                    if scan.first_token_now || prelude_bytes >= 1024 * 1024 {
+                                        break Ok(());
+                                    }
+                                }
+                                Some(Err(_)) => break Ok(()),
+                                None => break Ok(()),
+                            }
+                        }
+                    },
+                )
+                .await;
+                match prelude_outcome {
+                    Ok(Err(message)) => {
+                        // 2xx body carries an upstream error: record and fail
+                        // over to the next candidate (Python prelude path).
+                        let finished = chrono::Utc::now();
+                        state.telemetry.emit(Event::ChannelFailure {
+                            channel_id: candidate.channel_id.clone(),
+                            error_kind: "upstream_error".into(),
+                            status: Some(502),
+                            threshold: failure_threshold,
+                            open_seconds: circuit_open_seconds,
+                            countable: true,
+                        });
+                        state.telemetry.emit(attempt_event(
+                            &request_id,
+                            candidate,
+                            attempts,
+                            attempt_started,
+                            finished,
+                            Some(502),
+                            "http_error",
+                            Some("upstream_error".into()),
+                            attempts < candidates.len() as i64,
+                            false,
+                            None,
+                            None,
+                            Usage::default(),
+                            prelude_bytes as i64,
+                            Some(upstream_protocol.into()),
+                            Some(upstream_model.into()),
+                        ));
+                        let _ = message;
+                        continue;
+                    }
+                    Err(_) => {
+                        // No first token within first_token_timeout: fail over.
+                        let finished = chrono::Utc::now();
+                        state.telemetry.emit(Event::ChannelFailure {
+                            channel_id: candidate.channel_id.clone(),
+                            error_kind: "timeout".into(),
+                            status: None,
+                            threshold: failure_threshold,
+                            open_seconds: circuit_open_seconds,
+                            countable: true,
+                        });
+                        state.telemetry.emit(attempt_event(
+                            &request_id,
+                            candidate,
+                            attempts,
+                            attempt_started,
+                            finished,
+                            None,
+                            "transport_error",
+                            Some("timeout".into()),
+                            attempts < candidates.len() as i64,
+                            false,
+                            None,
+                            None,
+                            Usage::default(),
+                            prelude_bytes as i64,
+                            Some(upstream_protocol.into()),
+                            Some(upstream_model.into()),
+                        ));
+                        continue;
+                    }
+                    Ok(Ok(())) => {}
+                }
+                let converter =
+                    match convert::MappedStreamConverter::new(
+                        entry_protocol,
+                        upstream_protocol,
+                        &entry_model,
+                    ) {
+                        Ok(converter) => converter,
+                        Err(error) => {
+                            return gateway_error(
+                                entry_protocol,
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "conversion_error",
+                                &error.to_string(),
+                                &request_id,
+                            );
+                        }
+                    };
+                let stream_protocol = upstream_protocol.to_owned();
+                let response_headers_for_client = response_headers.clone();
+                let telemetry = state.telemetry.clone();
+                let request_id_stream = request_id.clone();
+                let candidate_stream = candidate.clone();
+                let upstream_protocol_stream = upstream_protocol.to_owned();
+                let upstream_model_stream = upstream_model.to_owned();
+                let cancel_completed = Arc::new(AtomicBool::new(false));
+                let cancel_responded = Arc::new(AtomicBool::new(false));
+                let cancel_telemetry = state.telemetry.clone();
+                let cancel_request_id = request_id.clone();
+                let cancel_candidate = candidate.clone();
+                let cancel_attempt_no = attempts;
+                let cancel_attempt_started = attempt_started;
+                let cancel_status = status.as_u16() as i64;
+                let cancel_upstream_protocol = upstream_protocol_stream.clone();
+                let cancel_upstream_model = upstream_model_stream.clone();
+                let cancel_responded_flag = cancel_responded.clone();
+                let on_cancel: Box<dyn FnOnce() + Send> = Box::new(move || {
+                    let finished = chrono::Utc::now();
+                    cancel_telemetry.emit(attempt_event(
+                        &cancel_request_id,
+                        &cancel_candidate,
+                        cancel_attempt_no,
+                        cancel_attempt_started,
+                        finished,
+                        Some(cancel_status),
+                        "cancelled",
+                        None,
+                        false,
+                        cancel_responded_flag.load(Ordering::SeqCst),
+                        None,
+                        None,
+                        Usage::default(),
+                        0,
+                        Some(cancel_upstream_protocol),
+                        Some(cancel_upstream_model),
+                    ));
+                    cancel_telemetry.emit(Event::RequestFinish {
+                        id: cancel_request_id,
+                        finished_at: finished.to_rfc3339(),
+                        duration_ms: finished
+                            .signed_duration_since(cancel_attempt_started)
+                            .num_milliseconds(),
+                        status: Some(cancel_status),
+                        outcome: "cancelled".into(),
+                        attempts: cancel_attempt_no,
+                        channel_id: Some(cancel_candidate.channel_id),
+                        response_bytes: 0,
+                    });
+                });
+                let cancel_aware = CancelAware {
+                    inner: upstream_stream,
+                    completed: cancel_completed,
+                    responded: cancel_responded,
+                    on_cancel: Some(on_cancel),
+                };
+                let stream_body = stream! {
+                    let mut upstream_stream = cancel_aware;
+                    let mut converter = converter;
+                    let mut scan = scan;
+                    let mut response_bytes = 0i64;
+                    let mut ok = true;
+                    let mut idle_timeout = false;
+                    let mut error_message: Option<String> = None;
+                    let mut first_byte_ms: Option<i64> = None;
+                    let mut first_token_ms: Option<i64> = None;
+                    // Replay the buffered prelude through the converter.
+                    for chunk in prelude {
+                        response_bytes += chunk.len() as i64;
+                        if first_byte_ms.is_none() {
+                            first_byte_ms = Some(
+                                chrono::Utc::now()
+                                    .signed_duration_since(attempt_started)
+                                    .num_milliseconds(),
+                            );
+                        }
+                        let converted = converter.feed(&chunk);
+                        if !converted.is_empty() {
+                            yield Ok::<Bytes, Infallible>(Bytes::from(converted));
+                        }
+                    }
+                    if first_token_ms.is_none() && scan.first_token() {
+                        first_token_ms = Some(
+                            chrono::Utc::now()
+                                .signed_duration_since(attempt_started)
+                                .num_milliseconds(),
+                        );
+                    }
+                    loop {
+                        let next = tokio::time::timeout(stream_idle_timeout, upstream_stream.next()).await;
+                        match next {
+                            Ok(Some(Ok(chunk))) => {
+                                response_bytes += chunk.len() as i64;
+                                let now = chrono::Utc::now();
+                                if first_byte_ms.is_none() {
+                                    first_byte_ms = Some(
+                                        now.signed_duration_since(attempt_started)
+                                            .num_milliseconds(),
+                                    );
+                                }
+                                if let Some(message) = scan.feed(&stream_protocol, &chunk) {
+                                    error_message = Some(message);
+                                    let converted = converter.error_event(
+                                        error_message
+                                            .as_deref()
+                                            .unwrap_or("Upstream stream error"),
+                                    );
+                                    if !converted.is_empty() {
+                                        yield Ok::<Bytes, Infallible>(Bytes::from(converted));
+                                    }
+                                    break;
+                                }
+                                if first_token_ms.is_none() && scan.first_token_now {
+                                    first_token_ms = Some(
+                                        now.signed_duration_since(attempt_started)
+                                            .num_milliseconds(),
+                                    );
+                                }
+                                let converted = converter.feed(&chunk);
+                                if !converted.is_empty() {
+                                    yield Ok::<Bytes, Infallible>(Bytes::from(converted));
+                                }
+                            }
+                            Ok(Some(Err(_))) => {
+                                ok = false;
+                                break;
+                            }
+                            Ok(None) => break,
+                            Err(_) => {
+                                ok = false;
+                                idle_timeout = true;
+                                break;
+                            }
+                        }
+                    }
+                    // Close any remaining items on a clean finish.
+                    if error_message.is_none() && ok {
+                        let tail = converter.flush();
+                        if !tail.is_empty() {
+                            yield Ok::<Bytes, Infallible>(Bytes::from(tail));
+                        }
+                    }
+                    let finished = chrono::Utc::now();
+                    let finished_str = finished.to_rfc3339();
+                    let (outcome, error_kind, final_status): (&str, Option<String>, i64) =
+                        if error_message.is_some() {
+                            (
+                                "upstream_error",
+                                Some("upstream_error".into()),
+                                status.as_u16() as i64,
+                            )
+                        } else if !ok {
+                            if idle_timeout {
+                                (
+                                    "stream_interrupted",
+                                    Some("transport_timeout".into()),
+                                    504,
+                                )
+                            } else {
+                                (
+                                    "stream_interrupted",
+                                    Some("stream_interrupted".into()),
+                                    status.as_u16() as i64,
+                                )
+                            }
+                        } else {
+                            ("success", None, status.as_u16() as i64)
+                        };
+                    let (input, output, cache_read, cache_write) = converter.usage();
+                    let cache_miss = match stream_protocol.as_str() {
+                        "claude" => input,
+                        "gemini" => input.map(|total| (total - cache_read.unwrap_or(0)).max(0)),
+                        _ => match (input, cache_read) {
+                            (Some(total), Some(read)) => {
+                                Some((total - read - cache_write.unwrap_or(0)).max(0))
+                            }
+                            _ => None,
+                        },
+                    };
+                    let usage = Usage {
+                        input_tokens: input,
+                        cache_read_tokens: cache_read,
+                        cache_write_tokens: cache_write,
+                        cache_miss_input_tokens: cache_miss,
+                        output_tokens: output,
+                        raw: None,
+                    };
+                    if outcome == "success" {
+                        telemetry.emit(Event::ChannelSuccess {
+                            channel_id: candidate_stream.channel_id.clone(),
+                        });
+                    } else {
+                        telemetry.emit(Event::ChannelFailure {
+                            channel_id: candidate_stream.channel_id.clone(),
+                            error_kind: error_kind
+                                .clone()
+                                .unwrap_or_else(|| "upstream_error".into()),
+                            status: Some(final_status),
+                            threshold: failure_threshold,
+                            open_seconds: circuit_open_seconds,
+                            countable: true,
+                        });
+                    }
+                    telemetry.emit(attempt_event(
+                        &request_id_stream,
+                        &candidate_stream,
+                        attempts,
+                        attempt_started,
+                        finished,
+                        Some(final_status),
+                        outcome,
+                        error_kind,
+                        false,
+                        true,
+                        first_byte_ms,
+                        first_token_ms,
+                        usage,
+                        response_bytes,
+                        Some(upstream_protocol_stream),
+                        Some(upstream_model_stream),
+                    ));
+                    telemetry.emit(Event::RequestFinish {
+                        id: request_id_stream,
+                        finished_at: finished_str,
+                        duration_ms: chrono::Utc::now()
+                            .signed_duration_since(started)
+                            .num_milliseconds(),
+                        status: Some(final_status),
+                        outcome: outcome.into(),
+                        attempts,
+                        channel_id: Some(candidate_stream.channel_id),
+                        response_bytes,
+                    });
+                };
+                let mut result = Response::new(Body::from_stream(stream_body));
+                *result.status_mut() = status;
+                let mut headers = response_headers_for_client;
+                headers.remove("content-length");
+                headers.insert(
+                    "content-type",
+                    HeaderValue::from_static("text/event-stream"),
+                );
+                *result.headers_mut() = headers;
                 return result;
             }
             let read = tokio::time::timeout(
@@ -823,23 +1202,36 @@ async fn proxy(
                 }
             };
             let usage = usage_from_body(upstream_protocol, &raw);
+            let mut conversion_failed = false;
             let result_body = if let Some(value) = mapping.as_ref() {
-                if stream_requested {
-                    convert::convert_stream(
-                        &value.entry,
-                        &value.upstream_protocol,
-                        &entry_model,
-                        &raw,
-                    )
-                    .unwrap_or(raw.clone())
-                } else {
-                    convert::convert_response(
-                        &value.entry,
-                        &value.upstream_protocol,
-                        &entry_model,
-                        &raw,
-                    )
-                    .unwrap_or(raw.clone())
+                match convert::convert_response(
+                    &value.entry,
+                    &value.upstream_protocol,
+                    &entry_model,
+                    &raw,
+                ) {
+                    Ok(converted) => converted,
+                    Err(error) => {
+                        // Conversion failure produces a gateway error body in
+                        // the entry format (Python `_mapped_error_body`) plus a
+                        // channel_failure telemetry event; the HTTP status
+                        // stays 200 like the Python gateway.
+                        let payload = if entry_protocol == "claude" {
+                            json!({"type": "error", "error": {"type": "gateway_error", "message": error.to_string()}})
+                        } else {
+                            json!({"error": {"message": error.to_string(), "type": "gateway_error", "code": "conversion_error"}})
+                        };
+                        conversion_failed = true;
+                        state.telemetry.emit(Event::ChannelFailure {
+                            channel_id: candidate.channel_id.clone(),
+                            error_kind: "conversion_error".into(),
+                            status: None,
+                            threshold: runtime.failure_threshold,
+                            open_seconds: runtime.circuit_open_seconds,
+                            countable: false,
+                        });
+                        serde_json::to_vec(&payload).unwrap_or_else(|_| raw.clone())
+                    }
                 }
             } else {
                 raw
@@ -849,16 +1241,14 @@ async fn proxy(
                 result.headers_mut().remove("content-length");
                 result.headers_mut().insert(
                     "content-type",
-                    HeaderValue::from_static(if stream_requested {
-                        "text/event-stream"
-                    } else {
-                        "application/json"
-                    }),
+                    HeaderValue::from_static("application/json"),
                 );
             }
-            state.telemetry.emit(Event::ChannelSuccess {
-                channel_id: candidate.channel_id.clone(),
-            });
+            if !conversion_failed {
+                state.telemetry.emit(Event::ChannelSuccess {
+                    channel_id: candidate.channel_id.clone(),
+                });
+            }
             let finished_at = chrono::Utc::now();
             state.telemetry.emit(attempt_event(
                 &request_id,
@@ -933,7 +1323,7 @@ async fn proxy(
     }
     if let Some((status, headers, raw, channel_id)) = last_error {
         let result_body = if let Some(value) = mapping.as_ref() {
-            convert::convert_error(&value.entry, &raw)
+            convert::convert_error(&value.entry, &value.upstream_protocol, &raw)
         } else {
             raw
         };
@@ -1038,24 +1428,28 @@ pub async fn models(
             json!({"models":items.iter().map(|item|json!({"name":format!("models/{}",item.id),"displayName":item.display_name,"supportedGenerationMethods":["generateContent"]})).collect::<Vec<_>>() }),
         )
     } else {
-        // Attach stored capability metadata (context window, max tokens, reasoning,
+        // Attach capability metadata (context window, max tokens, reasoning,
         // image input, costs) under x_local_gateway.capabilities so catalog
         // consumers such as the omp extension can use real values instead of
-        // their built-in defaults. Models without a capability row omit the field.
-        let ids: Vec<&str> = items.iter().map(|item| item.id.as_str()).collect();
-        let mut caps: HashMap<String, (Option<i64>, Option<i64>, Option<bool>, Option<bool>, Option<Value>, Option<f64>, Option<f64>, Option<f64>, Option<f64>)> =
-            HashMap::new();
-        if !ids.is_empty() {
-            let mut builder = QueryBuilder::new(
-                "SELECT requested_model_id, context_window, max_tokens, supports_image_input, reasoning, thinking_level_map, cost_input, cost_output, cost_cache_read, cost_cache_write FROM model_caps WHERE requested_model_id IN (",
-            );
-            let mut separated = builder.separated(", ");
-            for id in &ids {
-                separated.push_bind(id);
-            }
-            builder.push(")");
-            let rows = match builder.build().fetch_all(state.db.pool()).await {
-                Ok(rows) => rows,
+        // their built-in defaults. Capabilities are detected on the fly for
+        // `auto` rows (C5); models without any capability data omit the field.
+        let mut data = Vec::new();
+        for item in &items {
+            let mut value = json!({
+                "id": item.id,
+                "object": "model",
+                "owned_by": "local-gateway",
+                "created": item.created_at,
+            });
+            match capabilities::get_model_caps(&state, &item.id).await {
+                Ok(caps) => {
+                    if capabilities::has_capability_data(&caps) {
+                        value["x_local_gateway"] = json!({
+                            "capabilities": caps,
+                            "pi_model_config": capabilities::pi_model_config(&caps),
+                        });
+                    }
+                }
                 Err(error) => {
                     return gateway_error(
                         protocol,
@@ -1065,45 +1459,10 @@ pub async fn models(
                         "catalog",
                     );
                 }
-            };
-            for row in rows {
-                let reasoning: Option<bool> = row.get(4);
-                let thinking_raw: Option<String> = row.get(5);
-                let thinking_level_map = thinking_raw
-                    .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-                caps.insert(
-                    row.get(0),
-                    (
-                        row.get(1),
-                        row.get(2),
-                        row.get(3),
-                        reasoning,
-                        thinking_level_map,
-                        row.get(6),
-                        row.get(7),
-                        row.get(8),
-                        row.get(9),
-                    ),
-                );
             }
+            data.push(value);
         }
-        json_response(
-            StatusCode::OK,
-            json!({"object":"list","data":items.iter().map(|item|{
-                let mut value = json!({"id":item.id,"object":"model","owned_by":"local-gateway","created":item.created_at});
-                if let Some((context_window, max_tokens, supports_image, reasoning, thinking_level_map, cost_input, cost_output, cost_cache_read, cost_cache_write)) = caps.get(&item.id) {
-                    value["x_local_gateway"] = json!({"capabilities":{
-                        "context_window": context_window,
-                        "max_tokens": max_tokens,
-                        "reasoning": reasoning,
-                        "thinking_level_map": thinking_level_map,
-                        "supports_image_input": supports_image,
-                        "cost":{"input":cost_input,"output":cost_output,"cacheRead":cost_cache_read,"cacheWrite":cost_cache_write}
-                    }});
-                }
-                value
-            }).collect::<Vec<_>>() }),
-        )
+        json_response(StatusCode::OK, json!({ "object": "list", "data": data }))
     }
 }
 

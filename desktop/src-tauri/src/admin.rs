@@ -1065,23 +1065,11 @@ async fn delete_profile(
 }
 
 async fn get_caps_value(state: &AppState, model_id: &str) -> Result<Value, ApiError> {
-    let row=sqlx::query("SELECT source,profile_id,context_window,max_tokens,supports_image_input,reasoning,thinking_level_map,cost_input,cost_output,cost_cache_read,cost_cache_write,updated_at FROM model_caps WHERE requested_model_id=?").bind(model_id).fetch_optional(state.db.pool()).await?;
-    let Some(row) = row else {
-        return Ok(
-            json!({"source":"auto","profile_id":null,"profile_name":null,"context_window":null,"max_tokens":null,"supports_image_input":null,"reasoning":null,"thinking_level_map":null,"cost":{"input":null,"output":null,"cacheRead":null,"cacheWrite":null},"updated_at":null}),
-        );
-    };
-    let map: Option<String> = row.try_get("thinking_level_map")?;
-    let thinking: Option<Value> = map.and_then(|value| serde_json::from_str::<Value>(&value).ok());
-    let profile_id: Option<String> = row.get("profile_id");
-    let profile_name: Option<String> =
-        sqlx::query_scalar("SELECT name FROM capability_profiles WHERE id=?")
-            .bind(profile_id.clone())
-            .fetch_optional(state.db.pool())
-            .await?;
-    Ok(
-        json!({"source":row.get::<String,_>("source"),"profile_id":profile_id,"profile_name":profile_name,"context_window":row.get::<Option<i64>,_>("context_window"),"max_tokens":row.get::<Option<i64>,_>("max_tokens"),"supports_image_input":row.get::<Option<bool>,_>("supports_image_input"),"reasoning":row.get::<Option<bool>,_>("reasoning"),"thinking_level_map":thinking,"cost":{"input":row.get::<Option<f64>,_>("cost_input"),"output":row.get::<Option<f64>,_>("cost_output"),"cacheRead":row.get::<Option<f64>,_>("cost_cache_read"),"cacheWrite":row.get::<Option<f64>,_>("cost_cache_write")},"updated_at":row.get::<String,_>("updated_at")}),
-    )
+    // C5: capabilities are detected on the fly for `auto` rows / missing rows,
+    // mirroring the Python `get_model_caps`.
+    crate::capabilities::get_model_caps(state, model_id)
+        .await
+        .map_err(ApiError::internal)
 }
 async fn get_capabilities(
     _: AdminAuth,
@@ -1114,40 +1102,102 @@ async fn put_capabilities(
     if route == 0 {
         return Err(ApiError::not_found("Route not found"));
     }
-    let source = input.source.unwrap_or_else(|| "manual".into());
-    let mut values = (
-        input.context_window,
-        input.max_tokens,
-        input.supports_image_input,
-        input.reasoning,
-        input.thinking_level_map,
-        input.cost_input,
-        input.cost_output,
-        input.cost_cache_read,
-        input.cost_cache_write,
-    );
-    if let Some(profile_id) = &input.profile_id {
-        let profile=sqlx::query("SELECT context_window,max_tokens,supports_image_input,reasoning,thinking_level_map FROM capability_profiles WHERE id=?").bind(profile_id).fetch_optional(state.db.pool()).await?.ok_or_else(||ApiError::not_found("Profile not found"))?;
-        if values.0.is_none() {
-            values.0 = profile.get("context_window");
-        }
-        if values.1.is_none() {
-            values.1 = profile.get("max_tokens");
-        }
-        if values.2.is_none() {
-            values.2 = profile.get("supports_image_input");
-        }
-        if values.3.is_none() {
-            values.3 = profile.get("reasoning");
-        }
-        if values.4.is_none() {
-            values.4 = profile
-                .get::<Option<String>, _>("thinking_level_map")
-                .and_then(|v| serde_json::from_str(&v).ok());
+    let source = input.source.clone().unwrap_or_else(|| "manual".into());
+    if !matches!(source.as_str(), "auto" | "manual") {
+        return Err(ApiError::validation("Unsupported capability source"));
+    }
+    for (key, value) in [
+        ("context_window", input.context_window),
+        ("max_tokens", input.max_tokens),
+    ] {
+        if value.is_some_and(|value| value < 1) {
+            return Err(ApiError::validation(format!("{key} must be >= 1")));
         }
     }
+    for (key, value) in [
+        ("cost_input", input.cost_input),
+        ("cost_output", input.cost_output),
+        ("cost_cache_read", input.cost_cache_read),
+        ("cost_cache_write", input.cost_cache_write),
+    ] {
+        if value.is_some_and(|value| value < 0.0) {
+            return Err(ApiError::validation(format!("{key} must be >= 0")));
+        }
+    }
+    if let Some(map) = &input.thinking_level_map {
+        if let Some(object) = map.as_object() {
+            for key in object.keys() {
+                if !matches!(
+                    key.as_str(),
+                    "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+                ) {
+                    return Err(ApiError::validation("Unsupported thinking level"));
+                }
+            }
+        }
+    }
+    // C5: `auto` source runs the real capability detection pipeline instead
+    // of writing an all-null row.
+    let (values, profile_id): (Value, Option<String>) = if source == "auto" {
+        (
+            crate::capabilities::detect_model_capabilities(&state, &model_id)
+                .await
+                .map_err(ApiError::internal)?,
+            None,
+        )
+    } else {
+        let mut values = json!({
+            "context_window": input.context_window,
+            "max_tokens": input.max_tokens,
+            "supports_image_input": input.supports_image_input,
+            "reasoning": input.reasoning,
+            "thinking_level_map": input.thinking_level_map,
+            "cost_input": input.cost_input,
+            "cost_output": input.cost_output,
+            "cost_cache_read": input.cost_cache_read,
+            "cost_cache_write": input.cost_cache_write,
+        });
+        if let Some(id) = &input.profile_id {
+            let profile=sqlx::query("SELECT context_window,max_tokens,supports_image_input,reasoning,thinking_level_map FROM capability_profiles WHERE id=?").bind(id).fetch_optional(state.db.pool()).await?.ok_or_else(||ApiError::not_found("Profile not found"))?;
+            if values["context_window"].is_null() {
+                values["context_window"] = profile.get::<Option<i64>, _>("context_window").map(Value::from).unwrap_or(Value::Null);
+            }
+            if values["max_tokens"].is_null() {
+                values["max_tokens"] = profile.get::<Option<i64>, _>("max_tokens").map(Value::from).unwrap_or(Value::Null);
+            }
+            if values["supports_image_input"].is_null() {
+                values["supports_image_input"] = profile.get::<Option<bool>, _>("supports_image_input").map(Value::from).unwrap_or(Value::Null);
+            }
+            if values["reasoning"].is_null() {
+                values["reasoning"] = profile.get::<Option<bool>, _>("reasoning").map(Value::from).unwrap_or(Value::Null);
+            }
+            if values["thinking_level_map"].is_null() {
+                values["thinking_level_map"] = profile
+                    .get::<Option<String>, _>("thinking_level_map")
+                    .and_then(|text| serde_json::from_str(&text).ok())
+                    .unwrap_or(Value::Null);
+            }
+        }
+        (values, input.profile_id.clone())
+    };
     let time = now();
-    sqlx::query("INSERT INTO model_caps(requested_model_id,context_window,max_tokens,supports_image_input,reasoning,thinking_level_map,cost_input,cost_output,cost_cache_read,cost_cache_write,source,profile_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(requested_model_id) DO UPDATE SET context_window=excluded.context_window,max_tokens=excluded.max_tokens,supports_image_input=excluded.supports_image_input,reasoning=excluded.reasoning,thinking_level_map=excluded.thinking_level_map,cost_input=excluded.cost_input,cost_output=excluded.cost_output,cost_cache_read=excluded.cost_cache_read,cost_cache_write=excluded.cost_cache_write,source=excluded.source,profile_id=excluded.profile_id,updated_at=excluded.updated_at").bind(&model_id).bind(values.0).bind(values.1).bind(values.2).bind(values.3).bind(values.4.map(|v|v.to_string())).bind(values.5).bind(values.6).bind(values.7).bind(values.8).bind(source).bind(input.profile_id).bind(&time).bind(&time).execute(state.db.pool()).await?;
+    sqlx::query("INSERT INTO model_caps(requested_model_id,context_window,max_tokens,supports_image_input,reasoning,thinking_level_map,cost_input,cost_output,cost_cache_read,cost_cache_write,source,profile_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(requested_model_id) DO UPDATE SET context_window=excluded.context_window,max_tokens=excluded.max_tokens,supports_image_input=excluded.supports_image_input,reasoning=excluded.reasoning,thinking_level_map=excluded.thinking_level_map,cost_input=excluded.cost_input,cost_output=excluded.cost_output,cost_cache_read=excluded.cost_cache_read,cost_cache_write=excluded.cost_cache_write,source=excluded.source,profile_id=excluded.profile_id,updated_at=excluded.updated_at")
+        .bind(&model_id)
+        .bind(values.get("context_window").and_then(Value::as_i64))
+        .bind(values.get("max_tokens").and_then(Value::as_i64))
+        .bind(values.get("supports_image_input").and_then(Value::as_bool))
+        .bind(values.get("reasoning").and_then(Value::as_bool))
+        .bind(values.get("thinking_level_map").map(|value| serde_json::to_string(value).unwrap_or_default()))
+        .bind(values.get("cost_input").and_then(Value::as_f64))
+        .bind(values.get("cost_output").and_then(Value::as_f64))
+        .bind(values.get("cost_cache_read").and_then(Value::as_f64))
+        .bind(values.get("cost_cache_write").and_then(Value::as_f64))
+        .bind(&source)
+        .bind(&profile_id)
+        .bind(&time)
+        .bind(&time)
+        .execute(state.db.pool())
+        .await?;
     Ok(ok(get_caps_value(&state, &model_id).await?))
 }
 async fn detect_capabilities(
@@ -1237,9 +1287,23 @@ async fn mapping_json(state: &AppState, kind: &str, row_id: &str) -> Result<Valu
         .ok()
         .and_then(|v| v.get("candidates").cloned())
         .unwrap_or_else(|| json!([]));
-    Ok(
-        json!({"id":row.get::<String,_>("id"),"model_id":row.get::<String,_>("model_id"),"display_name":row.get::<Option<String>,_>("display_name"),"upstream_protocol":upstream_protocol,"upstream_model_id":upstream_model_id,"enabled":row.get::<bool,_>("enabled"),"candidates":candidates,"created_at":row.get::<String,_>("created_at"),"updated_at":row.get::<String,_>("updated_at")}),
-    )
+    let model_id: String = row.get("model_id");
+    // The management UI reads the protocol-specific key (claude_model_id /
+    // codex_model_id), mirroring the Python gateway; `model_id` is kept as a
+    // compatibility alias.
+    let mut value = json!({
+        "id": row.get::<String, _>("id"),
+        "model_id": model_id,
+        idcol: model_id,
+        "display_name": row.get::<Option<String>, _>("display_name"),
+        "upstream_protocol": upstream_protocol,
+        "upstream_model_id": upstream_model_id,
+        "enabled": row.get::<bool, _>("enabled"),
+        "candidates": candidates,
+        "created_at": row.get::<String, _>("created_at"),
+        "updated_at": row.get::<String, _>("updated_at"),
+    });
+    Ok(value)
 }
 async fn list_mappings(state: &AppState, kind: &str) -> Result<Vec<Value>, ApiError> {
     let (table, idcol) = if kind == "claude" {
@@ -1994,9 +2058,25 @@ async fn get_discovery_run(
         .fetch_optional(state.db.pool())
         .await?
         .ok_or_else(|| ApiError::not_found("Discovery run not found"))?;
-    Ok(ok(
-        json!({"id":row.get::<String,_>("id"),"channel_id":row.get::<String,_>("channel_id"),"trigger":row.get::<String,_>("trigger"),"started_at":row.get::<String,_>("started_at"),"finished_at":row.get::<Option<String>,_>("finished_at"),"success":row.get::<Option<bool>,_>("success"),"model_count":row.get::<Option<i64>,_>("model_count"),"status_code":row.get::<Option<i64>,_>("status_code"),"error_kind":row.get::<Option<String>,_>("error_kind")}),
-    ))
+    // The management UI polls this endpoint and switches on `status`
+    // (running/succeeded/failed), mirroring the Python gateway.
+    let finished_at: Option<String> = row.try_get("finished_at")?;
+    let success: Option<bool> = row.try_get("success")?;
+    let status = match finished_at {
+        None => "running",
+        Some(_) if success == Some(true) => "succeeded",
+        Some(_) => "failed",
+    };
+    Ok(ok(json!({
+        "id": row.get::<String, _>("id"),
+        "channel_id": row.get::<String, _>("channel_id"),
+        "status": status,
+        "model_count": row.get::<Option<i64>, _>("model_count"),
+        "status_code": row.get::<Option<i64>, _>("status_code"),
+        "error_kind": row.get::<Option<String>, _>("error_kind"),
+        "started_at": row.get::<String, _>("started_at"),
+        "finished_at": finished_at,
+    })))
 }
 async fn list_discovery_runs(
     _: AdminAuth,

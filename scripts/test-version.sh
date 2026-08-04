@@ -181,7 +181,17 @@ ok "cargo metadata 解析版本 $cargo_version == VERSION"
 py_version="$(
   python3 -c "import tomllib; print(tomllib.load(open('${ROOT_DIR}/backend/pyproject.toml', 'rb'))['project']['version'])"
 )"
-[[ "$py_version" == "$real_version" ]] || fail "pyproject.toml 解析版本为 $py_version，VERSION 为 $real_version"
-ok "pyproject.toml 解析版本 $py_version == VERSION"
+# pyproject.toml 使用 PEP 440 映射：非 PEP 440 pre 标签（如 fix1）写成 +local（0.2.1+fix1）。
+py_expected="$(python3 - "${real_version}" <<'PY'
+import re
+import sys
+v = sys.argv[1]
+m = re.fullmatch(r"([0-9]+(?:\.[0-9]+)*)-(.*)", v)
+print(f"{m.group(1)}+{m.group(2)}" if m else v)
+PY
+)"
+[[ "$py_version" == "$real_version" || "$py_version" == "$py_expected" ]] \
+  || fail "pyproject.toml 解析版本为 $py_version，VERSION 为 $real_version（PEP 440 映射 $py_expected）"
+ok "pyproject.toml 解析版本 $py_version == VERSION（PEP 440 映射）"
 
 echo "全部自校验通过"

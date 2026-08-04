@@ -91,6 +91,25 @@ def version_line(path, text):
         raise SystemExit(f"{path}: 未找到 ^version = \"...\" 声明")
     return m.group(1)
 
+# PEP 440 合法 pre 标签（uv 会把它们规范化写入 uv.lock，例如 0.3.0-rc.1 -> 0.3.0rc1）。
+PEP440_PRE = {"a", "b", "c", "rc", "alpha", "beta", "pre", "preview", "dev"}
+
+
+def pep440_write(semver):
+    """把 semver 版本映射为 PEP 440 可解析形式（用于 pyproject.toml）。
+
+    合法 pre 标签原样保留（uv 自行规范化）；其余 prerelease（如 fix1）无法用
+    PEP 440 pre 表示，映射为 local segment（0.2.1-fix1 -> 0.2.1+fix1）。
+    """
+    m = re.fullmatch(r"([0-9]+(?:\.[0-9]+)*)-(.*)", semver)
+    if not m:
+        return semver
+    release, pre = m.groups()
+    parts = pre.split(".")
+    if parts and parts[0].lower() in PEP440_PRE and all(part.isdigit() for part in parts[1:]):
+        return semver
+    return f"{release}+{pre}"
+
 def check_old(path, old):
     if not SEMVER.match(old):
         raise SystemExit(f"{path}: 当前版本不是合法 SemVer: {old!r}")
@@ -98,13 +117,15 @@ def check_old(path, old):
 results = []  # (path, original, new_content, old)
 
 # 1. Cargo.toml 与 3. pyproject.toml：^version = "..." 行
-for path in (paths[0], paths[2]):
+#    pyproject.toml 使用 PEP 440 映射形式（pep440_write），其余文件保持 semver 原样。
+for index, path in ((0, paths[0]), (2, paths[2])):
     text = load(path)
     old = version_line(path, text)
     check_old(path, old)
+    replacement = pep440_write(new) if index == 2 else new
     results.append((
         path, text,
-        re.sub(r'^(version\s*=\s*")[^"]+(")$', lambda m: m.group(1) + new + m.group(2),
+        re.sub(r'^(version\s*=\s*")[^"]+(")$', lambda m: m.group(1) + replacement + m.group(2),
                text, count=1, flags=re.MULTILINE),
         old,
     ))
@@ -226,7 +247,10 @@ def pep440_compact(v):
     m = re.match(r"^[-_.]?([0-9]+)(.*)$", rest)
     if m:
         return f"{release}post{m.group(1)}"
-    return f"{release}{rest}"
+    # 其余内容（+local 或非法 pre 标签如 -fix1）按 PEP 440 local segment 归一：
+    # 0.2.1-fix1 与 0.2.1+fix1 视为同一版本。
+    local = rest.lstrip("+-_).").replace("-", "").replace("_", "").lower()
+    return f"{release}+{local}"
 
 checks = [
     ("desktop/src-tauri/Cargo.toml", version_line(cargo_manifest), expected),
@@ -236,8 +260,12 @@ checks = [
     ("backend/uv.lock", lock_version(uv_lock), pep440_compact(expected)),
     ("backend/app/main.py", main_version(app_main), expected),
 ]
+# pyproject.toml / uv.lock 允许 PEP 440 映射（0.2.1-fix1 -> 0.2.1+fix1 / 0.2.1fix1）。
 for name, actual, want in checks:
-    ok = actual == want or (name == "backend/uv.lock" and pep440_compact(actual) == want)
+    ok = actual == want or (
+        name in ("backend/pyproject.toml", "backend/uv.lock")
+        and pep440_compact(actual) == pep440_compact(want)
+    )
     print(f"  [{'OK' if ok else 'FAIL'}] {name}: {actual if actual is not None else '(未找到)'}")
     if not ok:
         failures.append(name)

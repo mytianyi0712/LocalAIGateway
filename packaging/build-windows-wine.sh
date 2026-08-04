@@ -102,6 +102,9 @@ export CI=true
 
 cd "${TAURI_DIR}"
 cargo clean --release --target "${TARGET}" --package local-ai-gateway
+# Tauri does not remove previously built installers; stale-version NSIS
+# bundles would otherwise be copied into releases/ alongside the new one.
+rm -rf "${TARGET_DIR}/${TARGET}/release/bundle/nsis"
 cargo tauri build --target "${TARGET}" --bundles nsis
 
 OUTPUT_DIR="${ROOT_DIR}/target/packages/windows-wine"

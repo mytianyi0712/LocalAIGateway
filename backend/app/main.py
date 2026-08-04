@@ -91,7 +91,7 @@ class SPAStaticFiles(StaticFiles):
         return response
 
 
-app = FastAPI(title="Local AI Gateway", version="0.2.1", lifespan=lifespan)
+app = FastAPI(title="Local AI Gateway", version="0.2.0-fix1", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=(

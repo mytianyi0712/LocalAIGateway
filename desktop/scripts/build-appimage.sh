@@ -73,4 +73,9 @@ export NO_STRIP="${NO_STRIP:-true}"
 # Tauri CLI treats CI as a strict boolean; some harnesses export CI=1.
 export CI=true
 
+# Tauri leaves stale bundles from previous versions in target/ (it never
+# removes old bundle directories); drop them so the release folder only ever
+# sees the current version's artifacts. Note: the cwd here is src-tauri/, and
+# Tauri writes bundles under target/release/bundle/.
+rm -rf target/release/bundle/deb target/release/bundle/appimage
 cargo tauri build --bundles "${BUNDLES:-deb,appimage}"

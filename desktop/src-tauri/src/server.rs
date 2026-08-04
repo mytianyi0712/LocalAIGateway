@@ -36,6 +36,10 @@ pub async fn build(config: AppConfig) -> Result<Router> {
         http,
         telemetry,
     };
+    // Background supervisors (circuit auto-recovery + maintenance) live for
+    // the process lifetime, like the telemetry writer.
+    crate::health::spawn_supervisor(state.clone());
+    crate::maintenance::spawn_supervisor(state.clone());
     Ok(Router::new()
         .merge(crate::admin::router())
         .route("/api/health", get(health))

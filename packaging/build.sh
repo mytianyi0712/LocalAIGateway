@@ -50,17 +50,35 @@ collect_artifacts() {
       files=("${ROOT_DIR}/target/packages/windows-wine/"*.exe)
       ;;
   esac
+  # Tauri leaves stale bundles from previous versions in target/; copy only
+  # artifacts whose name carries the current VERSION (both the semver form and
+  # the Arch underscore form, e.g. 0.2.1-fix1 vs 0.2.1_fix1).
+  local version
+  version="$(cat "${ROOT_DIR}/VERSION")"
+  local patterns=("${version}" "${version//-/_}")
   mkdir -p "${RELEASES_DIR}"
   local copied=0
   local file
   for file in "${files[@]}"; do
-    if [[ -f "${file}" ]]; then
+    if [[ ! -f "${file}" ]]; then
+      continue
+    fi
+    local name="$(basename "${file}")"
+    local matched=0
+    local pattern
+    for pattern in "${patterns[@]}"; do
+      if [[ "${name}" == *[-_]"${pattern}"[-_]* ]]; then
+        matched=1
+        break
+      fi
+    done
+    if (( matched )); then
       cp -- "${file}" "${RELEASES_DIR}/"
       echo "  -> releases/$(basename "${file}")"
       copied=$((copied + 1))
     fi
   done
-  if ((copied == 0)); then
+  if (( copied == 0 )); then
     echo "warning: no artifacts produced by ${target}" >&2
   fi
 }
@@ -70,6 +88,35 @@ if [[ -z "$TARGET" || "$TARGET" == "-h" || "$TARGET" == "--help" ]]; then
   usage
   [[ -z "$TARGET" ]] && exit 2 || exit 0
 fi
+
+# The releases/ folder is a pure artifact directory. Every build removes
+# stale artifacts of previous versions (identified by the current VERSION in
+# both the semver form and the Arch underscore form), while keeping artifacts
+# of the current version so step-by-step builds (appimage, then arch, then
+# windows) accumulate into one complete release set.
+clean_stale_releases() {
+  local version="$(cat "${ROOT_DIR}/VERSION")"
+  local patterns=("${version}" "${version//-/_}")
+  mkdir -p "${RELEASES_DIR}"
+  local file
+  for file in "${RELEASES_DIR}"/*; do
+    [[ -e "${file}" ]] || continue
+    local name="$(basename "${file}")"
+    local matched=0
+    local pattern
+    for pattern in "${patterns[@]}"; do
+      if [[ "${name}" == *[-_]"${pattern}"[-_]* ]]; then
+        matched=1
+        break
+      fi
+    done
+    if (( ! matched )); then
+      rm -f -- "${file}"
+      echo "  cleaned releases/$(basename "${file}")"
+    fi
+  done
+}
+clean_stale_releases
 
 if [[ "$TARGET" == "all" ]]; then
   run_target appimage
