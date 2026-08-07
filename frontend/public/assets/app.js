@@ -1412,7 +1412,7 @@ function renderLogsPage() {
     return `<tr class="log-row" data-log-request-id="${escapeAttr(item.id)}" tabindex="0" aria-label="查看 ${escapeAttr(item.model_id || '请求')} 的详情">
       <td class="logs-cell-time">${escapeHtml(formatLogTime(item.started_at))}</td>
       <td><span class="mono logs-model" title="${escapeAttr(item.model_id || '')}">${escapeHtml(item.model_id)}</span></td>
-      <td class="logs-cell-upstream">${item.upstream_model_id ? `<span class="mono">${escapeHtml(item.upstream_model_id)}</span>${item.upstream_protocol ? `<span class="protocol protocol-upstream">→${escapeHtml(protocolLabel(item.upstream_protocol))}</span>` : ''}` : '<span class="subtle-text">-</span>'}</td>
+      <td class="logs-cell-upstream">${item.upstream_model_id ? `<span class="mono">${escapeHtml(item.upstream_model_id)}</span>` : '<span class="subtle-text">-</span>'}</td>
       <td class="logs-cell-route">${responseChannelTags(item.response_channels || [])}</td>
       <td class="logs-cell-protocol">${protocols([item.protocol])}</td>
       <td>${statusDot(outcome.label, outcome.statusClass)}</td>

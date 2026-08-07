@@ -1,4 +1,11 @@
-use std::{convert::Infallible, pin::Pin, sync::Arc, sync::atomic::{AtomicBool, Ordering}, task::{Context, Poll}, time::Duration};
+use std::{
+    convert::Infallible,
+    pin::Pin,
+    sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use anyhow::Result;
 use async_stream::stream;
@@ -18,7 +25,7 @@ use crate::{
     routing::{self, Candidate},
     server::AppState,
     settings,
-    telemetry::{Event, Usage},
+    telemetry::{AttemptData, Event, Usage},
 };
 
 const MAX_REQUEST_BODY: usize = 8 * 1024 * 1024;
@@ -53,10 +60,10 @@ impl<S: futures_util::Stream + Unpin> futures_util::Stream for CancelAware<S> {
 
 impl<S> Drop for CancelAware<S> {
     fn drop(&mut self) {
-        if !self.completed.load(Ordering::SeqCst) {
-            if let Some(callback) = self.on_cancel.take() {
-                callback();
-            }
+        if !self.completed.load(Ordering::SeqCst)
+            && let Some(callback) = self.on_cancel.take()
+        {
+            callback();
         }
     }
 }
@@ -195,6 +202,10 @@ async fn resolve_mapping(
     }))
 }
 
+// Telemetry boundary assembler: fields come from disjoint call-site contexts
+// (candidate, attempt bookkeeping, timings, usage), so grouping them would
+// merely move the verbosity to eight call sites. Allow the argument count.
+#[allow(clippy::too_many_arguments)]
 fn attempt_event(
     request_id: &str,
     candidate: &Candidate,
@@ -213,7 +224,7 @@ fn attempt_event(
     upstream_protocol: Option<String>,
     upstream_model_id: Option<String>,
 ) -> Event {
-    Event::Attempt {
+    Event::Attempt(Box::new(AttemptData {
         id: uuid::Uuid::new_v4().to_string(),
         request_id: request_id.to_owned(),
         channel_id: candidate.channel_id.clone(),
@@ -229,12 +240,14 @@ fn attempt_event(
         response_started,
         first_byte_ms,
         first_token_ms,
-        duration_ms: finished_at.signed_duration_since(started_at).num_milliseconds(),
+        duration_ms: finished_at
+            .signed_duration_since(started_at)
+            .num_milliseconds(),
         usage,
         response_bytes,
         upstream_protocol,
         upstream_model_id,
-    }
+    }))
 }
 
 /// Extracts the per-protocol usage object from a streamed SSE value or a
@@ -249,10 +262,12 @@ fn stream_usage_value(protocol: &str, value: &Value) -> Option<Value> {
         "gemini" => value.get("usageMetadata").cloned(),
         // OpenAI Responses API carries streamed usage inside the
         // response.completed event's response object, not at the top level.
-        _ => value
-            .get("usage")
-            .cloned()
-            .or_else(|| value.get("response").and_then(|item| item.get("usage")).cloned()),
+        _ => value.get("usage").cloned().or_else(|| {
+            value
+                .get("response")
+                .and_then(|item| item.get("usage"))
+                .cloned()
+        }),
     }
 }
 
@@ -263,7 +278,9 @@ fn normalize_usage(protocol: &str, usage: &Value) -> Usage {
     match protocol {
         "claude" => {
             let read = usage.get("cache_read_input_tokens").and_then(Value::as_i64);
-            let write = usage.get("cache_creation_input_tokens").and_then(Value::as_i64);
+            let write = usage
+                .get("cache_creation_input_tokens")
+                .and_then(Value::as_i64);
             let miss = usage.get("input_tokens").and_then(Value::as_i64);
             let total = if miss.is_some() || read.is_some() || write.is_some() {
                 Some(miss.unwrap_or(0) + read.unwrap_or(0) + write.unwrap_or(0))
@@ -828,29 +845,24 @@ async fn proxy(
                 let mut prelude: Vec<Bytes> = Vec::new();
                 let mut prelude_bytes = 0usize;
                 let mut scan = convert::StreamScan::new(upstream_protocol);
-                let prelude_outcome = tokio::time::timeout(
-                    first_token_timeout,
-                    async {
-                        loop {
-                            match upstream_stream.next().await {
-                                Some(Ok(chunk)) => {
-                                    prelude_bytes += chunk.len();
-                                    prelude.push(chunk.clone());
-                                    if let Some(message) =
-                                        scan.feed(upstream_protocol, &chunk)
-                                    {
-                                        break Err(message);
-                                    }
-                                    if scan.first_token_now || prelude_bytes >= 1024 * 1024 {
-                                        break Ok(());
-                                    }
+                let prelude_outcome = tokio::time::timeout(first_token_timeout, async {
+                    loop {
+                        match upstream_stream.next().await {
+                            Some(Ok(chunk)) => {
+                                prelude_bytes += chunk.len();
+                                prelude.push(chunk.clone());
+                                if let Some(message) = scan.feed(upstream_protocol, &chunk) {
+                                    break Err(message);
                                 }
-                                Some(Err(_)) => break Ok(()),
-                                None => break Ok(()),
+                                if scan.first_token_now || prelude_bytes >= 1024 * 1024 {
+                                    break Ok(());
+                                }
                             }
+                            Some(Err(_)) => break Ok(()),
+                            None => break Ok(()),
                         }
-                    },
-                )
+                    }
+                })
                 .await;
                 match prelude_outcome {
                     Ok(Err(message)) => {
@@ -919,23 +931,22 @@ async fn proxy(
                     }
                     Ok(Ok(())) => {}
                 }
-                let converter =
-                    match convert::MappedStreamConverter::new(
-                        entry_protocol,
-                        upstream_protocol,
-                        &entry_model,
-                    ) {
-                        Ok(converter) => converter,
-                        Err(error) => {
-                            return gateway_error(
-                                entry_protocol,
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "conversion_error",
-                                &error.to_string(),
-                                &request_id,
-                            );
-                        }
-                    };
+                let converter = match convert::MappedStreamConverter::new(
+                    entry_protocol,
+                    upstream_protocol,
+                    &entry_model,
+                ) {
+                    Ok(converter) => converter,
+                    Err(error) => {
+                        return gateway_error(
+                            entry_protocol,
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "conversion_error",
+                            &error.to_string(),
+                            &request_id,
+                        );
+                    }
+                };
                 let stream_protocol = upstream_protocol.to_owned();
                 let response_headers_for_client = response_headers.clone();
                 let telemetry = state.telemetry.clone();
@@ -1239,10 +1250,9 @@ async fn proxy(
             let mut result = response_with_headers(status, response_headers, result_body.clone());
             if mapping.is_some() {
                 result.headers_mut().remove("content-length");
-                result.headers_mut().insert(
-                    "content-type",
-                    HeaderValue::from_static("application/json"),
-                );
+                result
+                    .headers_mut()
+                    .insert("content-type", HeaderValue::from_static("application/json"));
             }
             if !conversion_failed {
                 state.telemetry.emit(Event::ChannelSuccess {
@@ -1441,13 +1451,28 @@ pub async fn models(
                 "owned_by": "local-gateway",
                 "created": item.created_at,
             });
+            match routing::list_routable_model_endpoints(&state, &item.id).await {
+                Ok(endpoints) => {
+                    if !endpoints.is_empty() {
+                        value["x_local_gateway"]["supported_endpoints"] = json!(endpoints);
+                    }
+                }
+                Err(error) => {
+                    return gateway_error(
+                        protocol,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "database_error",
+                        &error.to_string(),
+                        "catalog",
+                    );
+                }
+            }
             match capabilities::get_model_caps(&state, &item.id).await {
                 Ok(caps) => {
                     if capabilities::has_capability_data(&caps) {
-                        value["x_local_gateway"] = json!({
-                            "capabilities": caps,
-                            "pi_model_config": capabilities::pi_model_config(&caps),
-                        });
+                        let pi_config = capabilities::pi_model_config(&caps);
+                        value["x_local_gateway"]["capabilities"] = caps;
+                        value["x_local_gateway"]["pi_model_config"] = pi_config;
                     }
                 }
                 Err(error) => {

@@ -25,10 +25,9 @@ pub async fn serve(uri: Uri) -> Response {
             .next()
             .unwrap_or_default()
             .contains('.')
+        && let Some(index) = Frontend::get("index.html")
     {
-        if let Some(index) = Frontend::get("index.html") {
-            return asset_response("index.html", index.data.into_owned());
-        }
+        return asset_response("index.html", index.data.into_owned());
     }
     (
         StatusCode::NOT_FOUND,

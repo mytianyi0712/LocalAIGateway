@@ -43,17 +43,17 @@ fn first_int(value: &Value, paths: &[&[&str]]) -> Option<i64> {
                     if int > 0 {
                         return Some(int);
                     }
-                } else if let Some(float) = number.as_f64() {
-                    if float > 0.0 {
-                        return Some(float as i64);
-                    }
+                } else if let Some(float) = number.as_f64()
+                    && float > 0.0
+                {
+                    return Some(float as i64);
                 }
             }
             Value::String(text) => {
-                if let Ok(parsed) = text.trim().parse::<i64>() {
-                    if parsed > 0 {
-                        return Some(parsed);
-                    }
+                if let Ok(parsed) = text.trim().parse::<i64>()
+                    && parsed > 0
+                {
+                    return Some(parsed);
                 }
             }
             _ => {}
@@ -99,9 +99,12 @@ fn contains_image(value: &Value) -> Option<bool> {
                 .filter_map(|item| item.as_str())
                 .map(|item| item.trim().to_ascii_lowercase())
                 .collect::<Vec<_>>();
-            let hit = normalized
-                .iter()
-                .any(|item| matches!(item.as_str(), "image" | "vision" | "multimodal" | "image_url"));
+            let hit = normalized.iter().any(|item| {
+                matches!(
+                    item.as_str(),
+                    "image" | "vision" | "multimodal" | "image_url"
+                )
+            });
             if hit { Some(true) } else { None }
         }
         Value::Object(_) => {
@@ -163,17 +166,17 @@ fn cost_value(value: &Value, paths: &[&[&str]]) -> Option<f64> {
         match raw {
             Value::Bool(_) => continue,
             Value::Number(number) => {
-                if let Some(float) = number.as_f64() {
-                    if float >= 0.0 {
-                        return Some(float);
-                    }
+                if let Some(float) = number.as_f64()
+                    && float >= 0.0
+                {
+                    return Some(float);
                 }
             }
             Value::String(text) => {
-                if let Ok(parsed) = text.trim().parse::<f64>() {
-                    if parsed >= 0.0 {
-                        return Some(parsed);
-                    }
+                if let Ok(parsed) = text.trim().parse::<f64>()
+                    && parsed >= 0.0
+                {
+                    return Some(parsed);
                 }
             }
             _ => {}
@@ -297,8 +300,15 @@ pub fn extract_capabilities(metadata: &Value) -> Value {
         ),
         (
             "cost_cache_read",
-            cost_value(&cost, &[&["cacheRead"][..], &["cache_read"][..], &["cached_input"][..]])
-                .map(Value::from),
+            cost_value(
+                &cost,
+                &[
+                    &["cacheRead"][..],
+                    &["cache_read"][..],
+                    &["cached_input"][..],
+                ],
+            )
+            .map(Value::from),
         ),
         (
             "cost_cache_write",
@@ -318,7 +328,9 @@ fn merge_values(values: &[Value]) -> Option<Value> {
         return None;
     }
     if known.iter().all(|value| value.is_boolean()) {
-        return Some(Value::Bool(known.iter().all(|value| value.as_bool().unwrap_or(false))));
+        return Some(Value::Bool(
+            known.iter().all(|value| value.as_bool().unwrap_or(false)),
+        ));
     }
     if known
         .iter()
@@ -387,7 +399,11 @@ pub fn aggregate_capabilities(items: &[Value]) -> Value {
     }
     let maps: Vec<Value> = items
         .iter()
-        .map(|item| item.get("thinking_level_map").cloned().unwrap_or(Value::Null))
+        .map(|item| {
+            item.get("thinking_level_map")
+                .cloned()
+                .unwrap_or(Value::Null)
+        })
         .collect();
     if let Some(merged) = merge_thinking_level_maps(&maps) {
         result.insert("thinking_level_map".to_owned(), merged);
@@ -398,7 +414,10 @@ pub fn aggregate_capabilities(items: &[Value]) -> Value {
 /// Recompute the capabilities of a route's model from its live candidates'
 /// discovery metadata — mirror of services/capabilities.py
 /// `detect_model_capabilities`. Never touches the network.
-pub async fn detect_model_capabilities(state: &AppState, requested_model_id: &str) -> Result<Value> {
+pub async fn detect_model_capabilities(
+    state: &AppState,
+    requested_model_id: &str,
+) -> Result<Value> {
     let rows = sqlx::query(
         "SELECT cm.metadata_json, cmp.protocol FROM channel_models cm \
          JOIN route_candidates rc ON rc.channel_model_id = cm.id \
@@ -423,12 +442,11 @@ pub async fn detect_model_capabilities(state: &AppState, requested_model_id: &st
         }
         let protocol: Option<String> = row.try_get("protocol")?;
         let mut extracted: Vec<Value> = Vec::new();
-        if let Some(protocol) = protocol {
-            if let Some(per_protocol) = metadata.get(&protocol) {
-                if per_protocol.is_object() {
-                    extracted.push(extract_capabilities(per_protocol));
-                }
-            }
+        if let Some(protocol) = protocol
+            && let Some(per_protocol) = metadata.get(&protocol)
+            && per_protocol.is_object()
+        {
+            extracted.push(extract_capabilities(per_protocol));
         }
         if extracted.is_empty() {
             extracted.push(extract_capabilities(&metadata));
@@ -492,40 +510,95 @@ pub async fn get_model_caps(state: &AppState, model_id: &str) -> Result<Value> {
         (stored, name)
     };
     let updated_at: Option<String> = row.try_get("updated_at")?;
-    Ok(caps_json(&source, profile_id.as_deref(), profile_name.as_deref(), &values, updated_at.as_deref()))
+    Ok(caps_json(
+        &source,
+        profile_id.as_deref(),
+        profile_name.as_deref(),
+        &values,
+        updated_at.as_deref(),
+    ))
 }
 
 async fn profile_name(state: &AppState, profile_id: Option<&str>) -> Result<Option<String>> {
     let Some(profile_id) = profile_id else {
         return Ok(None);
     };
-    let name: Option<String> = sqlx::query_scalar("SELECT name FROM capability_profiles WHERE id = ?")
-        .bind(profile_id)
-        .fetch_optional(state.db.pool())
-        .await?;
+    let name: Option<String> =
+        sqlx::query_scalar("SELECT name FROM capability_profiles WHERE id = ?")
+            .bind(profile_id)
+            .fetch_optional(state.db.pool())
+            .await?;
     Ok(name)
 }
 
 fn caps_from_row(row: &sqlx::sqlite::SqliteRow) -> Value {
     let mut result = serde_json::Map::new();
     for (key, value) in [
-        ("context_window", row.try_get::<Option<i64>, _>("context_window").ok().flatten().map(Value::from)),
-        ("max_tokens", row.try_get::<Option<i64>, _>("max_tokens").ok().flatten().map(Value::from)),
-        ("supports_image_input", row.try_get::<Option<bool>, _>("supports_image_input").ok().flatten().map(Value::from)),
-        ("reasoning", row.try_get::<Option<bool>, _>("reasoning").ok().flatten().map(Value::from)),
-        ("cost_input", row.try_get::<Option<f64>, _>("cost_input").ok().flatten().map(Value::from)),
-        ("cost_output", row.try_get::<Option<f64>, _>("cost_output").ok().flatten().map(Value::from)),
-        ("cost_cache_read", row.try_get::<Option<f64>, _>("cost_cache_read").ok().flatten().map(Value::from)),
-        ("cost_cache_write", row.try_get::<Option<f64>, _>("cost_cache_write").ok().flatten().map(Value::from)),
+        (
+            "context_window",
+            row.try_get::<Option<i64>, _>("context_window")
+                .ok()
+                .flatten()
+                .map(Value::from),
+        ),
+        (
+            "max_tokens",
+            row.try_get::<Option<i64>, _>("max_tokens")
+                .ok()
+                .flatten()
+                .map(Value::from),
+        ),
+        (
+            "supports_image_input",
+            row.try_get::<Option<bool>, _>("supports_image_input")
+                .ok()
+                .flatten()
+                .map(Value::from),
+        ),
+        (
+            "reasoning",
+            row.try_get::<Option<bool>, _>("reasoning")
+                .ok()
+                .flatten()
+                .map(Value::from),
+        ),
+        (
+            "cost_input",
+            row.try_get::<Option<f64>, _>("cost_input")
+                .ok()
+                .flatten()
+                .map(Value::from),
+        ),
+        (
+            "cost_output",
+            row.try_get::<Option<f64>, _>("cost_output")
+                .ok()
+                .flatten()
+                .map(Value::from),
+        ),
+        (
+            "cost_cache_read",
+            row.try_get::<Option<f64>, _>("cost_cache_read")
+                .ok()
+                .flatten()
+                .map(Value::from),
+        ),
+        (
+            "cost_cache_write",
+            row.try_get::<Option<f64>, _>("cost_cache_write")
+                .ok()
+                .flatten()
+                .map(Value::from),
+        ),
     ] {
         if let Some(value) = value {
             result.insert(key.to_owned(), value);
         }
     }
-    if let Ok(Some(raw)) = row.try_get::<Option<String>, _>("thinking_level_map") {
-        if let Ok(map) = serde_json::from_str::<Value>(&raw) {
-            result.insert("thinking_level_map".to_owned(), map);
-        }
+    if let Ok(Some(raw)) = row.try_get::<Option<String>, _>("thinking_level_map")
+        && let Ok(map) = serde_json::from_str::<Value>(&raw)
+    {
+        result.insert("thinking_level_map".to_owned(), map);
     }
     Value::Object(result)
 }

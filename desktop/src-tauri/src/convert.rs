@@ -40,7 +40,11 @@ fn sse(event: &str, payload: &Value) -> Vec<u8> {
 }
 
 fn sse_data(payload: &Value) -> Vec<u8> {
-    format!("data: {}\n\n", serde_json::to_string(payload).unwrap_or_default()).into_bytes()
+    format!(
+        "data: {}\n\n",
+        serde_json::to_string(payload).unwrap_or_default()
+    )
+    .into_bytes()
 }
 
 // ---------------------------------------------------------------------------
@@ -152,7 +156,11 @@ fn tools_to_openai(tools: &Value) -> Option<Vec<Value>> {
             }
         }));
     }
-    if result.is_empty() { None } else { Some(result) }
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
 }
 
 fn claude_block_text(block: &Value) -> Option<String> {
@@ -256,7 +264,7 @@ fn claude_to_chat(upstream_model: &str, data: &Value) -> Value {
                 converted["content"] = content_parts[0]
                     .get("text")
                     .cloned()
-                    .unwrap_or_else(|| Value::Array(content_parts));
+                    .unwrap_or(Value::Array(content_parts));
             } else {
                 converted["content"] = Value::Array(content_parts);
             }
@@ -276,18 +284,16 @@ fn claude_to_chat(upstream_model: &str, data: &Value) -> Value {
             payload[key] = value.clone();
         }
     }
-    if let Some(stop) = data.get("stop_sequences").filter(|value| {
-        value.as_array().is_some_and(|items| !items.is_empty())
-    }) {
+    if let Some(stop) = data
+        .get("stop_sequences")
+        .filter(|value| value.as_array().is_some_and(|items| !items.is_empty()))
+    {
         payload["stop"] = stop.clone();
     }
     if let Some(tools) = tools_to_openai(data.get("tools").unwrap_or(&Value::Null)) {
         payload["tools"] = Value::Array(tools);
     }
-    if let Some(tool_choice) = data
-        .get("tool_choice")
-        .and_then(tool_choice_to_openai)
-    {
+    if let Some(tool_choice) = data.get("tool_choice").and_then(tool_choice_to_openai) {
         payload["tool_choice"] = tool_choice;
     }
     payload
@@ -389,10 +395,7 @@ fn claude_to_responses_value(upstream_model: &str, data: &Value) -> Value {
             .collect();
         payload["tools"] = Value::Array(flattened);
     }
-    if let Some(tool_choice) = data
-        .get("tool_choice")
-        .and_then(tool_choice_to_openai)
-    {
+    if let Some(tool_choice) = data.get("tool_choice").and_then(tool_choice_to_openai) {
         payload["tool_choice"] = tool_choice;
     }
     payload
@@ -406,10 +409,16 @@ fn claude_to_gemini(upstream_model: &str, data: &Value) -> Value {
                 continue;
             };
             for block in blocks {
-                if block.get("type").and_then(Value::as_str) == Some("tool_use") {
-                    if let Some(id) = block.get("id").and_then(Value::as_str) {
-                        tool_names.insert(id, block.get("name").and_then(Value::as_str).unwrap_or("unknown_tool"));
-                    }
+                if block.get("type").and_then(Value::as_str) == Some("tool_use")
+                    && let Some(id) = block.get("id").and_then(Value::as_str)
+                {
+                    tool_names.insert(
+                        id,
+                        block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown_tool"),
+                    );
                 }
             }
         }
@@ -501,16 +510,24 @@ fn claude_to_gemini(upstream_model: &str, data: &Value) -> Value {
     }
     let mut generation_config = serde_json::Map::new();
     if data.get("max_tokens").is_some_and(|value| value.is_i64()) {
-        generation_config.insert("maxOutputTokens".into(), data.get("max_tokens").cloned().unwrap());
+        generation_config.insert(
+            "maxOutputTokens".into(),
+            data.get("max_tokens").cloned().unwrap(),
+        );
     }
-    for (from, to) in [("temperature", "temperature"), ("top_p", "topP"), ("top_k", "topK")] {
+    for (from, to) in [
+        ("temperature", "temperature"),
+        ("top_p", "topP"),
+        ("top_k", "topK"),
+    ] {
         if let Some(value) = data.get(from) {
             generation_config.insert(to.into(), value.clone());
         }
     }
-    if let Some(stop) = data.get("stop_sequences").filter(|value| {
-        value.as_array().is_some_and(|items| !items.is_empty())
-    }) {
+    if let Some(stop) = data
+        .get("stop_sequences")
+        .filter(|value| value.as_array().is_some_and(|items| !items.is_empty()))
+    {
         generation_config.insert("stopSequences".into(), stop.clone());
     }
     if !generation_config.is_empty() {
@@ -584,17 +601,21 @@ fn responses_tools_to_openai(tools: &Value) -> Option<Vec<Value>> {
             }
         }));
     }
-    if result.is_empty() { None } else { Some(result) }
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
 }
 
 fn responses_tool_choice(tool_choice: &Value) -> Option<Value> {
     if let Some(choice) = tool_choice.as_str() {
         return Some(Value::String(choice.to_owned()));
     }
-    if tool_choice.get("type").and_then(Value::as_str) == Some("function") {
-        if let Some(name) = tool_choice.get("name").and_then(Value::as_str) {
-            return Some(json!({"type": "function", "function": {"name": name}}));
-        }
+    if tool_choice.get("type").and_then(Value::as_str) == Some("function")
+        && let Some(name) = tool_choice.get("name").and_then(Value::as_str)
+    {
+        return Some(json!({"type": "function", "function": {"name": name}}));
     }
     None
 }
@@ -615,7 +636,11 @@ fn responses_tools_to_claude(tools: &Value) -> Option<Vec<Value>> {
                 .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
         }));
     }
-    if result.is_empty() { None } else { Some(result) }
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
 }
 
 fn responses_tools_to_gemini(tools: &Value) -> Option<Vec<Value>> {
@@ -657,7 +682,11 @@ fn parse_data_url(value: &Value) -> (String, String) {
         .split_once(',')
         .unwrap_or((&url["data:".len()..], ""));
     let media_type = meta.split(';').next().unwrap_or("image/png");
-    let media_type = if media_type.is_empty() { "image/png" } else { media_type };
+    let media_type = if media_type.is_empty() {
+        "image/png"
+    } else {
+        media_type
+    };
     (media_type.to_owned(), data.to_owned())
 }
 
@@ -666,7 +695,10 @@ fn responses_image_url(part: &Value) -> Option<String> {
     if let Some(url) = image_url.as_str().filter(|url| !url.is_empty()) {
         return Some(url.to_owned());
     }
-    image_url.get("url").and_then(Value::as_str).map(str::to_owned)
+    image_url
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 fn responses_to_chat(upstream_model: &str, data: &Value) -> Value {
@@ -703,7 +735,8 @@ fn responses_to_chat(upstream_model: &str, data: &Value) -> Value {
                         }
                         Some("input_image") => {
                             if let Some(url) = responses_image_url(part) {
-                                image_parts.push(json!({"type": "image_url", "image_url": {"url": url}}));
+                                image_parts
+                                    .push(json!({"type": "image_url", "image_url": {"url": url}}));
                             }
                         }
                         _ => {}
@@ -727,13 +760,15 @@ fn responses_to_chat(upstream_model: &str, data: &Value) -> Value {
                         "arguments": item.get("arguments").and_then(Value::as_str).unwrap_or("{}"),
                     }
                 });
-                let can_merge = messages
-                    .last()
-                    .is_some_and(|last| last.get("role").and_then(Value::as_str) == Some("assistant")
-                        && last.get("tool_calls").is_some());
+                let can_merge = messages.last().is_some_and(|last| {
+                    last.get("role").and_then(Value::as_str) == Some("assistant")
+                        && last.get("tool_calls").is_some()
+                });
                 if can_merge {
                     if let Some(last) = messages.last_mut() {
-                        if let Some(calls) = last.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                        if let Some(calls) =
+                            last.get_mut("tool_calls").and_then(Value::as_array_mut)
+                        {
                             calls.push(tool_call);
                         }
                         if let Some(reasoning) = item.get("reasoning_content") {
@@ -762,7 +797,10 @@ fn responses_to_chat(upstream_model: &str, data: &Value) -> Value {
         "messages": messages,
         "stream": data.get("stream").and_then(Value::as_bool).unwrap_or(false),
     });
-    if data.get("max_output_tokens").is_some_and(|value| value.is_i64()) {
+    if data
+        .get("max_output_tokens")
+        .is_some_and(|value| value.is_i64())
+    {
         payload["max_tokens"] = data.get("max_output_tokens").cloned().unwrap();
     }
     for key in ["temperature", "top_p"] {
@@ -773,10 +811,7 @@ fn responses_to_chat(upstream_model: &str, data: &Value) -> Value {
     if let Some(tools) = responses_tools_to_openai(data.get("tools").unwrap_or(&Value::Null)) {
         payload["tools"] = Value::Array(tools);
     }
-    if let Some(tool_choice) = data
-        .get("tool_choice")
-        .and_then(responses_tool_choice)
-    {
+    if let Some(tool_choice) = data.get("tool_choice").and_then(responses_tool_choice) {
         payload["tool_choice"] = tool_choice;
     }
     payload
@@ -794,7 +829,9 @@ fn responses_to_claude(upstream_model: &str, data: &Value) -> Value {
                 }
                 let content = item.get("content").unwrap_or(&Value::Null);
                 if let Value::String(content) = content {
-                    messages.push(json!({"role": role, "content": [{"type": "text", "text": content}]}));
+                    messages.push(
+                        json!({"role": role, "content": [{"type": "text", "text": content}]}),
+                    );
                     continue;
                 }
                 let Some(parts_value) = content.as_array() else {
@@ -808,7 +845,9 @@ fn responses_to_claude(upstream_model: &str, data: &Value) -> Value {
                         }
                         Some("input_image") => {
                             let (media_type, data_b64) = parse_data_url(
-                                &responses_image_url(part).map(Value::String).unwrap_or(Value::Null),
+                                &responses_image_url(part)
+                                    .map(Value::String)
+                                    .unwrap_or(Value::Null),
                             );
                             if !data_b64.is_empty() {
                                 blocks.push(json!({
@@ -851,7 +890,10 @@ fn responses_to_claude(upstream_model: &str, data: &Value) -> Value {
         "messages": messages,
         "stream": data.get("stream").and_then(Value::as_bool).unwrap_or(false),
     });
-    if data.get("max_output_tokens").is_some_and(|value| value.is_i64()) {
+    if data
+        .get("max_output_tokens")
+        .is_some_and(|value| value.is_i64())
+    {
         payload["max_tokens"] = data.get("max_output_tokens").cloned().unwrap();
     }
     for key in ["temperature", "top_p"] {
@@ -872,10 +914,15 @@ fn responses_to_gemini(upstream_model: &str, data: &Value) -> Value {
     let mut call_names: HashMap<&str, &str> = HashMap::new();
     if let Some(items) = data.get("input").and_then(Value::as_array) {
         for item in items {
-            if item.get("type").and_then(Value::as_str) == Some("function_call") {
-                if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
-                    call_names.insert(call_id, item.get("name").and_then(Value::as_str).unwrap_or("unknown_tool"));
-                }
+            if item.get("type").and_then(Value::as_str) == Some("function_call")
+                && let Some(call_id) = item.get("call_id").and_then(Value::as_str)
+            {
+                call_names.insert(
+                    call_id,
+                    item.get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown_tool"),
+                );
             }
         }
     }
@@ -901,7 +948,9 @@ fn responses_to_gemini(upstream_model: &str, data: &Value) -> Value {
                             }
                             Some("input_image") => {
                                 let (media_type, data_b64) = parse_data_url(
-                                    &responses_image_url(part).map(Value::String).unwrap_or(Value::Null),
+                                    &responses_image_url(part)
+                                        .map(Value::String)
+                                        .unwrap_or(Value::Null),
                                 );
                                 if !data_b64.is_empty() {
                                     parts.push(json!({"inlineData": {"mimeType": media_type, "data": data_b64}}));
@@ -952,8 +1001,14 @@ fn responses_to_gemini(upstream_model: &str, data: &Value) -> Value {
         payload["tools"] = Value::Array(tools);
     }
     let mut generation_config = serde_json::Map::new();
-    if data.get("max_output_tokens").is_some_and(|value| value.is_i64()) {
-        generation_config.insert("maxOutputTokens".into(), data.get("max_output_tokens").cloned().unwrap());
+    if data
+        .get("max_output_tokens")
+        .is_some_and(|value| value.is_i64())
+    {
+        generation_config.insert(
+            "maxOutputTokens".into(),
+            data.get("max_output_tokens").cloned().unwrap(),
+        );
     }
     for key in ["temperature", "topP"] {
         if let Some(value) = data.get(key) {
@@ -975,11 +1030,19 @@ pub fn convert_request(
     body: &[u8],
 ) -> Result<Vec<u8>> {
     let data: Value = serde_json::from_slice(body).map_err(|error| {
-        let label = if entry == "claude" { "Claude" } else { "Responses" };
+        let label = if entry == "claude" {
+            "Claude"
+        } else {
+            "Responses"
+        };
         anyhow::anyhow!("Invalid {label} request body: {error}")
     })?;
     if !data.is_object() {
-        let label = if entry == "claude" { "Claude" } else { "Responses" };
+        let label = if entry == "claude" {
+            "Claude"
+        } else {
+            "Responses"
+        };
         bail!("{label} request body must be a JSON object");
     }
     let converted = match (entry, upstream_protocol) {
@@ -1058,7 +1121,10 @@ fn openai_compatible_to_claude(claude_model: &str, data: &Value) -> Value {
     let reasoning = message
         .get("reasoning_content")
         .or_else(|| message.get("reasoning"));
-    if let Some(reasoning) = reasoning.and_then(Value::as_str).filter(|text| !text.is_empty()) {
+    if let Some(reasoning) = reasoning
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
         content.push(json!({"type": "thinking", "thinking": reasoning}));
     }
     let text = chat_message_text(message.get("content").unwrap_or(&Value::Null));
@@ -1124,13 +1190,11 @@ fn openai_responses_to_claude(claude_model: &str, data: &Value) -> Value {
             if matches!(item_type, "message" | "reasoning") {
                 if let Some(parts) = item.get("content").and_then(Value::as_array) {
                     for part in parts {
-                        match part.get("type").and_then(Value::as_str) {
-                            Some("output_text" | "summary_text") => {
-                                if let Some(text) = part.get("text").and_then(Value::as_str) {
-                                    content.push(json!({"type": "text", "text": text}));
-                                }
-                            }
-                            _ => {}
+                        if let Some("output_text" | "summary_text") =
+                            part.get("type").and_then(Value::as_str)
+                            && let Some(text) = part.get("text").and_then(Value::as_str)
+                        {
+                            content.push(json!({"type": "text", "text": text}));
                         }
                     }
                 }
@@ -1192,10 +1256,10 @@ fn gemini_to_claude(claude_model: &str, data: &Value) -> Value {
         .unwrap_or_default();
     let mut content: Vec<Value> = Vec::new();
     for part in &parts {
-        if let Some(thought) = part.get("thought") {
-            if !thought.is_null() {
-                content.push(json!({"type": "thinking", "thinking": thought}));
-            }
+        if let Some(thought) = part.get("thought")
+            && !thought.is_null()
+        {
+            content.push(json!({"type": "thinking", "thinking": thought}));
         }
         if part.get("text").is_some() {
             content.push(json!({"type": "text", "text": part.get("text").and_then(Value::as_str).unwrap_or("")}));
@@ -1410,35 +1474,35 @@ fn html_unescape(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut at = 0;
     while at < bytes.len() {
-        if bytes[at] == b'&' {
-            if let Some(relative) = input[at..].find(';') {
-                let entity = &input[at + 1..at + relative];
-                let decoded: Option<String> = match entity {
-                    "amp" => Some("&".into()),
-                    "lt" => Some("<".into()),
-                    "gt" => Some(">".into()),
-                    "quot" => Some("\"".into()),
-                    "apos" => Some("'".into()),
-                    "nbsp" => Some("\u{00a0}".into()),
-                    _ => entity
-                        .strip_prefix("#x")
-                        .or_else(|| entity.strip_prefix("#X"))
-                        .and_then(|hex| u32::from_str_radix(hex, 16).ok())
-                        .and_then(char::from_u32)
-                        .map(|c| c.to_string())
-                        .or_else(|| {
-                            entity
-                                .strip_prefix('#')
-                                .and_then(|num| num.parse::<u32>().ok())
-                                .and_then(char::from_u32)
-                                .map(|c| c.to_string())
-                        }),
-                };
-                if let Some(decoded) = decoded {
-                    out.push_str(&decoded);
-                    at += relative + 1;
-                    continue;
-                }
+        if bytes[at] == b'&'
+            && let Some(relative) = input[at..].find(';')
+        {
+            let entity = &input[at + 1..at + relative];
+            let decoded: Option<String> = match entity {
+                "amp" => Some("&".into()),
+                "lt" => Some("<".into()),
+                "gt" => Some(">".into()),
+                "quot" => Some("\"".into()),
+                "apos" => Some("'".into()),
+                "nbsp" => Some("\u{00a0}".into()),
+                _ => entity
+                    .strip_prefix("#x")
+                    .or_else(|| entity.strip_prefix("#X"))
+                    .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                    .and_then(char::from_u32)
+                    .map(|c| c.to_string())
+                    .or_else(|| {
+                        entity
+                            .strip_prefix('#')
+                            .and_then(|num| num.parse::<u32>().ok())
+                            .and_then(char::from_u32)
+                            .map(|c| c.to_string())
+                    }),
+            };
+            if let Some(decoded) = decoded {
+                out.push_str(&decoded);
+                at += relative + 1;
+                continue;
             }
         }
         let ch = input[at..].chars().next().unwrap_or('\u{fffd}');
@@ -1510,35 +1574,36 @@ fn dsml_arguments(body: &str) -> Value {
     while let Some(relative) = body[at..].find('<') {
         let pos = at + relative;
         if let Some(tag) = match_tag(body, pos) {
-            if !tag.closing && tag.name == "parameter" {
-                if let Some(close) = find_closing_tag(body, tag.end, "parameter") {
-                    let raw = html_unescape(body[tag.end..close.0].trim());
-                    let attrs = dsml_attributes(&tag.attrs);
-                    if let Some(name) = attrs.get("name") {
-                        let value = if attrs
-                            .get("string")
-                            .is_some_and(|flag| flag.eq_ignore_ascii_case("true"))
-                        {
-                            Value::String(raw)
-                        } else {
-                            serde_json::from_str::<Value>(&raw)
-                                .unwrap_or_else(|_| Value::String(raw))
-                        };
-                        arguments.insert(name.clone(), value);
-                    }
-                    at = close.1;
-                    continue;
+            if !tag.closing
+                && tag.name == "parameter"
+                && let Some(close) = find_closing_tag(body, tag.end, "parameter")
+            {
+                let raw = html_unescape(body[tag.end..close.0].trim());
+                let attrs = dsml_attributes(&tag.attrs);
+                if let Some(name) = attrs.get("name") {
+                    let value = if attrs
+                        .get("string")
+                        .is_some_and(|flag| flag.eq_ignore_ascii_case("true"))
+                    {
+                        Value::String(raw)
+                    } else {
+                        serde_json::from_str::<Value>(&raw).unwrap_or(Value::String(raw))
+                    };
+                    arguments.insert(name.clone(), value);
                 }
+                at = close.1;
+                continue;
             }
-            if !tag.closing && tag.name == "command" {
-                if let Some(close) = find_closing_tag(body, tag.end, "command") {
-                    arguments.insert(
-                        "cmd".into(),
-                        Value::String(html_unescape(body[tag.end..close.0].trim())),
-                    );
-                    at = close.1;
-                    continue;
-                }
+            if !tag.closing
+                && tag.name == "command"
+                && let Some(close) = find_closing_tag(body, tag.end, "command")
+            {
+                arguments.insert(
+                    "cmd".into(),
+                    Value::String(html_unescape(body[tag.end..close.0].trim())),
+                );
+                at = close.1;
+                continue;
             }
         }
         at = pos + 1;
@@ -1551,10 +1616,11 @@ fn find_closing_tag(text: &str, from: usize, name: &str) -> Option<(usize, usize
     let mut at = from;
     while let Some(relative) = text[at..].find('<') {
         let pos = at + relative;
-        if let Some(tag) = match_tag(text, pos) {
-            if tag.closing && tag.name == name {
-                return Some((pos, tag.end));
-            }
+        if let Some(tag) = match_tag(text, pos)
+            && tag.closing
+            && tag.name == name
+        {
+            return Some((pos, tag.end));
         }
         at = pos + 1;
     }
@@ -1568,30 +1634,29 @@ fn parse_dsml_invocations(block: &str) -> Vec<Value> {
     while let Some(relative) = block[at..].find('<') {
         let pos = at + relative;
         if let Some(tag) = match_tag(block, pos) {
-            if !tag.closing && tag.name == "invoke" {
-                if let Some(close) = find_closing_tag(block, tag.end, "invoke") {
-                    let attrs = dsml_attributes(&tag.attrs);
-                    if let Some(name) = attrs.get("name") {
-                        matches.push((pos, name.clone(), dsml_arguments(&block[tag.end..close.0])));
-                    }
-                    at = close.1;
-                    continue;
+            if !tag.closing
+                && tag.name == "invoke"
+                && let Some(close) = find_closing_tag(block, tag.end, "invoke")
+            {
+                let attrs = dsml_attributes(&tag.attrs);
+                if let Some(name) = attrs.get("name") {
+                    matches.push((pos, name.clone(), dsml_arguments(&block[tag.end..close.0])));
                 }
+                at = close.1;
+                continue;
             }
             // message blocks close with </...invoke> (Python parity)
-            if !tag.closing && tag.name == "message" {
-                if let Some(close) = find_closing_tag(block, tag.end, "invoke") {
-                    let attrs = dsml_attributes(&tag.attrs);
-                    let name = attrs
-                        .get("to")
-                        .or_else(|| attrs.get("name"))
-                        .cloned();
-                    if let Some(name) = name {
-                        matches.push((pos, name, dsml_arguments(&block[tag.end..close.0])));
-                    }
-                    at = close.1;
-                    continue;
+            if !tag.closing
+                && tag.name == "message"
+                && let Some(close) = find_closing_tag(block, tag.end, "invoke")
+            {
+                let attrs = dsml_attributes(&tag.attrs);
+                let name = attrs.get("to").or_else(|| attrs.get("name")).cloned();
+                if let Some(name) = name {
+                    matches.push((pos, name, dsml_arguments(&block[tag.end..close.0])));
                 }
+                at = close.1;
+                continue;
             }
         }
         at = pos + 1;
@@ -1618,19 +1683,24 @@ fn split_dsml_content(text: &str) -> Vec<(String, Value)> {
         }
         let noise = find_dsml_noise_start(remaining);
         let start = find_dsml_start(remaining);
-        if let Some(noise_index) = noise {
-            if start.as_ref().is_none_or(|(start_index, _, _)| noise_index < *start_index) {
-                if noise_index > 0 {
-                    segments.push(("text".into(), Value::String(remaining[..noise_index].to_owned())));
+        if let Some(noise_index) = noise
+            && start
+                .as_ref()
+                .is_none_or(|(start_index, _, _)| noise_index < *start_index)
+        {
+            if noise_index > 0 {
+                segments.push((
+                    "text".into(),
+                    Value::String(remaining[..noise_index].to_owned()),
+                ));
+            }
+            let rest = &remaining[noise_index..];
+            match rest.find('\n') {
+                Some(line_end) => {
+                    remaining = &rest[line_end + 1..];
+                    continue;
                 }
-                let rest = &remaining[noise_index..];
-                match rest.find('\n') {
-                    Some(line_end) => {
-                        remaining = &rest[line_end + 1..];
-                        continue;
-                    }
-                    None => break,
-                }
+                None => break,
             }
         }
         let Some((start_index, start_marker, end_marker)) = start else {
@@ -1644,7 +1714,10 @@ fn split_dsml_content(text: &str) -> Vec<(String, Value)> {
         };
         let end_index = start_index + start_marker.len() + end_relative;
         if start_index > 0 {
-            segments.push(("text".into(), Value::String(remaining[..start_index].to_owned())));
+            segments.push((
+                "text".into(),
+                Value::String(remaining[..start_index].to_owned()),
+            ));
         }
         let block = &remaining[start_index + start_marker.len()..end_index];
         let calls = parse_dsml_invocations(block);
@@ -1710,7 +1783,9 @@ fn openai_compatible_to_responses(codex_model: &str, data: &Value) -> Value {
     }
     let usage = data.get("usage").unwrap_or(&Value::Null);
     let prompt_details = usage.get("prompt_tokens_details").unwrap_or(&Value::Null);
-    let output_details = usage.get("completion_tokens_details").unwrap_or(&Value::Null);
+    let output_details = usage
+        .get("completion_tokens_details")
+        .unwrap_or(&Value::Null);
     let status = if choice.get("finish_reason").and_then(Value::as_str) == Some("length") {
         "incomplete"
     } else {
@@ -1723,8 +1798,14 @@ fn openai_compatible_to_responses(codex_model: &str, data: &Value) -> Value {
         status,
         output,
         responses_usage(
-            usage.get("prompt_tokens").or_else(|| usage.get("input_tokens")).and_then(Value::as_i64),
-            usage.get("completion_tokens").or_else(|| usage.get("output_tokens")).and_then(Value::as_i64),
+            usage
+                .get("prompt_tokens")
+                .or_else(|| usage.get("input_tokens"))
+                .and_then(Value::as_i64),
+            usage
+                .get("completion_tokens")
+                .or_else(|| usage.get("output_tokens"))
+                .and_then(Value::as_i64),
             prompt_details
                 .get("cached_tokens")
                 .or_else(|| prompt_details.get("cache_read_input_tokens"))
@@ -1836,7 +1917,11 @@ fn gemini_to_responses(codex_model: &str, data: &Value) -> Value {
         }
     }
     let usage = data.get("usageMetadata").unwrap_or(&Value::Null);
-    let status = if candidate.get("finishReason").and_then(Value::as_str).unwrap_or("STOP") == "MAX_TOKENS"
+    let status = if candidate
+        .get("finishReason")
+        .and_then(Value::as_str)
+        .unwrap_or("STOP")
+        == "MAX_TOKENS"
     {
         "incomplete"
     } else {
@@ -1904,10 +1989,7 @@ enum ParsedEvent {
 
 fn split_sse_blocks(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
     let mut blocks = Vec::new();
-    loop {
-        let Some(marker) = buffer.windows(2).position(|window| window == b"\n\n") else {
-            break;
-        };
+    while let Some(marker) = buffer.windows(2).position(|window| window == b"\n\n") {
         let block = buffer.drain(..marker).collect::<Vec<_>>();
         buffer.drain(..2);
         if !block.is_empty() {
@@ -1968,10 +2050,7 @@ fn trim_ascii(mut value: &[u8]) -> &[u8] {
 fn parse_gemini_events(chunk: &[u8], buffer: &mut Vec<u8>) -> Vec<ParsedEvent> {
     buffer.extend_from_slice(&normalize_crlf(chunk));
     let mut events = Vec::new();
-    loop {
-        let Some(marker) = buffer.iter().position(|byte| *byte == b'\n') else {
-            break;
-        };
+    while let Some(marker) = buffer.iter().position(|byte| *byte == b'\n') {
         let line = buffer.drain(..marker).collect::<Vec<_>>();
         if !buffer.is_empty() {
             buffer.remove(0);
@@ -2022,10 +2101,10 @@ impl UsageAcc {
             if cache_read.is_some_and(|value| value > 0) {
                 self.cache_read = cache_read;
             }
-            if let Some(value) = details.get("cache_write_tokens").and_then(Value::as_i64) {
-                if value > 0 {
-                    self.cache_write = Some(value);
-                }
+            if let Some(value) = details.get("cache_write_tokens").and_then(Value::as_i64)
+                && value > 0
+            {
+                self.cache_write = Some(value);
             }
         }
         if let Some(details) = usage
@@ -2224,8 +2303,10 @@ impl MappedStreamConverter {
 
     fn feed_impl(&mut self, chunk: &[u8]) -> Vec<u8> {
         // For non-gemini kinds the buffer must include the new chunk.
-        let events = if matches!(self.kind, ConverterKind::ClaudeGemini | ConverterKind::ResponsesGemini)
-        {
+        let events = if matches!(
+            self.kind,
+            ConverterKind::ClaudeGemini | ConverterKind::ResponsesGemini
+        ) {
             parse_gemini_events(chunk, &mut self.buffer)
         } else {
             self.buffer.extend_from_slice(&normalize_crlf(chunk));
@@ -2292,16 +2373,14 @@ impl MappedStreamConverter {
 
     pub fn error_event(&mut self, message: &str) -> Vec<u8> {
         match self.kind {
-            ConverterKind::ClaudePassthrough => {
-                return sse(
-                    "error",
-                    &json!({
-                        "type": "error",
-                        "error": {"type": GATEWAY_ERROR_TYPE, "message": message},
-                        "request_id": self.request_id,
-                    }),
-                );
-            }
+            ConverterKind::ClaudePassthrough => sse(
+                "error",
+                &json!({
+                    "type": "error",
+                    "error": {"type": GATEWAY_ERROR_TYPE, "message": message},
+                    "request_id": self.request_id,
+                }),
+            ),
             ConverterKind::ResponsesPassthrough => {
                 let mut output = self.ensure_start_responses();
                 output.extend(self.responses_event("response.failed", &json!({
@@ -2309,15 +2388,20 @@ impl MappedStreamConverter {
                     "response": self.envelope("failed", Some(json!({"code": "gateway_error", "message": message}))),
                 })));
                 self.finished = true;
-                return output;
+                output
             }
             ConverterKind::ResponsesOpenai => {
                 let mut output = self.drain_dsml_text(None, true);
                 output.extend(self.error_event_responses(message));
-                return output;
+                output
             }
             _ => {
-                if matches!(self.kind, ConverterKind::ClaudeOpenai | ConverterKind::ClaudeResponses | ConverterKind::ClaudeGemini) {
+                if matches!(
+                    self.kind,
+                    ConverterKind::ClaudeOpenai
+                        | ConverterKind::ClaudeResponses
+                        | ConverterKind::ClaudeGemini
+                ) {
                     if !self.started {
                         self.ensure_start_claude();
                     }
@@ -2365,7 +2449,14 @@ impl MappedStreamConverter {
         if self.open_blocks.contains_key(&index) {
             return Vec::new();
         }
-        self.open_blocks.insert(index, block.get("type").and_then(Value::as_str).unwrap_or("text").to_owned());
+        self.open_blocks.insert(
+            index,
+            block
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("text")
+                .to_owned(),
+        );
         sse(
             "content_block_start",
             &json!({"type": "content_block_start", "index": index, "content_block": block}),
@@ -2712,8 +2803,15 @@ impl MappedStreamConverter {
         for call in calls {
             let key = format!("dsml_{}", self.dsml_tool_index);
             self.dsml_tool_index += 1;
-            output.extend(self.open_function_item(key.clone(), &new_id("call"), call.get("name").and_then(Value::as_str).unwrap_or("")));
-            output.extend(self.append_function_arguments(&key, call.get("arguments").and_then(Value::as_str).unwrap_or("")));
+            output.extend(self.open_function_item(
+                key.clone(),
+                &new_id("call"),
+                call.get("name").and_then(Value::as_str).unwrap_or(""),
+            ));
+            output.extend(self.append_function_arguments(
+                &key,
+                call.get("arguments").and_then(Value::as_str).unwrap_or(""),
+            ));
             output.extend(self.close_function_item(&key));
         }
         output
@@ -2787,7 +2885,9 @@ impl MappedStreamConverter {
                     }
                 }
             }
-            if let Some((start_index, start_marker, end_marker)) = find_dsml_start(&self.dsml_text_buffer) {
+            if let Some((start_index, start_marker, end_marker)) =
+                find_dsml_start(&self.dsml_text_buffer)
+            {
                 if start_index > 0 {
                     let prefix = self.dsml_text_buffer[..start_index].to_owned();
                     output.extend(self.append_text_delta(&prefix));
@@ -2846,10 +2946,16 @@ impl MappedStreamConverter {
         let reasoning = delta
             .get("reasoning_content")
             .or_else(|| delta.get("reasoning"));
-        if let Some(reasoning) = reasoning.and_then(Value::as_str).filter(|text| !text.is_empty()) {
+        if let Some(reasoning) = reasoning
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
             let index = self.next_block_index();
             output.extend(self.start_block(index, &json!({"type": "thinking", "thinking": ""})));
-            output.extend(self.delta(index, &json!({"type": "thinking_delta", "thinking": reasoning})));
+            output.extend(self.delta(
+                index,
+                &json!({"type": "thinking_delta", "thinking": reasoning}),
+            ));
         }
         let text = chat_message_text(delta.get("content").unwrap_or(&Value::Null));
         if !text.is_empty() {
@@ -2869,34 +2975,41 @@ impl MappedStreamConverter {
                 let upstream_index = tool_call.get("index").and_then(Value::as_i64);
                 let index = tool_id
                     .and_then(|id| self.tool_index_by_id.get(id).copied())
-                    .or_else(|| upstream_index.and_then(|index| self.tool_index_by_upstream.get(&index).copied()));
-                let index = match index {
-                    Some(index) => index,
-                    None => {
-                        let index = self.next_block_index();
-                        if let Some(tool_id) = tool_id {
-                            self.tool_index_by_id.insert(tool_id.to_owned(), index);
-                        }
-                        if let Some(upstream_index) = upstream_index {
-                            self.tool_index_by_upstream.insert(upstream_index, index);
-                        }
-                        let function = tool_call.get("function").unwrap_or(&Value::Null);
-                        output.extend(self.start_block(index, &json!({
+                    .or_else(|| {
+                        upstream_index
+                            .and_then(|index| self.tool_index_by_upstream.get(&index).copied())
+                    });
+                let index =
+                    match index {
+                        Some(index) => index,
+                        None => {
+                            let index = self.next_block_index();
+                            if let Some(tool_id) = tool_id {
+                                self.tool_index_by_id.insert(tool_id.to_owned(), index);
+                            }
+                            if let Some(upstream_index) = upstream_index {
+                                self.tool_index_by_upstream.insert(upstream_index, index);
+                            }
+                            let function = tool_call.get("function").unwrap_or(&Value::Null);
+                            output.extend(self.start_block(index, &json!({
                             "type": "tool_use",
                             "id": tool_id.map(str::to_owned).unwrap_or_else(|| new_id("toolu")),
                             "name": function.get("name").and_then(Value::as_str).unwrap_or(""),
                             "input": {},
                         })));
-                        index
-                    }
-                };
+                            index
+                        }
+                    };
                 if let Some(arguments) = tool_call
                     .get("function")
                     .and_then(|function| function.get("arguments"))
                     .and_then(Value::as_str)
                     .filter(|arguments| !arguments.is_empty())
                 {
-                    output.extend(self.delta(index, &json!({"type": "input_json_delta", "partial_json": arguments})));
+                    output.extend(self.delta(
+                        index,
+                        &json!({"type": "input_json_delta", "partial_json": arguments}),
+                    ));
                 }
             }
         }
@@ -2926,12 +3039,15 @@ impl MappedStreamConverter {
                         .unwrap_or_else(|| call_id.clone());
                     self.item_index_by_id.insert(key, index);
                     self.next_index = index + 1;
-                    output.extend(self.start_block(index, &json!({
-                        "type": "tool_use",
-                        "id": call_id,
-                        "name": item.get("name").and_then(Value::as_str).unwrap_or(""),
-                        "input": {},
-                    })));
+                    output.extend(self.start_block(
+                        index,
+                        &json!({
+                            "type": "tool_use",
+                            "id": call_id,
+                            "name": item.get("name").and_then(Value::as_str).unwrap_or(""),
+                            "input": {},
+                        }),
+                    ));
                 }
             }
             "response.function_call_arguments.delta" => {
@@ -2951,14 +3067,18 @@ impl MappedStreamConverter {
                     Some(index) => index,
                     None => {
                         let index = self.next_block_index();
-                        output.extend(self.start_block(index, &json!({"type": "text", "text": ""})));
+                        output
+                            .extend(self.start_block(index, &json!({"type": "text", "text": ""})));
                         index
                     }
                 };
-                output.extend(self.delta(index, &json!({
-                    "type": "text_delta",
-                    "text": event.get("delta").and_then(Value::as_str).unwrap_or(""),
-                })));
+                output.extend(self.delta(
+                    index,
+                    &json!({
+                        "type": "text_delta",
+                        "text": event.get("delta").and_then(Value::as_str).unwrap_or(""),
+                    }),
+                ));
             }
             "response.output_text.done" => {
                 if let Some(index) = self.current_block_of_type("text") {
@@ -2989,11 +3109,13 @@ impl MappedStreamConverter {
     fn consume_gemini_to_claude(&mut self, event: &Value) -> Vec<u8> {
         let mut output = self.ensure_start_claude();
         let Some(candidates) = event.get("candidates").and_then(Value::as_array) else {
-            self.usage.merge_gemini(event.get("usageMetadata").unwrap_or(&Value::Null));
+            self.usage
+                .merge_gemini(event.get("usageMetadata").unwrap_or(&Value::Null));
             return output;
         };
         let Some(candidate) = candidates.first() else {
-            self.usage.merge_gemini(event.get("usageMetadata").unwrap_or(&Value::Null));
+            self.usage
+                .merge_gemini(event.get("usageMetadata").unwrap_or(&Value::Null));
             return output;
         };
         let parts = candidate
@@ -3005,39 +3127,56 @@ impl MappedStreamConverter {
         for part in &parts {
             if let Some(thought) = part.get("thought").filter(|value| !value.is_null()) {
                 let index = self.next_block_index();
-                output.extend(self.start_block(index, &json!({"type": "thinking", "thinking": ""})));
-                output.extend(self.delta(index, &json!({"type": "thinking_delta", "thinking": thought})));
+                output
+                    .extend(self.start_block(index, &json!({"type": "thinking", "thinking": ""})));
+                output.extend(self.delta(
+                    index,
+                    &json!({"type": "thinking_delta", "thinking": thought}),
+                ));
             } else if part.get("text").is_some() {
                 let index = match self.current_block_of_type("text") {
                     Some(index) => index,
                     None => {
                         let index = self.next_block_index();
-                        output.extend(self.start_block(index, &json!({"type": "text", "text": ""})));
+                        output
+                            .extend(self.start_block(index, &json!({"type": "text", "text": ""})));
                         index
                     }
                 };
-                output.extend(self.delta(index, &json!({
-                    "type": "text_delta",
-                    "text": part.get("text").and_then(Value::as_str).unwrap_or(""),
-                })));
+                output.extend(self.delta(
+                    index,
+                    &json!({
+                        "type": "text_delta",
+                        "text": part.get("text").and_then(Value::as_str).unwrap_or(""),
+                    }),
+                ));
             }
-            if let Some(function_call) = part.get("functionCall").filter(|value| value.is_object()) {
+            if let Some(function_call) = part.get("functionCall").filter(|value| value.is_object())
+            {
                 let index = self.next_block_index();
-                output.extend(self.start_block(index, &json!({
-                    "type": "tool_use",
-                    "id": new_id("toolu"),
-                    "name": function_call.get("name").and_then(Value::as_str).unwrap_or(""),
-                    "input": {},
-                })));
-                let arguments = serde_json::to_string(function_call.get("args").unwrap_or(&Value::Null))
-                    .unwrap_or_else(|_| "{}".into());
+                output.extend(self.start_block(
+                    index,
+                    &json!({
+                        "type": "tool_use",
+                        "id": new_id("toolu"),
+                        "name": function_call.get("name").and_then(Value::as_str).unwrap_or(""),
+                        "input": {},
+                    }),
+                ));
+                let arguments =
+                    serde_json::to_string(function_call.get("args").unwrap_or(&Value::Null))
+                        .unwrap_or_else(|_| "{}".into());
                 if !arguments.is_empty() {
-                    output.extend(self.delta(index, &json!({"type": "input_json_delta", "partial_json": arguments})));
+                    output.extend(self.delta(
+                        index,
+                        &json!({"type": "input_json_delta", "partial_json": arguments}),
+                    ));
                 }
                 output.extend(self.stop_block(index));
             }
         }
-        self.usage.merge_gemini(event.get("usageMetadata").unwrap_or(&Value::Null));
+        self.usage
+            .merge_gemini(event.get("usageMetadata").unwrap_or(&Value::Null));
         if let Some(finish_reason) = candidate.get("finishReason").and_then(Value::as_str) {
             output.extend(self.finish_claude(stop_reason_gemini(finish_reason)));
         }
@@ -3068,7 +3207,9 @@ impl MappedStreamConverter {
                 let upstream_index = tool_call.get("index").and_then(Value::as_i64);
                 let key = tool_id
                     .and_then(|id| self.tool_key_by_id.get(id).cloned())
-                    .or_else(|| upstream_index.and_then(|index| self.tool_key_by_index.get(&index).cloned()));
+                    .or_else(|| {
+                        upstream_index.and_then(|index| self.tool_key_by_index.get(&index).cloned())
+                    });
                 let key = match key {
                     Some(key) => key,
                     None => {
@@ -3113,7 +3254,11 @@ impl MappedStreamConverter {
             "content_block_start" => {
                 let index = event.get("index").and_then(Value::as_i64).unwrap_or(0);
                 let block = event.get("content_block").unwrap_or(&Value::Null);
-                let block_type = block.get("type").and_then(Value::as_str).unwrap_or("").to_owned();
+                let block_type = block
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
                 self.open_block_types.insert(index, block_type.clone());
                 if block_type == "tool_use" {
                     let key = format!("block_{}", index);
@@ -3130,11 +3275,21 @@ impl MappedStreamConverter {
                 let delta = event.get("delta").unwrap_or(&Value::Null);
                 match delta.get("type").and_then(Value::as_str) {
                     Some("text_delta") => {
-                        output.extend(self.append_text_delta(delta.get("text").and_then(Value::as_str).unwrap_or("")));
+                        output.extend(self.append_text_delta(
+                            delta.get("text").and_then(Value::as_str).unwrap_or(""),
+                        ));
                     }
                     Some("input_json_delta") => {
                         if let Some(key) = self.function_key_by_block.get(&index).cloned() {
-                            output.extend(self.append_function_arguments(&key, delta.get("partial_json").and_then(Value::as_str).unwrap_or("")));
+                            output.extend(
+                                self.append_function_arguments(
+                                    &key,
+                                    delta
+                                        .get("partial_json")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or(""),
+                                ),
+                            );
                         }
                     }
                     _ => {}
@@ -3170,11 +3325,13 @@ impl MappedStreamConverter {
     fn consume_gemini_to_responses(&mut self, event: &Value) -> Vec<u8> {
         let mut output = self.ensure_start_responses();
         let Some(candidates) = event.get("candidates").and_then(Value::as_array) else {
-            self.usage.merge_gemini(event.get("usageMetadata").unwrap_or(&Value::Null));
+            self.usage
+                .merge_gemini(event.get("usageMetadata").unwrap_or(&Value::Null));
             return output;
         };
         let Some(candidate) = candidates.first() else {
-            self.usage.merge_gemini(event.get("usageMetadata").unwrap_or(&Value::Null));
+            self.usage
+                .merge_gemini(event.get("usageMetadata").unwrap_or(&Value::Null));
             return output;
         };
         let parts = candidate
@@ -3185,24 +3342,34 @@ impl MappedStreamConverter {
             .unwrap_or_default();
         for part in &parts {
             if part.get("text").is_some() {
-                output.extend(self.append_text_delta(part.get("text").and_then(Value::as_str).unwrap_or("")));
+                output.extend(
+                    self.append_text_delta(part.get("text").and_then(Value::as_str).unwrap_or("")),
+                );
             }
-            if let Some(function_call) = part.get("functionCall").filter(|value| value.is_object()) {
+            if let Some(function_call) = part.get("functionCall").filter(|value| value.is_object())
+            {
                 let key = new_id("fc");
-                output.extend(self.open_function_item(
-                    key.clone(),
-                    &new_id("call"),
-                    function_call.get("name").and_then(Value::as_str).unwrap_or(""),
-                ));
-                let arguments = serde_json::to_string(function_call.get("args").unwrap_or(&Value::Null))
-                    .unwrap_or_else(|_| "{}".into());
+                output.extend(
+                    self.open_function_item(
+                        key.clone(),
+                        &new_id("call"),
+                        function_call
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or(""),
+                    ),
+                );
+                let arguments =
+                    serde_json::to_string(function_call.get("args").unwrap_or(&Value::Null))
+                        .unwrap_or_else(|_| "{}".into());
                 if !arguments.is_empty() {
                     output.extend(self.append_function_arguments(&key, &arguments));
                 }
                 output.extend(self.close_function_item(&key));
             }
         }
-        self.usage.merge_gemini(event.get("usageMetadata").unwrap_or(&Value::Null));
+        self.usage
+            .merge_gemini(event.get("usageMetadata").unwrap_or(&Value::Null));
         if candidate.get("finishReason").and_then(Value::as_str) == Some("MAX_TOKENS") {
             self.status = "incomplete".into();
         }
@@ -3381,18 +3548,18 @@ pub fn stream_error_message(upstream: &str, value: &Value) -> Option<String> {
                 );
             }
         }
-        "openai_responses" => {
-            if value.get("type").and_then(Value::as_str) == Some("response.failed") {
-                let response = value.get("response").unwrap_or(&Value::Null);
-                let error = response.get("error").unwrap_or(&Value::Null);
-                return Some(
-                    error
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Upstream stream error")
-                        .to_owned(),
-                );
-            }
+        "openai_responses"
+            if value.get("type").and_then(Value::as_str) == Some("response.failed") =>
+        {
+            let response = value.get("response").unwrap_or(&Value::Null);
+            let error = response.get("error").unwrap_or(&Value::Null);
+            return Some(
+                error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Upstream stream error")
+                    .to_owned(),
+            );
         }
         _ => {}
     }
@@ -3434,10 +3601,15 @@ mod tests {
             "tool_choice":{"type":"auto"},
             "messages":[{"role":"user","content":"weather?"},
                         {"role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"get_weather","input":{"city":"SF"}}]}]}"#;
-        let converted = parse(&convert_request("claude", "openai_compatible", "upstream-model", input).unwrap());
+        let converted = parse(
+            &convert_request("claude", "openai_compatible", "upstream-model", input).unwrap(),
+        );
         assert_eq!(converted["model"], "upstream-model");
         assert_eq!(converted["messages"][1]["tool_calls"][0]["id"], "tu_1");
-        assert_eq!(converted["messages"][1]["tool_calls"][0]["function"]["name"], "get_weather");
+        assert_eq!(
+            converted["messages"][1]["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
         assert_eq!(converted["tools"][0]["type"], "function");
         assert_eq!(converted["tool_choice"], json!("auto"));
         assert_eq!(converted["stream"], true);
@@ -3446,7 +3618,9 @@ mod tests {
     #[test]
     fn claude_image_uses_png_default() {
         let input = br#"{"model":"m","messages":[{"role":"user","content":[{"type":"image","source":{"data":"AAAA"}}]}]}"#;
-        let converted = parse(&convert_request("claude", "openai_compatible", "upstream-model", input).unwrap());
+        let converted = parse(
+            &convert_request("claude", "openai_compatible", "upstream-model", input).unwrap(),
+        );
         assert_eq!(
             converted["messages"][0]["content"][0]["image_url"]["url"],
             "data:image/png;base64,AAAA"
@@ -3459,22 +3633,40 @@ mod tests {
             "thinking":{"budget_tokens":1024},
             "tools":[{"name":"t","description":"d","input_schema":{"type":"object"}}],
             "messages":[{"role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"t","input":{"a":1}}]}]}"#;
-        let converted = parse(&convert_request("claude", "gemini", "upstream-model", input).unwrap());
+        let converted =
+            parse(&convert_request("claude", "gemini", "upstream-model", input).unwrap());
         assert_eq!(converted["generationConfig"]["maxOutputTokens"], 64);
         assert_eq!(converted["generationConfig"]["topK"], 10);
         assert_eq!(converted["thinkingConfig"]["thinkingBudget"], 1024);
         assert_eq!(converted["contents"][0]["role"], "model");
-        assert_eq!(converted["contents"][0]["parts"][0]["functionCall"]["name"], "t");
-        assert_eq!(converted["tools"][0]["functionDeclarations"][0]["name"], "t");
+        assert_eq!(
+            converted["contents"][0]["parts"][0]["functionCall"]["name"],
+            "t"
+        );
+        assert_eq!(
+            converted["tools"][0]["functionDeclarations"][0]["name"],
+            "t"
+        );
     }
 
     #[test]
     fn responses_request_converts_function_call_to_tool_calls() {
         let input = br#"{"model":"codex","max_output_tokens":32,
             "input":[{"type":"function_call","call_id":"fc_1","name":"t","arguments":"{\"a\":1}"}]}"#;
-        let converted = parse(&convert_request("openai_responses", "openai_compatible", "upstream-model", input).unwrap());
+        let converted = parse(
+            &convert_request(
+                "openai_responses",
+                "openai_compatible",
+                "upstream-model",
+                input,
+            )
+            .unwrap(),
+        );
         assert_eq!(converted["messages"][0]["role"], "assistant");
-        assert_eq!(converted["messages"][0]["tool_calls"][0]["function"]["name"], "t");
+        assert_eq!(
+            converted["messages"][0]["tool_calls"][0]["function"]["name"],
+            "t"
+        );
         assert_eq!(converted["max_tokens"], 32);
     }
 
@@ -3484,7 +3676,9 @@ mod tests {
             "content":"Done","tool_calls":[{"id":"call_1","type":"function","function":{"name":"t","arguments":"{\"a\":1}"}}]},
             "finish_reason":"tool_calls"}],"usage":{"prompt_tokens":4,"completion_tokens":2,
             "prompt_tokens_details":{"cached_tokens":1}}}"#;
-        let converted = parse(&convert_response("claude", "openai_compatible", "claude-client", upstream).unwrap());
+        let converted = parse(
+            &convert_response("claude", "openai_compatible", "claude-client", upstream).unwrap(),
+        );
         assert_eq!(converted["content"][0]["type"], "thinking");
         assert_eq!(converted["content"][1]["type"], "text");
         assert_eq!(converted["content"][2]["type"], "tool_use");
@@ -3496,37 +3690,65 @@ mod tests {
     fn chat_converts_to_responses_with_full_envelope() {
         let upstream = br#"{"id":"chat-1","choices":[{"message":{"content":"Hello"},"finish_reason":"length"}],
             "usage":{"prompt_tokens":4,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":1}}}"#;
-        let converted = parse(&convert_response("openai_responses", "openai_compatible", "codex-model", upstream).unwrap());
+        let converted = parse(
+            &convert_response(
+                "openai_responses",
+                "openai_compatible",
+                "codex-model",
+                upstream,
+            )
+            .unwrap(),
+        );
         assert_eq!(converted["object"], "response");
         assert_eq!(converted["status"], "incomplete");
-        assert_eq!(converted["incomplete_details"]["reason"], "max_output_tokens");
+        assert_eq!(
+            converted["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
         assert_eq!(converted["output"][0]["content"][0]["text"], "Hello");
-        assert_eq!(converted["usage"]["input_tokens_details"]["cached_tokens"], 1);
+        assert_eq!(
+            converted["usage"]["input_tokens_details"]["cached_tokens"],
+            1
+        );
         assert_eq!(converted["parallel_tool_calls"], true);
     }
 
     #[test]
     fn dsml_parses_invocations_in_chat_text() {
         let upstream = br#"{"id":"chat-1","choices":[{"message":{"content":"<|DSML|tool_calls><|DSML|invoke name=\"t\"><|DSML|parameter name=\"a\" string=\"true\">v</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>"},"finish_reason":"stop"}],"usage":{}}"#;
-        let converted = parse(&convert_response("openai_responses", "openai_compatible", "codex-model", upstream).unwrap());
+        let converted = parse(
+            &convert_response(
+                "openai_responses",
+                "openai_compatible",
+                "codex-model",
+                upstream,
+            )
+            .unwrap(),
+        );
         assert_eq!(converted["output"][0]["type"], "function_call");
         assert_eq!(converted["output"][0]["name"], "t");
-        let arguments: Value = serde_json::from_str(converted["output"][0]["arguments"].as_str().unwrap()).unwrap();
+        let arguments: Value =
+            serde_json::from_str(converted["output"][0]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(arguments["a"], "v");
     }
 
     #[test]
     fn claude_stream_converts_openai_events_incrementally() {
-        let mut converter = MappedStreamConverter::new("claude", "openai_compatible", "claude-client").unwrap();
+        let mut converter =
+            MappedStreamConverter::new("claude", "openai_compatible", "claude-client").unwrap();
         let mut out = Vec::new();
-        out.extend(converter.feed(br#"data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}
+        out.extend(converter.feed(
+            br#"data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}
 
-"#));
-        out.extend(converter.feed(br#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+"#,
+        ));
+        out.extend(converter.feed(
+            br#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
 
 data: [DONE]
 
-"#));
+"#,
+        ));
         out.extend(converter.flush());
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("event: message_start"));
@@ -3538,7 +3760,8 @@ data: [DONE]
 
     #[test]
     fn claude_stream_merges_tool_calls_by_index() {
-        let mut converter = MappedStreamConverter::new("claude", "openai_compatible", "claude-client").unwrap();
+        let mut converter =
+            MappedStreamConverter::new("claude", "openai_compatible", "claude-client").unwrap();
         let mut out = Vec::new();
         out.extend(converter.feed(br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"t","arguments":""}}]},"finish_reason":null}]}
 
@@ -3546,11 +3769,13 @@ data: [DONE]
         out.extend(converter.feed(br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"a\":1}"}}]},"finish_reason":null}]}
 
 "#));
-        out.extend(converter.feed(br#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
+        out.extend(converter.feed(
+            br#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
 
 data: [DONE]
 
-"#));
+"#,
+        ));
         out.extend(converter.flush());
         let text = String::from_utf8(out).unwrap();
         assert_eq!(text.matches("event: content_block_start").count(), 1);
@@ -3562,16 +3787,22 @@ data: [DONE]
 
     #[test]
     fn responses_stream_emits_sequence_numbered_events() {
-        let mut converter = MappedStreamConverter::new("openai_responses", "openai_compatible", "codex-model").unwrap();
+        let mut converter =
+            MappedStreamConverter::new("openai_responses", "openai_compatible", "codex-model")
+                .unwrap();
         let mut out = Vec::new();
-        out.extend(converter.feed(br#"data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}
+        out.extend(converter.feed(
+            br#"data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}
 
-"#));
-        out.extend(converter.feed(br#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+"#,
+        ));
+        out.extend(converter.feed(
+            br#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
 
 data: [DONE]
 
-"#));
+"#,
+        ));
         out.extend(converter.flush());
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("\"type\":\"response.created\""));
@@ -3583,9 +3814,12 @@ data: [DONE]
 
     #[test]
     fn gemini_stream_converts_to_claude() {
-        let mut converter = MappedStreamConverter::new("claude", "gemini", "claude-client").unwrap();
+        let mut converter =
+            MappedStreamConverter::new("claude", "gemini", "claude-client").unwrap();
         let mut out = Vec::new();
-        out.extend(converter.feed(b"{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Gem\"}]}}]}\n"));
+        out.extend(
+            converter.feed(b"{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Gem\"}]}}]}\n"),
+        );
         out.extend(converter.feed(b"{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ini\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":2}}\n"));
         out.extend(converter.flush());
         let text = String::from_utf8(out).unwrap();
@@ -3611,19 +3845,33 @@ data: [DONE]
     #[test]
     fn stream_error_and_completion_detection() {
         let error = json!({"type":"error","error":{"message":"stream broke"}});
-        assert_eq!(stream_error_message("claude", &error).as_deref(), Some("stream broke"));
+        assert_eq!(
+            stream_error_message("claude", &error).as_deref(),
+            Some("stream broke")
+        );
         let failed = json!({"type":"response.failed","response":{"error":{"message":"nope"}}});
-        assert_eq!(stream_error_message("openai_responses", &failed).as_deref(), Some("nope"));
+        assert_eq!(
+            stream_error_message("openai_responses", &failed).as_deref(),
+            Some("nope")
+        );
         assert!(stream_completed("claude", &json!({"type":"message_stop"})));
-        assert!(stream_completed("openai_compatible", &json!({"choices":[{"finish_reason":"stop"}]})));
-        assert!(!stream_completed("openai_compatible", &json!({"choices":[{"delta":{"content":"x"}}]})));
+        assert!(stream_completed(
+            "openai_compatible",
+            &json!({"choices":[{"finish_reason":"stop"}]})
+        ));
+        assert!(!stream_completed(
+            "openai_compatible",
+            &json!({"choices":[{"delta":{"content":"x"}}]})
+        ));
     }
 
     #[test]
     fn dsml_fullwidth_bars_do_not_panic() {
         // Regression: byte-offset slicing inside the 3-byte fullwidth bar '｜'
         // used to panic.
-        let mut converter = MappedStreamConverter::new("openai_responses", "openai_compatible", "codex-model").unwrap();
+        let mut converter =
+            MappedStreamConverter::new("openai_responses", "openai_compatible", "codex-model")
+                .unwrap();
         let out = converter.feed("data: {\"choices\":[{\"delta\":{\"content\":\"<｜DSML｜invoke\"},\"finish_reason\":null}]}\n\n".as_bytes());
         let out = String::from_utf8(out).unwrap();
         assert!(!out.is_empty());

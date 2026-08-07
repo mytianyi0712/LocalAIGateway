@@ -106,10 +106,10 @@ impl ServerController {
     }
 
     pub fn request_stop(&self) {
-        if let Ok(slot) = self.server.try_lock() {
-            if let Some(running) = slot.as_ref() {
-                running.cancel.cancel();
-            }
+        if let Ok(slot) = self.server.try_lock()
+            && let Some(running) = slot.as_ref()
+        {
+            running.cancel.cancel();
         }
     }
 

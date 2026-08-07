@@ -36,28 +36,10 @@ pub enum Event {
         channel_id: Option<String>,
         response_bytes: i64,
     },
-    Attempt {
-        id: String,
-        request_id: String,
-        channel_id: String,
-        channel_name: String,
-        attempt_no: i64,
-        priority: i64,
-        started_at: String,
-        finished_at: String,
-        status: Option<i64>,
-        outcome: String,
-        error_kind: Option<String>,
-        failover: bool,
-        response_started: bool,
-        first_byte_ms: Option<i64>,
-        first_token_ms: Option<i64>,
-        duration_ms: i64,
-        usage: Usage,
-        response_bytes: i64,
-        upstream_protocol: Option<String>,
-        upstream_model_id: Option<String>,
-    },
+    // Attempt is by far the largest variant (21 fields incl. Usage); boxing it
+    // keeps the Event enum small so every queued event costs one allocation
+    // of the same size instead of padding each message to the largest variant.
+    Attempt(Box<AttemptData>),
     ChannelSuccess {
         channel_id: String,
     },
@@ -69,6 +51,31 @@ pub enum Event {
         open_seconds: i64,
         countable: bool,
     },
+}
+
+/// Per-attempt telemetry snapshot, carried by [`Event::Attempt`].
+#[derive(Debug)]
+pub struct AttemptData {
+    pub id: String,
+    pub request_id: String,
+    pub channel_id: String,
+    pub channel_name: String,
+    pub attempt_no: i64,
+    pub priority: i64,
+    pub started_at: String,
+    pub finished_at: String,
+    pub status: Option<i64>,
+    pub outcome: String,
+    pub error_kind: Option<String>,
+    pub failover: bool,
+    pub response_started: bool,
+    pub first_byte_ms: Option<i64>,
+    pub first_token_ms: Option<i64>,
+    pub duration_ms: i64,
+    pub usage: Usage,
+    pub response_bytes: i64,
+    pub upstream_protocol: Option<String>,
+    pub upstream_model_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -137,29 +144,8 @@ async fn write_event(db: &Database, event: Event) -> anyhow::Result<()> {
             sqlx::query("UPDATE request_logs SET finished_at=?, total_duration_ms=?, final_status_code=?, outcome=?, attempt_count=?, final_channel_id=?, response_bytes=? WHERE id=?")
                 .bind(finished_at).bind(duration_ms).bind(status).bind(outcome).bind(attempts).bind(channel_id).bind(response_bytes).bind(id).execute(db.pool()).await?;
         }
-        Event::Attempt {
-            id,
-            request_id,
-            channel_id,
-            channel_name,
-            attempt_no,
-            priority,
-            started_at,
-            finished_at,
-            status,
-            outcome,
-            error_kind,
-            failover,
-            response_started,
-            first_byte_ms,
-            first_token_ms,
-            duration_ms,
-            usage,
-            response_bytes,
-            upstream_protocol,
-            upstream_model_id,
-        } => {
-            let tps = match (usage.output_tokens, duration_ms) {
+        Event::Attempt(attempt) => {
+            let tps = match (attempt.usage.output_tokens, attempt.duration_ms) {
                 (Some(tokens), ms) if ms > 0 => Some(tokens as f64 * 1000.0 / ms as f64),
                 _ => None,
             };
@@ -168,9 +154,9 @@ async fn write_event(db: &Database, event: Event) -> anyhow::Result<()> {
             // logged attempt, and a failed write rolls both back together.
             let mut tx = db.pool().begin().await?;
             sqlx::query("INSERT INTO request_attempts(id, request_id, channel_id, channel_name, attempt_no, priority_snapshot, started_at, finished_at, status_code, outcome, error_kind, failover_eligible, response_started, first_byte_ms, first_token_ms, duration_ms, input_tokens, cache_read_tokens, cache_write_tokens, cache_miss_input_tokens, output_tokens, tps, raw_usage_json, response_bytes, upstream_protocol, upstream_model_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-                .bind(&id).bind(&request_id).bind(&channel_id).bind(&channel_name).bind(attempt_no).bind(priority).bind(&started_at).bind(&finished_at).bind(status).bind(&outcome).bind(&error_kind).bind(failover).bind(response_started).bind(first_byte_ms).bind(first_token_ms).bind(duration_ms)
-                .bind(usage.input_tokens).bind(usage.cache_read_tokens).bind(usage.cache_write_tokens).bind(usage.cache_miss_input_tokens).bind(usage.output_tokens).bind(tps).bind(usage.raw.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default())).bind(response_bytes).bind(&upstream_protocol).bind(&upstream_model_id).execute(&mut *tx).await?;
-            if response_started {
+                .bind(&attempt.id).bind(&attempt.request_id).bind(&attempt.channel_id).bind(&attempt.channel_name).bind(attempt.attempt_no).bind(attempt.priority).bind(&attempt.started_at).bind(&attempt.finished_at).bind(attempt.status).bind(&attempt.outcome).bind(&attempt.error_kind).bind(attempt.failover).bind(attempt.response_started).bind(attempt.first_byte_ms).bind(attempt.first_token_ms).bind(attempt.duration_ms)
+                .bind(attempt.usage.input_tokens).bind(attempt.usage.cache_read_tokens).bind(attempt.usage.cache_write_tokens).bind(attempt.usage.cache_miss_input_tokens).bind(attempt.usage.output_tokens).bind(tps).bind(attempt.usage.raw.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default())).bind(attempt.response_bytes).bind(&attempt.upstream_protocol).bind(&attempt.upstream_model_id).execute(&mut *tx).await?;
+            if attempt.response_started {
                 // Only the attempt whose response reached the client carries
                 // user-visible usage. The whole request is attributed to its
                 // actual start time (request_logs.started_at, the same source
@@ -180,7 +166,7 @@ async fn write_event(db: &Database, event: Event) -> anyhow::Result<()> {
                 let request_row = sqlx::query(
                     "SELECT started_at, protocol, model_id FROM request_logs WHERE id=?",
                 )
-                .bind(&request_id)
+                .bind(&attempt.request_id)
                 .fetch_optional(&mut *tx)
                 .await?;
                 let occurred_at = request_row
@@ -203,7 +189,7 @@ async fn write_event(db: &Database, event: Event) -> anyhow::Result<()> {
                     // INSERT OR IGNORE deduplicates by attempt id: replaying a
                     // previously recorded attempt can never double-count.
                     sqlx::query("INSERT OR IGNORE INTO token_usage(attempt_id, occurred_at, bucket, protocol, model_id, input_tokens, cache_read_tokens, cache_write_tokens, cache_miss_input_tokens, output_tokens, first_token_ms, duration_ms) VALUES(?,?,strftime('%Y-%m-%dT%H:00:00Z', ?),?,?,?,?,?,?,?,?,?)")
-                        .bind(&id)
+                        .bind(&attempt.id)
                         .bind(&occurred_at)
                         .bind(&occurred_at)
                         .bind(
@@ -216,13 +202,13 @@ async fn write_event(db: &Database, event: Event) -> anyhow::Result<()> {
                                 .flatten()
                                 .unwrap_or_default(),
                         )
-                        .bind(usage.input_tokens)
-                        .bind(usage.cache_read_tokens)
-                        .bind(usage.cache_write_tokens)
-                        .bind(usage.cache_miss_input_tokens)
-                        .bind(usage.output_tokens)
-                        .bind(first_token_ms)
-                        .bind(duration_ms)
+                        .bind(attempt.usage.input_tokens)
+                        .bind(attempt.usage.cache_read_tokens)
+                        .bind(attempt.usage.cache_write_tokens)
+                        .bind(attempt.usage.cache_miss_input_tokens)
+                        .bind(attempt.usage.output_tokens)
+                        .bind(attempt.first_token_ms)
+                        .bind(attempt.duration_ms)
                         .execute(&mut *tx)
                         .await?;
                 }
@@ -258,7 +244,7 @@ mod tests {
     use crate::db::Database;
 
     fn attempt_event(response_started: bool) -> Event {
-        Event::Attempt {
+        Event::Attempt(Box::new(AttemptData {
             id: "attempt-1".into(),
             request_id: "req-1".into(),
             channel_id: "ch-1".into(),
@@ -286,7 +272,7 @@ mod tests {
             response_bytes: 10,
             upstream_protocol: Some("openai_compatible".into()),
             upstream_model_id: Some("upstream-model".into()),
-        }
+        }))
     }
 
     async fn temp_db() -> Database {

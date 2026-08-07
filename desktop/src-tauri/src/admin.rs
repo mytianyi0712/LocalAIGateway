@@ -1124,15 +1124,15 @@ async fn put_capabilities(
             return Err(ApiError::validation(format!("{key} must be >= 0")));
         }
     }
-    if let Some(map) = &input.thinking_level_map {
-        if let Some(object) = map.as_object() {
-            for key in object.keys() {
-                if !matches!(
-                    key.as_str(),
-                    "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-                ) {
-                    return Err(ApiError::validation("Unsupported thinking level"));
-                }
+    if let Some(map) = &input.thinking_level_map
+        && let Some(object) = map.as_object()
+    {
+        for key in object.keys() {
+            if !matches!(
+                key.as_str(),
+                "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+            ) {
+                return Err(ApiError::validation("Unsupported thinking level"));
             }
         }
     }
@@ -1160,16 +1160,28 @@ async fn put_capabilities(
         if let Some(id) = &input.profile_id {
             let profile=sqlx::query("SELECT context_window,max_tokens,supports_image_input,reasoning,thinking_level_map FROM capability_profiles WHERE id=?").bind(id).fetch_optional(state.db.pool()).await?.ok_or_else(||ApiError::not_found("Profile not found"))?;
             if values["context_window"].is_null() {
-                values["context_window"] = profile.get::<Option<i64>, _>("context_window").map(Value::from).unwrap_or(Value::Null);
+                values["context_window"] = profile
+                    .get::<Option<i64>, _>("context_window")
+                    .map(Value::from)
+                    .unwrap_or(Value::Null);
             }
             if values["max_tokens"].is_null() {
-                values["max_tokens"] = profile.get::<Option<i64>, _>("max_tokens").map(Value::from).unwrap_or(Value::Null);
+                values["max_tokens"] = profile
+                    .get::<Option<i64>, _>("max_tokens")
+                    .map(Value::from)
+                    .unwrap_or(Value::Null);
             }
             if values["supports_image_input"].is_null() {
-                values["supports_image_input"] = profile.get::<Option<bool>, _>("supports_image_input").map(Value::from).unwrap_or(Value::Null);
+                values["supports_image_input"] = profile
+                    .get::<Option<bool>, _>("supports_image_input")
+                    .map(Value::from)
+                    .unwrap_or(Value::Null);
             }
             if values["reasoning"].is_null() {
-                values["reasoning"] = profile.get::<Option<bool>, _>("reasoning").map(Value::from).unwrap_or(Value::Null);
+                values["reasoning"] = profile
+                    .get::<Option<bool>, _>("reasoning")
+                    .map(Value::from)
+                    .unwrap_or(Value::Null);
             }
             if values["thinking_level_map"].is_null() {
                 values["thinking_level_map"] = profile
@@ -1291,7 +1303,7 @@ async fn mapping_json(state: &AppState, kind: &str, row_id: &str) -> Result<Valu
     // The management UI reads the protocol-specific key (claude_model_id /
     // codex_model_id), mirroring the Python gateway; `model_id` is kept as a
     // compatibility alias.
-    let mut value = json!({
+    let value = json!({
         "id": row.get::<String, _>("id"),
         "model_id": model_id,
         idcol: model_id,
@@ -1481,26 +1493,26 @@ async fn presets(state: &AppState, key: &str, defaults: Value) -> Result<Value, 
             .bind(key)
             .fetch_optional(state.db.pool())
             .await?;
-    if let Some(raw) = raw {
-        if let Ok(stored) = serde_json::from_str::<Value>(&raw) {
-            let mut merged = defaults
-                .get("items")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            if let Some(items) = stored.get("items").and_then(Value::as_array) {
-                merged.extend(items.clone());
-            }
-            let mut seen = HashSet::new();
-            merged.retain(|item| {
-                item.get("id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| seen.insert(id.to_owned()))
-            });
-            return Ok(
-                json!({"items":merged,"source":"channels","refreshed_at":stored.get("refreshed_at")}),
-            );
+    if let Some(raw) = raw
+        && let Ok(stored) = serde_json::from_str::<Value>(&raw)
+    {
+        let mut merged = defaults
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(items) = stored.get("items").and_then(Value::as_array) {
+            merged.extend(items.clone());
         }
+        let mut seen = HashSet::new();
+        merged.retain(|item| {
+            item.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| seen.insert(id.to_owned()))
+        });
+        return Ok(
+            json!({"items":merged,"source":"channels","refreshed_at":stored.get("refreshed_at")}),
+        );
     }
     Ok(defaults)
 }
@@ -1633,8 +1645,9 @@ async fn list_requests(
     // Aggregate per-request attempt metadata (channels, upstream identity) the
     // same way the Python backend does, so the log list can show the responding
     // channel and upstream model without opening the detail view.
-    let mut attempts_by_request: HashMap<String, Vec<(String, Option<String>, Option<String>)>> =
-        HashMap::new();
+    // (channel_name, upstream_protocol, upstream_model_id)
+    type AttemptSummary = Vec<(String, Option<String>, Option<String>)>;
+    let mut attempts_by_request: HashMap<String, AttemptSummary> = HashMap::new();
     if !ids.is_empty() {
         let mut builder = QueryBuilder::new(
             "SELECT request_id, channel_name, upstream_protocol, upstream_model_id FROM request_attempts WHERE request_id IN (",

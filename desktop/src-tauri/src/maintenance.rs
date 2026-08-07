@@ -20,6 +20,10 @@ use tokio::time::{Duration, Instant};
 use crate::server::AppState;
 use crate::settings;
 
+/// Final attempt bookkeeping read back from `request_attempts` for repair:
+/// (outcome, status_code, response_started, has_raw_usage, output_tokens).
+type FinalAttempt = (String, Option<i64>, Option<i64>, bool, Option<i64>);
+
 /// Repair legacy cancellations that already captured a completed stream's
 /// usage (Python `reconcile_completed_stream_cancellations`).
 pub async fn reconcile_completed_stream_cancellations(state: &AppState) -> anyhow::Result<i64> {
@@ -30,29 +34,36 @@ pub async fn reconcile_completed_stream_cancellations(state: &AppState) -> anyho
     .fetch_all(state.db.pool())
     .await?
     .into_iter()
-    .map(|row| (row.try_get("id").unwrap_or_default(), row.try_get("response_bytes").unwrap_or_default()))
+    .map(|row| {
+        (
+            row.try_get("id").unwrap_or_default(),
+            row.try_get("response_bytes").unwrap_or_default(),
+        )
+    })
     .collect();
     let mut repaired = 0i64;
     for (request_id, _) in rows {
-        let final_attempt: Option<(String, Option<i64>, Option<i64>, bool, Option<i64>)> =
-            sqlx::query(
-                "SELECT outcome, status_code, response_started, raw_usage_json, output_tokens \
+        let final_attempt: Option<FinalAttempt> = sqlx::query(
+            "SELECT outcome, status_code, response_started, raw_usage_json, output_tokens \
                  FROM request_attempts WHERE request_id = ? ORDER BY attempt_no DESC LIMIT 1",
-            )
-            .bind(&request_id)
-            .fetch_optional(state.db.pool())
-            .await?
-            .map(|row| -> anyhow::Result<(String, Option<i64>, Option<i64>, bool, Option<i64>)> {
-                Ok((
-                    row.try_get::<String, _>("outcome")?,
-                    row.try_get::<Option<i64>, _>("status_code")?,
-                    row.try_get::<Option<bool>, _>("response_started")?.map(|v| v as i64),
-                    row.try_get::<Option<String>, _>("raw_usage_json")?.is_some(),
-                    row.try_get::<Option<i64>, _>("output_tokens")?,
-                ))
-            })
-            .transpose()?;
-        let Some((outcome, status_code, response_started, raw_usage, output_tokens)) = final_attempt
+        )
+        .bind(&request_id)
+        .fetch_optional(state.db.pool())
+        .await?
+        .map(|row| -> anyhow::Result<FinalAttempt> {
+            Ok((
+                row.try_get::<String, _>("outcome")?,
+                row.try_get::<Option<i64>, _>("status_code")?,
+                row.try_get::<Option<bool>, _>("response_started")?
+                    .map(|v| v as i64),
+                row.try_get::<Option<String>, _>("raw_usage_json")?
+                    .is_some(),
+                row.try_get::<Option<i64>, _>("output_tokens")?,
+            ))
+        })
+        .transpose()?;
+        let Some((outcome, status_code, response_started, raw_usage, output_tokens)) =
+            final_attempt
         else {
             continue;
         };
@@ -96,8 +107,7 @@ pub fn spawn_supervisor(state: AppState) {
             if let Err(error) = finalize_stale_pending_requests(&state).await {
                 tracing::warn!(%error, "stale request finalization failed");
             }
-            let due = last_cleanup
-                .is_none_or(|last| last.elapsed() >= Duration::from_secs(3600));
+            let due = last_cleanup.is_none_or(|last| last.elapsed() >= Duration::from_secs(3600));
             if due {
                 if let Err(error) = cleanup_logs(&state).await {
                     tracing::warn!(%error, "log cleanup failed");
@@ -117,19 +127,17 @@ async fn schedule_discovery(
     let runtime = settings::runtime_settings(state).await?;
     let interval_hours = runtime.model_discovery_interval_hours.max(1);
     let cutoff = (chrono::Utc::now() - chrono::Duration::hours(interval_hours)).to_rfc3339();
-    let channels: Vec<String> = sqlx::query_scalar(
-        "SELECT id FROM channels WHERE manual_enabled = 1 ORDER BY id",
-    )
-    .fetch_all(state.db.pool())
-    .await?;
+    let channels: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM channels WHERE manual_enabled = 1 ORDER BY id")
+            .fetch_all(state.db.pool())
+            .await?;
     let mut due: Vec<String> = Vec::new();
     for channel_id in channels {
-        let last_started: Option<String> = sqlx::query_scalar(
-            "SELECT MAX(started_at) FROM discovery_runs WHERE channel_id = ?",
-        )
-        .bind(&channel_id)
-        .fetch_optional(state.db.pool())
-        .await?;
+        let last_started: Option<String> =
+            sqlx::query_scalar("SELECT MAX(started_at) FROM discovery_runs WHERE channel_id = ?")
+                .bind(&channel_id)
+                .fetch_optional(state.db.pool())
+                .await?;
         let needs_run = match last_started {
             None => true,
             Some(last) => last <= cutoff,
@@ -142,12 +150,11 @@ async fn schedule_discovery(
     // Drop channels whose queued run already finished.
     let mut finished = Vec::new();
     for (channel_id, run_id) in discovering.iter() {
-        let done: Option<Option<String>> = sqlx::query_scalar(
-            "SELECT finished_at FROM discovery_runs WHERE id = ?",
-        )
-        .bind(run_id)
-        .fetch_optional(state.db.pool())
-        .await?;
+        let done: Option<Option<String>> =
+            sqlx::query_scalar("SELECT finished_at FROM discovery_runs WHERE id = ?")
+                .bind(run_id)
+                .fetch_optional(state.db.pool())
+                .await?;
         if done.flatten().is_some() {
             finished.push(channel_id.clone());
         }
@@ -201,7 +208,11 @@ async fn finalize_stale_pending_requests(state: &AppState) -> anyhow::Result<()>
     for (request_id, started_at) in rows {
         let duration_ms = started_at
             .and_then(|started| chrono::DateTime::parse_from_rfc3339(&started).ok())
-            .map(|started| (now - started.with_timezone(&chrono::Utc)).num_milliseconds().max(0));
+            .map(|started| {
+                (now - started.with_timezone(&chrono::Utc))
+                    .num_milliseconds()
+                    .max(0)
+            });
         sqlx::query(
             "UPDATE request_logs SET finished_at=?, total_duration_ms=?, outcome='cancelled', \
              response_bytes=COALESCE(response_bytes,0) WHERE id=?",

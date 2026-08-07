@@ -75,10 +75,10 @@ pub async fn access_policy(state: &AppState) -> Result<AccessPolicy> {
     for row in rows {
         let key: String = row.try_get("key")?;
         let raw: String = row.try_get("value_json")?;
-        if let Ok(token) = serde_json::from_str::<String>(&raw) {
-            if let Ok(value) = state.secrets.decrypt(token.as_bytes()) {
-                keys.insert(key, value);
-            }
+        if let Ok(token) = serde_json::from_str::<String>(&raw)
+            && let Ok(value) = state.secrets.decrypt(token.as_bytes())
+        {
+            keys.insert(key, value);
         }
     }
     Ok(AccessPolicy {

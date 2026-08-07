@@ -213,7 +213,9 @@ pub fn run_desktop() -> Result<()> {
                 // Pre-create the directory so enabling autostart cannot fail.
                 if let Some(home) = std::env::var_os("HOME") {
                     let _ = std::fs::create_dir_all(
-                        std::path::PathBuf::from(home).join(".config").join("autostart"),
+                        std::path::PathBuf::from(home)
+                            .join(".config")
+                            .join("autostart"),
                     );
                 }
             }
@@ -224,12 +226,11 @@ pub fn run_desktop() -> Result<()> {
             // The window is created hidden (`visible: false`); show it now
             // unless the user opted to start minimized to the tray.
             let start_to_tray = tauri::async_runtime::block_on(controller.start_to_tray());
-            if !start_to_tray {
-                if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                    if let Err(error) = window.show() {
-                        tracing::error!(?error, "failed to show main window");
-                    }
-                }
+            if !start_to_tray
+                && let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL)
+                && let Err(error) = window.show()
+            {
+                tracing::error!(?error, "failed to show main window");
             }
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = controller.start().await {
@@ -241,12 +242,12 @@ pub fn run_desktop() -> Result<()> {
         .on_window_event(|window, event| {
             // Closing the window only hides it: the gateway keeps running in the tray.
             // The controller is intentionally not stopped on this path.
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                if window.label() == MAIN_WINDOW_LABEL {
-                    api.prevent_close();
-                    if let Err(error) = window.hide() {
-                        tracing::error!(?error, "failed to hide main window on close");
-                    }
+            if let WindowEvent::CloseRequested { api, .. } = event
+                && window.label() == MAIN_WINDOW_LABEL
+            {
+                api.prevent_close();
+                if let Err(error) = window.hide() {
+                    tracing::error!(?error, "failed to hide main window on close");
                 }
             }
         })

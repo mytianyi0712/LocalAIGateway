@@ -118,6 +118,28 @@ clean_stale_releases() {
 }
 clean_stale_releases
 
+# ---- Linux AppImage 构建环境修复 ----
+# 1. NO_STRIP: linuxdeploy 内嵌的 strip 太旧,无法识别新版 binutils 生成的
+#    .relr.dyn section(系统库如 libxml2/libzstd 均带),strip 阶段会批量报错;
+#    禁用 strip 后产物功能完整,仅体积略增。(desktop/scripts/build-appimage.sh
+#    同样导出;此处兜底覆盖所有子脚本。)
+# 2. 代理检测:AppImage 打包首次需要从 GitHub 下载 type2-runtime(缓存在本机
+#    后才离线可用);直连不通时自动使用本机常见代理端口(7897/7890/10809/1080),
+#    不覆盖用户已显式设置的代理。
+export NO_STRIP=true
+
+if [[ -z "${HTTPS_PROXY:-}" && -z "${https_proxy:-}" ]]; then
+  for port in 7897 7890 10809 1080; do
+    if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
+      exec 3>&- 3<&-
+      export HTTPS_PROXY="http://127.0.0.1:${port}"
+      export HTTP_PROXY="http://127.0.0.1:${port}"
+      echo "  detected local proxy on port ${port}: using ${HTTPS_PROXY}"
+      break
+    fi
+  done
+fi
+
 if [[ "$TARGET" == "all" ]]; then
   run_target appimage
   collect_artifacts appimage

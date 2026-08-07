@@ -182,7 +182,6 @@ button:disabled { cursor: not-allowed; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .protocol-list, .route-chain { display: flex; gap: 5px; flex-wrap: wrap; align-items: center; }
 .protocol { display: inline-flex; align-items: center; min-height: 25px; padding: 0 8px; border: 1px solid #d9e4df; border-radius: 5px; background: #f7faf8; color: #4c6057; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10.5px; line-height: 1; white-space: nowrap; }
-.protocol-upstream { border-style: dashed; background: #f3f0fa; border-color: #d3c8ec; color: #6b5aa8; }
 .route-candidate { display: inline-flex; align-items: center; gap: 6px; min-height: 27px; padding: 0 8px 0 6px; border: 1px solid #d9e4df; border-radius: 5px; background: #f8fbf9; color: var(--text-secondary); font-size: 11px; white-space: nowrap; }
 .route-candidate b { display: inline-grid; place-items: center; min-width: 18px; height: 18px; border-radius: 4px; background: #dceee7; color: var(--accent-strong); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10px; }
 .route-candidate.is-open { border-color: #e8b5b7; background: #fff8f8; color: var(--danger); }

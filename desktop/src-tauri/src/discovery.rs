@@ -37,8 +37,7 @@ async fn queue_with_trigger(state: AppState, channel_id: String, trigger: &str) 
     let task_run_id = run_id.clone();
     let task_channel_id = channel_id.clone();
     tokio::spawn(async move {
-        let result =
-            timeout(Duration::from_secs(120), discover(&state, &task_channel_id)).await;
+        let result = timeout(Duration::from_secs(120), discover(&state, &task_channel_id)).await;
         let finished = chrono::Utc::now().to_rfc3339();
         match result {
             Ok(Ok((count, status_code, error_kind))) => {
@@ -122,7 +121,11 @@ async fn fetch_models(
 }
 
 /// Parse a catalog response; returns (items, optional next-page URL).
-fn parse_models(protocol_name: &str, body: &[u8], current_url: &url::Url) -> Result<(Vec<Value>, Option<url::Url>)> {
+fn parse_models(
+    protocol_name: &str,
+    body: &[u8],
+    current_url: &url::Url,
+) -> Result<(Vec<Value>, Option<url::Url>)> {
     let value: Value = serde_json::from_slice(body).context("模型目录 JSON 无效")?;
     let items = if protocol_name == "gemini" {
         value
@@ -219,20 +222,16 @@ async fn discover(
             None,
             protocol_name,
         )?;
-        let headers = protocol::outbound_headers(
-            &axum::http::HeaderMap::new(),
-            protocol_name,
-            &api_key,
-        )?;
+        let headers =
+            protocol::outbound_headers(&axum::http::HeaderMap::new(), protocol_name, &api_key)?;
         let mut header_key = String::new();
         for (name, value) in headers.iter() {
             header_key.push_str(&format!("{}:{};", name, value.to_str().unwrap_or("")));
         }
         let url_key = url.to_string();
-        match groups
-            .iter_mut()
-            .find(|(group_url, group_headers, _)| *group_url == url_key && *group_headers == header_key)
-        {
+        match groups.iter_mut().find(|(group_url, group_headers, _)| {
+            *group_url == url_key && *group_headers == header_key
+        }) {
             Some((_, _, group_protocols)) => group_protocols.push(protocol_name.clone()),
             None => groups.push((url_key, header_key, vec![protocol_name.clone()])),
         }
@@ -332,7 +331,10 @@ async fn discover(
             let metadata_json = serde_json::to_string(&Value::Object(metadata))?;
             match existing.get_mut(model_id) {
                 Some((row_id, stored_display, _, _)) => {
-                    let updated_display = if stored_display.as_deref().is_some_and(|value| !value.is_empty()) {
+                    let updated_display = if stored_display
+                        .as_deref()
+                        .is_some_and(|value| !value.is_empty())
+                    {
                         stored_display.clone()
                     } else {
                         Some(display_name)
@@ -366,11 +368,19 @@ async fn discover(
                     .await?;
                     existing.insert(
                         model_id.clone(),
-                        (row_id, Some(display_name), false, Some(metadata_json.clone())),
+                        (
+                            row_id,
+                            Some(display_name),
+                            false,
+                            Some(metadata_json.clone()),
+                        ),
                     );
                 }
             }
-            let row_id = existing.get(model_id).map(|(id, _, _, _)| id.clone()).unwrap_or_default();
+            let row_id = existing
+                .get(model_id)
+                .map(|(id, _, _, _)| id.clone())
+                .unwrap_or_default();
             sqlx::query("INSERT OR IGNORE INTO channel_model_protocols(channel_model_id,protocol) VALUES(?,?)")
                 .bind(&row_id)
                 .bind(protocol_name)
@@ -401,11 +411,13 @@ async fn discover(
             }
         }
         for protocol_name in &stale {
-            sqlx::query("DELETE FROM channel_model_protocols WHERE channel_model_id=? AND protocol=?")
-                .bind(row_id)
-                .bind(protocol_name)
-                .execute(state.db.pool())
-                .await?;
+            sqlx::query(
+                "DELETE FROM channel_model_protocols WHERE channel_model_id=? AND protocol=?",
+            )
+            .bind(row_id)
+            .bind(protocol_name)
+            .execute(state.db.pool())
+            .await?;
         }
         let remaining = protocol_sets
             .get(model_id)

@@ -58,13 +58,13 @@ fn probe_body_ok(protocol: &str, body: &[u8]) -> bool {
     match protocol {
         "openai_compatible" => {
             value.pointer("/choices/0/finish_reason").is_some()
-                || value.pointer("/choices/0/message/content").is_some_and(|content| {
-                    match content {
+                || value.pointer("/choices/0/message/content").is_some_and(
+                    |content| match content {
                         Value::String(text) => !text.is_empty(),
                         Value::Array(parts) => !parts.is_empty(),
                         _ => false,
-                    }
-                })
+                    },
+                )
         }
         "openai_responses" => {
             value.get("status").and_then(Value::as_str) == Some("completed")

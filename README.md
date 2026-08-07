@@ -113,7 +113,7 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 
 客户端模型目录端点：
 
-- 通用聚合目录：`GET /v1/models`，仅返回已配置且存在可用候选的模型；有能力数据的模型在 `x_local_gateway` 中附带 `capabilities` 与 `pi_model_config`（供目录消费方读取真实能力值）。
+- 通用聚合目录：`GET /v1/models`，仅返回已配置且存在可用候选的模型；每个条目在 `x_local_gateway` 中附带 `supported_endpoints`（该模型当前可路由的主入口，如 `["/v1/chat/completions"]`），有能力数据的模型另附 `capabilities` 与 `pi_model_config`（供目录消费方读取真实能力值）。
 - OpenAI Compatible：`GET /v1/models?protocol=openai_compatible`
 - OpenAI Responses：`GET /v1/models?protocol=openai_responses`；兼容别名为 `GET /v1/responses/models`
 - Claude：携带 `anthropic-version` 请求 `GET /v1/models`；兼容别名为 `GET /v1/messages/models`
