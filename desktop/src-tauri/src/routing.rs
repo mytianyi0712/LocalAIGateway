@@ -67,7 +67,8 @@ pub async fn list_routable_models(
 pub async fn list_mapping_models(state: &AppState, kind: &str) -> Result<Vec<RoutableModel>> {
     let (table, id_column) = match kind {
         "claude" => ("claude_model_mappings", "claude_model_id"),
-        "codex" => ("codex_model_mappings", "codex_model_id"),
+        // codex 映射按入口协议 openai_responses 标识（proxy::mapped_models 传 entry）
+        "openai_responses" => ("codex_model_mappings", "codex_model_id"),
         _ => return Ok(Vec::new()),
     };
     let sql = format!(
