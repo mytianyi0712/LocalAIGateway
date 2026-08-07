@@ -8,7 +8,7 @@
 - 按模型 ID 合并路由，渠道优先级只配置一次，请求时按入口协议过滤后进行同协议故障转移。
 - 请求、成功响应和最终上游 HTTP 错误保持原始字节不变。
 - 连续错误自动熔断 15 分钟，到期后以最小 `OK` 请求探测并静默恢复。
-- 旁路统计首字节、首 Token、TPS、缓存读取/写入/未命中和输出 Token。
+- 旁路统计首字节、首 Token、TPS 与输出 Token，并透传上游 usage 中的提示词缓存统计（缓存读取/写入/未命中）。
 - Claude 模型映射助手：对外暴露 Claude Code 标准模型名（如 `claude-opus-5`），控制台按模型独立配置上游协议与候选渠道，请求时自动完成协议转换（参考 CLIProxyAPI 的转换思路），路由实时生效。
 - Codex 模型映射助手：对外暴露 Codex 标准模型名（如 `gpt-5-codex`），与 Claude 映射同一套转换体系，让 Codex CLI 通过独立入口 `/codex` 使用任意上游模型。
 - 模型能力档案：内置 `capability_profiles` 表收集可复用的模型能力集合，支持手动创建/编辑/删除；在「模型路由 → 配置能力」中可直接选择档案应用（多个模型可共用同一套能力，如 GPT-5.6 Sol/Terra/Luna），修改档案自动同步到所有引用模型；成本仍按模型独立配置。
@@ -113,13 +113,13 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 
 客户端模型目录端点：
 
-- 通用聚合目录：`GET /v1/models`，仅返回已配置且存在可用候选的模型，`x_local_gateway` 仅列出 `supported_endpoints`。
+- 通用聚合目录：`GET /v1/models`，仅返回已配置且存在可用候选的模型；有能力数据的模型在 `x_local_gateway` 中附带 `capabilities` 与 `pi_model_config`（供目录消费方读取真实能力值）。
 - OpenAI Compatible：`GET /v1/models?protocol=openai_compatible`
 - OpenAI Responses：`GET /v1/models?protocol=openai_responses`；兼容别名为 `GET /v1/responses/models`
 - Claude：携带 `anthropic-version` 请求 `GET /v1/models`；兼容别名为 `GET /v1/messages/models`
 - Gemini：`GET /v1beta/models`
 
-聚合目录保持 OpenAI 标准的 `object: "list"` 和 `data[].id` 结构，额外字段可被 CC Switch 等只读取标准字段的客户端忽略。`GET /v1/models` 也接受 `X-Local-Gateway-Protocol` 显式选择单个协议池。
+聚合目录保持 OpenAI 标准的 `object: "list"` 和 `data[].id` 结构，额外字段可被 CC Switch 等只读取标准字段的客户端忽略。
 
 ## 桌面打包
 
