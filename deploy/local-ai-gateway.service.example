@@ -7,12 +7,11 @@ Wants=network-online.target
 Type=simple
 User=YOUR_USER
 Group=YOUR_GROUP
-WorkingDirectory=/opt/local-ai-gateway/backend
-Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/opt/local-ai-gateway
 Environment=AI_GATEWAY_HOST=0.0.0.0
 Environment=AI_GATEWAY_PORT=3000
 Environment=AI_GATEWAY_DATA_DIR=/var/lib/local-ai-gateway
-ExecStart=/opt/local-ai-gateway/backend/.venv/bin/python -m app
+ExecStart=/usr/bin/gateway-headless
 Restart=on-failure
 RestartSec=3s
 TimeoutStopSec=30s

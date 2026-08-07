@@ -1,1 +1,0 @@
-"""Local AI Gateway backend."""

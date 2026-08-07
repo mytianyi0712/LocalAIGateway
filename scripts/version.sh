@@ -11,9 +11,6 @@
 #   desktop/src-tauri/Cargo.toml    [package] version
 #   desktop/src-tauri/tauri.conf.json 顶层 version（见下方取舍说明）
 #   desktop/src-tauri/Cargo.lock    由 cargo metadata 重新解析，不手工替换
-#   backend/pyproject.toml          [project] version
-#   backend/uv.lock                 由 uv lock 重新解析，不手工替换
-#   backend/app/main.py             FastAPI(version=...) 字面量
 #   packaging/arch/PKGBUILD         pkgver 字面量（Arch 映射：连字符转下划线）；构建时
 #                                   packaging/build-arch.sh 还会从 Cargo.toml 覆盖该值，
 #                                   模板本身也由 set/check 保持与 VERSION 一致
@@ -31,9 +28,6 @@ VERSION_FILE="${ROOT_DIR}/VERSION"
 CARGO_MANIFEST="${ROOT_DIR}/desktop/src-tauri/Cargo.toml"
 TAURI_CONF="${ROOT_DIR}/desktop/src-tauri/tauri.conf.json"
 CARGO_LOCK="${ROOT_DIR}/desktop/src-tauri/Cargo.lock"
-PYPROJECT="${ROOT_DIR}/backend/pyproject.toml"
-UV_LOCK="${ROOT_DIR}/backend/uv.lock"
-APP_MAIN="${ROOT_DIR}/backend/app/main.py"
 PKGBUILD="${ROOT_DIR}/packaging/arch/PKGBUILD"
 
 # 官方 SemVer 语法（semver.org）。拒绝 1.2、v1.2.3、01.2.3、1.2.3.4、1.2.3- 等非规范输入。
@@ -65,7 +59,7 @@ read_version() { cat "${VERSION_FILE}"; }
 # 内容未变的文件不写入，重复执行同一版本是真正的空操作。
 update_manifests() {
   local new="$1"
-  "$PYTHON_BIN" - "$new" "$CARGO_MANIFEST" "$TAURI_CONF" "$PYPROJECT" "$APP_MAIN" "$PKGBUILD" <<'PY'
+  "$PYTHON_BIN" - "$new" "$CARGO_MANIFEST" "$TAURI_CONF" "$PKGBUILD" <<'PY'
 import json
 import pathlib
 import re
@@ -91,44 +85,22 @@ def version_line(path, text):
         raise SystemExit(f"{path}: 未找到 ^version = \"...\" 声明")
     return m.group(1)
 
-# PEP 440 合法 pre 标签（uv 会把它们规范化写入 uv.lock，例如 0.3.0-rc.1 -> 0.3.0rc1）。
-PEP440_PRE = {"a", "b", "c", "rc", "alpha", "beta", "pre", "preview", "dev"}
-
-
-def pep440_write(semver):
-    """把 semver 版本映射为 PEP 440 可解析形式（用于 pyproject.toml）。
-
-    合法 pre 标签原样保留（uv 自行规范化）；其余 prerelease（如 fix1）无法用
-    PEP 440 pre 表示，映射为 local segment（0.2.1-fix1 -> 0.2.1+fix1）。
-    """
-    m = re.fullmatch(r"([0-9]+(?:\.[0-9]+)*)-(.*)", semver)
-    if not m:
-        return semver
-    release, pre = m.groups()
-    parts = pre.split(".")
-    if parts and parts[0].lower() in PEP440_PRE and all(part.isdigit() for part in parts[1:]):
-        return semver
-    return f"{release}+{pre}"
-
 def check_old(path, old):
     if not SEMVER.match(old):
         raise SystemExit(f"{path}: 当前版本不是合法 SemVer: {old!r}")
 
 results = []  # (path, original, new_content, old)
 
-# 1. Cargo.toml 与 3. pyproject.toml：^version = "..." 行
-#    pyproject.toml 使用 PEP 440 映射形式（pep440_write），其余文件保持 semver 原样。
-for index, path in ((0, paths[0]), (2, paths[2])):
-    text = load(path)
-    old = version_line(path, text)
-    check_old(path, old)
-    replacement = pep440_write(new) if index == 2 else new
-    results.append((
-        path, text,
-        re.sub(r'^(version\s*=\s*")[^"]+(")$', lambda m: m.group(1) + replacement + m.group(2),
-               text, count=1, flags=re.MULTILINE),
-        old,
-    ))
+# 1. Cargo.toml：^version = "..." 行（semver 原样）
+text = load(paths[0])
+old = version_line(paths[0], text)
+check_old(paths[0], old)
+results.append((
+    paths[0], text,
+    re.sub(r'^(version\s*=\s*")[^"]+(")$', lambda m: m.group(1) + new + m.group(2),
+           text, count=1, flags=re.MULTILINE),
+    old,
+))
 
 # 2. tauri.conf.json：顶层 version 键（保留原格式化，只替换该行）
 text = load(paths[1])
@@ -142,27 +114,15 @@ if text.count(needle) != 1:
     raise SystemExit(f"{paths[1]}: 期望恰好一个 {needle!r}，实际 {text.count(needle)} 个")
 results.append((paths[1], text, text.replace(needle, f'"version": "{new}"'), old))
 
-# 4. backend/app/main.py：FastAPI(version="...") 字面量必须恰好出现一次
-text = load(paths[3])
-m = re.search(r'FastAPI\([^)]*version="([^"]+)"', text)
-if not m:
-    raise SystemExit(f"{paths[3]}: 未找到 FastAPI(version=\"...\") 字面量")
-old = m.group(1)
-check_old(paths[3], old)
-needle = f'version="{old}"'
-if text.count(needle) != 1:
-    raise SystemExit(f"{paths[3]}: 期望恰好一个 {needle!r}，实际 {text.count(needle)} 个")
-results.append((paths[3], text, text.replace(needle, f'version="{new}"'), old))
-
-# 5. packaging/arch/PKGBUILD：pkgver 字面量（Arch 规则：无连字符；映射 - -> _）
-text = load(paths[4])
+# 3. packaging/arch/PKGBUILD：pkgver 字面量（Arch 规则：无连字符；映射 - -> _）
+text = load(paths[2])
 m = re.search(r'^pkgver=([^\n]+)', text, re.MULTILINE)
 if not m:
-    raise SystemExit(f"{paths[4]}: 未找到 pkgver= 声明")
+    raise SystemExit(f"{paths[2]}: 未找到 pkgver= 声明")
 old = m.group(1).strip()
 if not re.fullmatch(r'[A-Za-z0-9._+]+', old):
-    raise SystemExit(f"{paths[4]}: pkgver={old!r} 含非法字符（Arch pkgver 不允许连字符）")
-results.append((paths[4], text,
+    raise SystemExit(f"{paths[2]}: pkgver={old!r} 含非法字符（Arch pkgver 不允许连字符）")
+results.append((paths[2], text,
                 re.sub(r'^(pkgver=)[^\n]*',
                        lambda mm: mm.group(1) + new.replace("-", "_"),
                        text, count=1, flags=re.MULTILINE),
@@ -177,12 +137,10 @@ for path, original, content, old in results:
 PY
 }
 
-# 用 cargo/uv 各自重新解析锁文件，保证本地包记录与清单一致（非手工全文替换）。
+# 用 cargo 重新解析锁文件，保证本地包记录与清单一致（非手工全文替换）。
 update_lockfiles() {
   echo "  Cargo.lock: cargo metadata 重新解析"
   cargo metadata --manifest-path "${CARGO_MANIFEST}" --format-version 1 >/dev/null
-  echo "  uv.lock: uv lock 重新解析"
-  (cd "${ROOT_DIR}/backend" && uv lock)
 }
 
 cmd_show() {
@@ -195,14 +153,14 @@ cmd_check() {
   local version
   version="$(read_version)"
   is_semver "${version}" || die "VERSION 内容不是合法 SemVer: ${version}"
-  "$PYTHON_BIN" - "$version" "$CARGO_MANIFEST" "$CARGO_LOCK" "$TAURI_CONF" "$PYPROJECT" "$UV_LOCK" "$APP_MAIN" "$PKGBUILD" <<'PY'
+  "$PYTHON_BIN" - "$version" "$CARGO_MANIFEST" "$CARGO_LOCK" "$TAURI_CONF" "$PKGBUILD" <<'PY'
 import json
 import pathlib
 import re
 import sys
 
 expected, *paths = sys.argv[1:]
-cargo_manifest, cargo_lock, tauri_conf, pyproject, uv_lock, app_main, pkgbuild = map(pathlib.Path, paths)
+cargo_manifest, cargo_lock, tauri_conf, pkgbuild = map(pathlib.Path, paths)
 failures = []
 
 def version_line(path):
@@ -218,54 +176,13 @@ def lock_version(path):
             return m.group(1) if m else None
     return None
 
-def main_version(path):
-    text = path.read_text()
-    m = re.search(r'FastAPI\([^)]*version="([^"]+)"', text)
-    return m.group(1) if m else None
-
-def pep440_compact(v):
-    # uv.lock 存 PEP 440 规范形（如 0.3.0-rc.1 -> 0.3.0rc1），把两侧都归一化后再比较。
-    v = v.strip().lower()
-    if v.startswith("v"):
-        v = v[1:]
-    m = re.match(r"^([0-9]+(?:\.[0-9]+)*)", v)
-    release = ".".join(str(int(p)) for p in m.group(1).split("."))
-    rest = v[m.end():]
-    if not rest:
-        return release
-    m = re.match(r"^[-_.]?(a|b|c|rc|alpha|beta|pre|preview)[-_.]?([0-9]*)(.*)$", rest)
-    if m:
-        label = {"a": "a", "alpha": "a", "b": "b", "beta": "b",
-                 "c": "rc", "pre": "rc", "preview": "rc", "rc": "rc"}[m.group(1)]
-        return f"{release}{label}{m.group(2) or '0'}"
-    m = re.match(r"^[-_.]?(dev)[-_.]?([0-9]*)(.*)$", rest)
-    if m:
-        return f"{release}dev{m.group(2) or '0'}"
-    m = re.match(r"^[-_.]?(post|rev|r)[-_.]?([0-9]*)(.*)$", rest)
-    if m:
-        return f"{release}post{m.group(2) or '0'}"
-    m = re.match(r"^[-_.]?([0-9]+)(.*)$", rest)
-    if m:
-        return f"{release}post{m.group(1)}"
-    # 其余内容（+local 或非法 pre 标签如 -fix1）按 PEP 440 local segment 归一：
-    # 0.2.1-fix1 与 0.2.1+fix1 视为同一版本。
-    local = rest.lstrip("+-_).").replace("-", "").replace("_", "").lower()
-    return f"{release}+{local}"
-
 checks = [
     ("desktop/src-tauri/Cargo.toml", version_line(cargo_manifest), expected),
     ("desktop/src-tauri/Cargo.lock", lock_version(cargo_lock), expected),
     ("desktop/src-tauri/tauri.conf.json", json.loads(tauri_conf.read_text()).get("version"), expected),
-    ("backend/pyproject.toml", version_line(pyproject), expected),
-    ("backend/uv.lock", lock_version(uv_lock), pep440_compact(expected)),
-    ("backend/app/main.py", main_version(app_main), expected),
 ]
-# pyproject.toml / uv.lock 允许 PEP 440 映射（0.2.1-fix1 -> 0.2.1+fix1 / 0.2.1fix1）。
 for name, actual, want in checks:
-    ok = actual == want or (
-        name in ("backend/pyproject.toml", "backend/uv.lock")
-        and pep440_compact(actual) == pep440_compact(want)
-    )
+    ok = actual == want
     print(f"  [{'OK' if ok else 'FAIL'}] {name}: {actual if actual is not None else '(未找到)'}")
     if not ok:
         failures.append(name)
@@ -289,7 +206,6 @@ cmd_set() {
   [[ -n "$new" ]] || die "set 需要一个版本参数，如 ./scripts/version.sh set 0.3.0-rc.1"
   is_semver "$new" || die "非法 SemVer（示例：0.2.1、0.3.0-rc.1）: ${new}"
   command -v cargo >/dev/null || die "需要 cargo（用于重新解析 Cargo.lock）"
-  command -v uv >/dev/null || die "需要 uv（用于重新解析 uv.lock）"
 
   local old=""
   if [[ -f "${VERSION_FILE}" ]]; then

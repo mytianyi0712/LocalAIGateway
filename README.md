@@ -1,6 +1,6 @@
 # Local AI Gateway
 
-面向个人本地环境的多供应商 AI 透明网关。后端使用 Python，管理端使用原生 HTML、CSS 和 JavaScript，提供同协议渠道故障转移、模型自动探测、渠道熔断恢复和请求用量统计。
+面向个人本地环境的多供应商 AI 透明网关。核心网关与桌面端基于 Rust（Tauri 2），管理端使用原生 HTML、CSS 和 JavaScript，提供同协议渠道故障转移、模型自动探测、渠道熔断恢复和请求用量统计。
 
 ## 当前能力
 
@@ -77,17 +77,17 @@
 
 ## 快速启动
 
-需要 Python 3.12+ 和 [uv](https://docs.astral.sh/uv/)。
+需要 Rust 工具链（[rustup](https://rustup.rs/)）与 Tauri 2 CLI：
 
 ```bash
-make install
-cp backend/.env.example backend/.env
+cargo install --locked tauri-cli --version '^2'
+cd desktop/src-tauri && cargo tauri dev
 ```
 
-编辑 `backend/.env` 后运行：
+或仅启动无头网关（无桌面托盘，适合服务器部署）：
 
 ```bash
-make run
+cd desktop/src-tauri && cargo run --bin gateway-headless
 ```
 
 打开 [http://127.0.0.1:3000](http://127.0.0.1:3000)，信任局域网模式默认无需输入管理密钥。关闭信任后再使用设置页中的手动或随机密钥。首次配置顺序为：
@@ -144,7 +144,7 @@ Arch 包需要 `makepkg`、GTK/WebKitGTK 与 Ayatana AppIndicator 开发环境�
 
 ## 版本管理
 
-项目版本遵循 SemVer，唯一权威源是仓库根目录的 `VERSION` 文件。所有第一方版本声明都从它同步或派生：`desktop/src-tauri/Cargo.toml`、`tauri.conf.json`、`Cargo.lock`、`backend/pyproject.toml`、`uv.lock`、`backend/app/main.py` 中 FastAPI 的 `version`，以及 `packaging/arch/PKGBUILD` 的 `pkgver`（Arch 规则不允许连字符，预发布段映射为下划线，如 `0.3.0-rc.1 -> 0.3.0_rc.1`）。依赖版本、第三方锁文件条目与 `releases/` 历史产物绝不被改动。
+项目版本遵循 SemVer，唯一权威源是仓库根目录的 `VERSION` 文件。所有第一方版本声明都从它同步或派生：`desktop/src-tauri/Cargo.toml`、`tauri.conf.json`、`Cargo.lock`，以及 `packaging/arch/PKGBUILD` 的 `pkgver`（Arch 规则不允许连字符，预发布段映射为下划线，如 `0.3.0-rc.1 -> 0.3.0_rc.1`）。依赖版本、第三方锁文件条目与 `releases/` 历史产物绝不被改动。
 
 发布新版本只需一个命令：
 
@@ -154,28 +154,28 @@ make version-check                     # 本地或 CI 校验各声明一致（�
 make version                           # 查看当前版本
 ```
 
-- `set` 只接受严格 SemVer（如 `0.2.1`、`0.3.0-rc.1`），非法输入在任何写入前即失败；重复设置同一版本是幂等空操作。锁文件由 `cargo metadata` / `uv lock` 重新解析更新，不做手工全文替换。
+- `set` 只接受严格 SemVer（如 `0.2.1`、`0.3.0-rc.1`），非法输入在任何写入前即失败；重复设置同一版本是幂等空操作。锁文件由 `cargo metadata` 重新解析更新，不做手工全文替换。
 - 取舍说明：Tauri CLI 在 `tauri.conf.json` 缺省 `version` 时会回退到 Cargo.toml，但 `tauri-build` 的 Windows 可执行文件版本资源（FileVersion/ProductVersion）只读取 `tauri.conf.json`，因此保留并同步该字段，避免 Windows 构建丢失版本元数据。`PKGBUILD` 模板中的 `pkgver` 由本工具保持可读一致，构建时 `packaging/build-arch.sh` 还会从 Cargo.toml 覆盖，两条路径由 `check` 保证结果相同。
 - 自校验：`./scripts/test-version.sh`（沙箱内验证 set/check、非法输入零写入、幂等、预发布支持、锁文件解析与打包文件名版本解析，无需构建安装包）。CI 的 `desktop.yml` 在打包前也会执行 `version.sh check`，并在 tag 推送时对账 `v$(cat VERSION)`。
 
 ## 开发与验证
 
 ```bash
-make test
+cd desktop/src-tauri && cargo test
 ```
 
-后端测试使用 mock 上游验证字节一致性、四协议入口、同协议隔离、故障转移、熔断和流式响应边界，不需要真实供应商密钥。
+Rust 测试覆盖协议转换、加密与管理 API 等核心模块，使用 mock 上游验证字节一致性、同协议隔离、故障转移、熔断和流式响应边界，不需要真实供应商密钥。
 
 ## systemd 部署
 
-仓库提供 [服务模板](deploy/local-ai-gateway.service.example)。复制到 `/etc/systemd/system/local-ai-gateway.service` 后，替换 `YOUR_USER`、`YOUR_GROUP` 和 `/opt/local-ai-gateway` 为实际安装路径，再执行：
+仓库提供[服务模板](deploy/local-ai-gateway.service.example)（无头网关 `gateway-headless`，随 deb 包安装到 `/usr/bin`）。复制到 `/etc/systemd/system/local-ai-gateway.service` 后，替换 `YOUR_USER`、`YOUR_GROUP` 为实际运行用户，并确保其可读写 `AI_GATEWAY_DATA_DIR` 指向的数据目录（默认 `/var/lib/local-ai-gateway`），再执行：
 
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now local-ai-gateway
 ```
 
-运行数据库、主密钥、`.env` 和本机专用服务文件均被 Git 忽略，不会上传到远端。
+运行数据库、主密钥和本机专用服务文件均被 Git 忽略，不会上传到远端。
 
 ## 设计文档
 

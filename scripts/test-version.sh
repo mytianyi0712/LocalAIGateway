@@ -3,7 +3,7 @@
 #   - set/check 全流程与幂等性
 #   - 非法 SemVer 在任何写入前被拒绝（文件内容不变）
 #   - 预发布版本（0.3.0-rc.1）支持
-#   - Cargo.lock / uv.lock 由 cargo/uv 重新解析后与清单一致
+#   - Cargo.lock 由 cargo 重新解析后与清单一致
 #   - 打包产物文件名中的版本可解析（Arch / NSIS / deb / AppImage 命名约定）
 #   - 历史 releases/ 产物列表在测试前后不变（未被改动）
 # 用法：./scripts/test-version.sh
@@ -19,15 +19,11 @@ ok() { echo "ok: $*"; }
 # ---- 沙箱：复制受管文件，构造最小仓库 ----
 mkdir -p "${SANDBOX}/scripts" \
   "${SANDBOX}/desktop/src-tauri" \
-  "${SANDBOX}/backend/app" \
   "${SANDBOX}/packaging/arch"
 cp "${ROOT_DIR}/scripts/version.sh" "${SANDBOX}/scripts/version.sh"
 cp "${ROOT_DIR}/desktop/src-tauri/Cargo.toml" "${SANDBOX}/desktop/src-tauri/Cargo.toml"
 cp "${ROOT_DIR}/desktop/src-tauri/Cargo.lock" "${SANDBOX}/desktop/src-tauri/Cargo.lock"
 cp "${ROOT_DIR}/desktop/src-tauri/tauri.conf.json" "${SANDBOX}/desktop/src-tauri/tauri.conf.json"
-cp "${ROOT_DIR}/backend/pyproject.toml" "${SANDBOX}/backend/pyproject.toml"
-cp "${ROOT_DIR}/backend/uv.lock" "${SANDBOX}/backend/uv.lock"
-cp "${ROOT_DIR}/backend/app/main.py" "${SANDBOX}/backend/app/main.py"
 cp "${ROOT_DIR}/packaging/arch/PKGBUILD" "${SANDBOX}/packaging/arch/PKGBUILD"
 printf '%s\n' "0.2.0-fix2" > "${SANDBOX}/VERSION"
 
@@ -36,8 +32,7 @@ cd "${SANDBOX}"
 # 全部受管文件（含锁文件）的哈希快照，用于断言"写入前失败"与幂等
 snapshot() {
   sha256sum VERSION desktop/src-tauri/Cargo.toml desktop/src-tauri/tauri.conf.json \
-    desktop/src-tauri/Cargo.lock backend/pyproject.toml backend/uv.lock \
-    backend/app/main.py packaging/arch/PKGBUILD
+    desktop/src-tauri/Cargo.lock packaging/arch/PKGBUILD
 }
 
 # ---- 1. 非法 SemVer 必须在任何写入前被拒绝 ----
@@ -77,10 +72,6 @@ cargo = pathlib.Path("desktop/src-tauri/Cargo.toml").read_text()
 assert re.search(r'^version\s*=\s*"' + re.escape(v) + r'"', cargo, re.M), "Cargo.toml"
 conf = json.loads(pathlib.Path("desktop/src-tauri/tauri.conf.json").read_text())
 assert conf["version"] == v, "tauri.conf.json"
-py = pathlib.Path("backend/pyproject.toml").read_text()
-assert re.search(r'^version\s*=\s*"' + re.escape(v) + r'"', py, re.M), "pyproject.toml"
-main = pathlib.Path("backend/app/main.py").read_text()
-assert re.search(r'FastAPI\([^)]*version="' + re.escape(v) + r'"', main), "app/main.py"
 pkg = pathlib.Path("packaging/arch/PKGBUILD").read_text()
 assert re.search(r'^pkgver=0\.3\.0_rc\.1$', pkg, re.M), "PKGBUILD pkgver 应映射为 0.3.0_rc.1"
 
@@ -92,36 +83,9 @@ def lock_version(path):
             return m.group(1) if m else None
     return None
 
-def pep440_compact(v):
-    # uv.lock 存 PEP 440 规范形（如 0.3.0-rc.1 -> 0.3.0rc1）
-    v = v.strip().lower()
-    if v.startswith("v"):
-        v = v[1:]
-    m = re.match(r"^([0-9]+(?:\.[0-9]+)*)", v)
-    release = ".".join(str(int(p)) for p in m.group(1).split("."))
-    rest = v[m.end():]
-    if not rest:
-        return release
-    m = re.match(r"^[-_.]?(a|b|c|rc|alpha|beta|pre|preview)[-_.]?([0-9]*)(.*)$", rest)
-    if m:
-        label = {"a": "a", "alpha": "a", "b": "b", "beta": "b",
-                 "c": "rc", "pre": "rc", "preview": "rc", "rc": "rc"}[m.group(1)]
-        return f"{release}{label}{m.group(2) or '0'}"
-    m = re.match(r"^[-_.]?(dev)[-_.]?([0-9]*)(.*)$", rest)
-    if m:
-        return f"{release}dev{m.group(2) or '0'}"
-    m = re.match(r"^[-_.]?(post|rev|r)[-_.]?([0-9]*)(.*)$", rest)
-    if m:
-        return f"{release}post{m.group(2) or '0'}"
-    m = re.match(r"^[-_.]?([0-9]+)(.*)$", rest)
-    if m:
-        return f"{release}post{m.group(1)}"
-    return f"{release}{rest}"
-
 assert lock_version(pathlib.Path("desktop/src-tauri/Cargo.lock")) == v, "Cargo.lock"
-assert pep440_compact(lock_version(pathlib.Path("backend/uv.lock"))) == pep440_compact(v), "uv.lock"
 PY
-ok "全部第一方声明（含锁文件与 PKGBUILD 映射）为 0.3.0-rc.1"
+ok "全部第一方声明（含 Cargo.lock 与 PKGBUILD 映射）为 0.3.0-rc.1"
 
 # ---- 3. 幂等：重复 set 同一版本不产生任何写入 ----
 before="$(snapshot)"
@@ -169,7 +133,7 @@ before_releases="$(releases_snapshot)"
 releases_count="$(printf '%s' "$before_releases" | grep -c . || true)"
 ok "releases/ 历史产物列表未变（共 ${releases_count} 个文件）"
 
-# ---- 7. 真实仓库：cargo metadata 与 Python 打包元数据与 VERSION 一致（版本无关）----
+# ---- 7. 真实仓库：cargo metadata 解析版本与 VERSION 一致 ----
 real_version="$(cat "${ROOT_DIR}/VERSION")"
 cargo_version="$(
   cargo metadata --manifest-path "${ROOT_DIR}/desktop/src-tauri/Cargo.toml" --format-version 1 \
@@ -177,21 +141,5 @@ cargo_version="$(
 )"
 [[ "$cargo_version" == "$real_version" ]] || fail "cargo metadata 解析版本为 $cargo_version，VERSION 为 $real_version"
 ok "cargo metadata 解析版本 $cargo_version == VERSION"
-
-py_version="$(
-  python3 -c "import tomllib; print(tomllib.load(open('${ROOT_DIR}/backend/pyproject.toml', 'rb'))['project']['version'])"
-)"
-# pyproject.toml 使用 PEP 440 映射：非 PEP 440 pre 标签（如 fix1）写成 +local（0.2.1+fix1）。
-py_expected="$(python3 - "${real_version}" <<'PY'
-import re
-import sys
-v = sys.argv[1]
-m = re.fullmatch(r"([0-9]+(?:\.[0-9]+)*)-(.*)", v)
-print(f"{m.group(1)}+{m.group(2)}" if m else v)
-PY
-)"
-[[ "$py_version" == "$real_version" || "$py_version" == "$py_expected" ]] \
-  || fail "pyproject.toml 解析版本为 $py_version，VERSION 为 $real_version（PEP 440 映射 $py_expected）"
-ok "pyproject.toml 解析版本 $py_version == VERSION（PEP 440 映射）"
 
 echo "全部自校验通过"

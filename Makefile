@@ -1,17 +1,4 @@
-.PHONY: install build test run desktop-icons desktop-build-linux desktop-build-windows package-appimage package-arch package-windows-wine package-all version version-set version-check
-
-install:
-	cd backend && uv sync --extra test
-
-build:
-	@echo "Native frontend: no build step required"
-
-test:
-	cd backend && uv run pytest -q
-
-run:
-	cd backend && uv run alembic upgrade head
-	cd backend && uv run python -m app
+.PHONY: desktop-icons desktop-build-linux desktop-build-windows package-appimage package-arch package-windows-wine package-all version version-set version-check
 
 desktop-icons:
 	cd desktop/src-tauri && cargo tauri icon icons/icon.png
