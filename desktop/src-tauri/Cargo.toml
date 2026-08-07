@@ -44,6 +44,7 @@ serde_json = "1.0"
 sha2 = "0.10"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "chrono", "json", "migrate", "macros"] }
 tauri = { version = "2.11", features = ["tray-icon"] }
+tauri-plugin-autostart = "2"
 thiserror = "2.0"
 tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "fs"] }
 tokio-util = "0.7"
@@ -54,8 +55,14 @@ url = "2.5"
 uuid = { version = "1.17", features = ["v4", "serde"] }
 
 [profile.release]
-codegen-units = 1
-lto = "thin"
+# codegen-units is kept at the default (16) and LTO is disabled: with
+# `codegen-units = 1` (and/or `lto = "thin"`) the GNU ld on this toolchain
+# silently drops the tail command registrations (commands taking a
+# `WebviewWindow` argument) from the linked Linux binary — the debug build
+# and the MinGW (Windows) link are unaffected. The loss is invisible until
+# the missing command is invoked (e.g. the custom titlebar's minimize/close
+# buttons). Cost of disabling LTO: marginally larger binary.
+lto = false
 opt-level = 3
 panic = "abort"
 strip = true

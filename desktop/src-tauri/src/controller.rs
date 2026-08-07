@@ -136,6 +136,16 @@ impl ServerController {
         open::that(&state.url).context("无法打开系统浏览器")
     }
 
+    pub async fn start_to_tray(&self) -> bool {
+        self.config.read().await.start_to_tray
+    }
+
+    pub async fn set_start_to_tray(&self, enabled: bool) -> Result<()> {
+        let mut config = self.config.write().await;
+        config.start_to_tray = enabled;
+        config.save().await.context("无法保存启动选项")
+    }
+
     pub fn platform_data_dir(&self) -> &PathBuf {
         &self.platform_data_dir
     }

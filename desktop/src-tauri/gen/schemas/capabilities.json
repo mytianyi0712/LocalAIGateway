@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"Local AI Gateway launcher permissions","local":true,"windows":["main"],"permissions":["core:default"]}}
+{"default":{"identifier":"default","description":"Local AI Gateway launcher permissions","local":true,"windows":["main"],"permissions":["core:default","core:window:allow-start-dragging"]}}

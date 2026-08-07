@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Local AI Gateway launcher permissions",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "core:window:allow-start-dragging"]
 }

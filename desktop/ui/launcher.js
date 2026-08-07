@@ -9,6 +9,11 @@ const elements = {
   hint: document.querySelector('#port-hint'),
   open: document.querySelector('#open-dashboard'),
   form: document.querySelector('#port-form'),
+  autostart: document.querySelector('#autostart'),
+  startToTray: document.querySelector('#start-to-tray'),
+  settingsHint: document.querySelector('#settings-hint'),
+  minimize: document.querySelector('#minimize-btn'),
+  close: document.querySelector('#close-btn'),
 };
 
 let savedPort = '';
@@ -59,5 +64,38 @@ elements.form.addEventListener('submit', async (event) => {
 
 elements.open.addEventListener('click', () => withBusy(elements.open, () => invoke('open_dashboard')));
 
+elements.minimize.addEventListener('click', () => invoke('minimize_window').catch(() => {}));
+elements.close.addEventListener('click', () => invoke('close_to_tray').catch(() => {}));
+
+async function refreshSettings() {
+  const settings = await invoke('launcher_settings');
+  elements.autostart.checked = settings.autostart_enabled;
+  elements.startToTray.checked = settings.start_to_tray;
+}
+
+async function toggleSetting(invokeName, checkbox) {
+  checkbox.disabled = true;
+  try {
+    await invoke(invokeName, { enabled: checkbox.checked });
+    // The backend is the source of truth (OS autostart state, persisted config).
+    await refreshSettings();
+    elements.settingsHint.hidden = true;
+  } catch (error) {
+    elements.settingsHint.textContent = String(error);
+    elements.settingsHint.hidden = false;
+    await refreshSettings();
+  } finally {
+    checkbox.disabled = false;
+  }
+}
+
+elements.autostart.addEventListener('change', () =>
+  toggleSetting('set_autostart', elements.autostart),
+);
+elements.startToTray.addEventListener('change', () =>
+  toggleSetting('set_start_to_tray', elements.startToTray),
+);
+
+await refreshSettings();
 await refresh();
 setInterval(refresh, 1500);

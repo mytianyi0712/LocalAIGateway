@@ -140,6 +140,8 @@ make package-all            # 依次执行以上全部流程
 
 Arch 包需要 `makepkg`、GTK/WebKitGTK 与 Ayatana AppIndicator 开发环境；Windows 交叉构建需要 Wine、MinGW-w64、Rustup 和 `unzip`，脚本会自动安装 Rust Windows GNU target 并缓存便携版 NSIS。所有目标的产物会自动复制到仓库根目录的 `releases/` 文件夹（原始构建输出仍在各自的 target 目录）。发布标签也会通过 `.github/workflows/desktop.yml` 构建相同平台矩阵。
 
+桌面启动器常驻系统托盘：关闭主窗口仅隐藏到托盘，托盘菜单可重新显示或彻底退出（同时停止网关）。启动器使用内建标题栏（无系统装饰，标题栏可拖动，自带最小化与关闭按钮——Linux Wayland 下系统标题栏按钮在隐藏/恢复后会失效，故弃用），窗口内可切换**开机自启动**（Windows 注册表 Run 键 / Linux autostart desktop 项 / macOS LaunchAgent）与**启动时最小化到托盘**（下次启动不显示主窗口，仅保留托盘图标）；自启动偏好保存在数据目录的 `launcher.json`，自启动状态以操作系统实际注册为准。
+
 ## 版本管理
 
 项目版本遵循 SemVer，唯一权威源是仓库根目录的 `VERSION` 文件。所有第一方版本声明都从它同步或派生：`desktop/src-tauri/Cargo.toml`、`tauri.conf.json`、`Cargo.lock`、`backend/pyproject.toml`、`uv.lock`、`backend/app/main.py` 中 FastAPI 的 `version`，以及 `packaging/arch/PKGBUILD` 的 `pkgver`（Arch 规则不允许连字符，预发布段映射为下划线，如 `0.3.0-rc.1 -> 0.3.0_rc.1`）。依赖版本、第三方锁文件条目与 `releases/` 历史产物绝不被改动。

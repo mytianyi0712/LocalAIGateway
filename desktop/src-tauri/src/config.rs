@@ -15,6 +15,8 @@ pub struct AppConfig {
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default)]
+    pub start_to_tray: bool,
     #[serde(skip)]
     pub data_dir: PathBuf,
 }
@@ -31,6 +33,7 @@ impl Default for AppConfig {
         Self {
             host: default_host(),
             port: DEFAULT_PORT,
+            start_to_tray: false,
             data_dir: PathBuf::from("data"),
         }
     }

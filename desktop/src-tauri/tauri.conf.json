@@ -12,11 +12,13 @@
       {
         "title": "Local AI Gateway",
         "width": 560,
-        "height": 480,
+        "height": 620,
         "minWidth": 520,
-        "minHeight": 440,
+        "minHeight": 580,
         "resizable": false,
-        "center": true
+        "center": true,
+        "visible": false,
+        "decorations": false
       }
     ],
     "security": {
@@ -25,9 +27,18 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["deb", "appimage", "nsis"],
+    "targets": [
+      "deb",
+      "appimage",
+      "nsis"
+    ],
     "useLocalToolsDir": true,
-    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.ico"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
     "shortDescription": "多供应商本地 AI 网关",
     "longDescription": "跨平台的本地 AI 协议网关与路由管理工具。",
     "resources": []
