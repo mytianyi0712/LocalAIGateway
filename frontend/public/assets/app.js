@@ -1,6 +1,21 @@
-const API_ROOT = '/api/admin/v1';
-const TOKEN_KEY = 'ai-gateway-admin-token';
-const PROTOCOLS = ['openai_compatible', 'openai_responses', 'claude', 'gemini'];
+// P2-4：UI 渲染助手与 API 请求层已拆分为独立 ES module。
+import {
+  elements, icon, escapeHtml, escapeAttr, number, tokenCount, percent,
+  parseStandardTime, formatTime, formatLogTime, duration, protocols,
+  responseChannelTags, healthInfo, outcomeInfo, statusDot, button, iconButton,
+  toolbar, panel, emptyState, skeleton, toast, openModal, closeModal,
+  openDrawer, closeDrawer, confirmAction, resolveConfirmation, metric,
+  tokenMetric, settingNumberField, pageError,
+} from './ui.js';
+import { getToken, setToken, api, get, post, put, patch, remove, setUnauthorizedHandler } from './api.js';
+
+// P2-3: the protocol list is data-driven from /system/protocols (populated
+// into state.protocols at boot); this constant is only the offline fallback
+// so the UI still renders before/without the gateway.
+const FALLBACK_PROTOCOLS = ['openai_compatible', 'openai_responses', 'claude', 'gemini'];
+function protocolOptions() {
+  return (state.protocols && state.protocols.length ? state.protocols : FALLBACK_PROTOCOLS);
+}
 
 const MAPPING_KINDS = {
   claude: {
@@ -81,251 +96,49 @@ const state = {
   presets: { claude: null, codex: null },
   summary: null,
   system: null,
+  protocols: null,
   logs: { page: 1, total: 0, items: [], filters: { protocol: '', upstream_protocol: '', model_id: '', upstream_model_id: '', outcome: '' } },
   dashboard: { filters: { range: 'all', start: '', end: '' } },
   settings: null,
   generatedKeys: null,
+  recovery: null,
   drawerRoute: null,
   confirmResolve: null,
   modalMode: '',
 };
 
-const elements = {
-  page: document.getElementById('page-content'),
-  title: document.getElementById('page-title'),
-  description: document.getElementById('page-description'),
-  sideStatus: document.getElementById('side-status'),
-  sideMode: document.getElementById('side-mode'),
-  topStatus: document.getElementById('top-status'),
-  topEndpoint: document.querySelector('.topbar-endpoint'),
-  lockButton: document.getElementById('lock-button'),
-  sidebar: document.getElementById('sidebar'),
-  sidebarScrim: document.getElementById('sidebar-scrim'),
-  modal: document.getElementById('modal'),
-  modalTitle: document.getElementById('modal-title'),
-  modalBody: document.getElementById('modal-body'),
-  modalFooter: document.getElementById('modal-footer'),
-  drawer: document.getElementById('drawer'),
-  drawerTitle: document.getElementById('drawer-title'),
-  drawerSubtitle: document.getElementById('drawer-subtitle'),
-  drawerBody: document.getElementById('drawer-body'),
-  drawerFooter: document.getElementById('drawer-footer'),
-  toasts: document.getElementById('toast-region'),
-};
 
-function icon(name, className = '') {
-  return `<svg class="icon ${className}" aria-hidden="true"><use href="#i-${name}"></use></svg>`;
-}
 
-function escapeHtml(value) {
-  return String(value ?? '')
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;');
-}
 
-function escapeAttr(value) {
-  return escapeHtml(value);
-}
 
-function number(value, options = {}) {
-  if (value === null || value === undefined || value === '') return '-';
-  return Number(value).toLocaleString('zh-CN', { maximumFractionDigits: 2, ...options });
-}
 
-function tokenCount(value) {
-  if (value === null || value === undefined || value === '') return '-';
-  const amount = Number(value);
-  if (!Number.isFinite(amount)) return '-';
-  if (amount >= 1_000_000_000_000) return `${(amount / 1_000_000_000_000).toFixed(2)}T`;
-  if (amount >= 1_000_000_000) return `${(amount / 1_000_000_000).toFixed(2)}B`;
-  if (amount >= 1_000_000) return `${(amount / 1_000_000).toFixed(2)}M`;
-  if (amount >= 1_000) return `${(amount / 1_000).toFixed(2)}K`;
-  return number(amount);
-}
 
-function percent(value) {
-  if (value === null || value === undefined) return '-';
-  return `${(Number(value) * 100).toFixed(1)}%`;
-}
 
-function parseStandardTime(value) {
-  if (!value) return null;
-  const raw = String(value).trim().replace(' ', 'T');
-  const normalized = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw) ? raw : `${raw}Z`;
-  const date = new Date(normalized);
-  return Number.isNaN(date.getTime()) ? null : date;
-}
 
-function formatTime(value) {
-  const date = parseStandardTime(value);
-  return date ? date.toLocaleString('zh-CN', { hour12: false }) : '-';
-}
 
-function formatLogTime(value) {
-  const date = parseStandardTime(value);
-  if (!date) return '-';
-  const pad = (item) => String(item).padStart(2, '0');
-  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
-}
 
-function duration(value) {
-  return value === null || value === undefined ? '-' : `${number(value)} ms`;
-}
 
-function protocols(items = []) {
-  return `<div class="protocol-list">${items.map((item) => `<span class="protocol">${escapeHtml(item)}</span>`).join('')}</div>`;
-}
 
-function responseChannelTags(items = []) {
-  if (!items.length) return '<span class="log-route-empty">-</span>';
-  const routeTitle = items.join(' -> ');
-  return `<div class="protocol-list log-route-list" title="${escapeAttr(routeTitle)}">${items.map((item) => `<span class="protocol log-route-tag">${escapeHtml(item)}</span>`).join('')}</div>`;
-}
 
-function healthInfo(channel) {
-  const health = channel.health || {};
-  const raw = channel.manual_enabled === false ? 'disabled' : (health.state || 'active');
-  const labels = { active: '正常', open: '熔断', half_open: '探测中', disabled: '已禁用' };
-  const statusClass = raw === 'active' ? 'is-success' : raw === 'half_open' ? 'is-warning' : raw === 'disabled' ? 'is-muted' : 'is-danger';
-  return { label: labels[raw] || raw, statusClass, raw };
-}
 
-function outcomeInfo(outcome) {
-  const labels = { success: '成功', http_error: '上游错误', transport_error: '传输错误', upstream_error: '上游错误', gateway_error: '网关错误', stream_interrupted: '流中断', cancelled: '已取消', pending: '等待中' };
-  const statusClass = outcome === 'success' ? 'is-success' : outcome === 'pending' ? 'is-warning' : 'is-danger';
-  return { label: labels[outcome] || outcome || '-', statusClass };
-}
 
-function statusDot(label, statusClass) {
-  return `<span class="status-dot ${statusClass}"><i></i>${escapeHtml(label)}</span>`;
-}
 
-function button({ action, label, iconName, primary = false, danger = false, disabled = false, attrs = '', type = 'button' }) {
-  const classes = ['button'];
-  if (primary) classes.push('button-primary');
-  if (danger) classes.push('button-danger');
-  return `<button type="${type}" class="${classes.join(' ')}" data-action="${escapeAttr(action)}" ${disabled ? 'disabled' : ''} ${attrs}>${iconName ? icon(iconName) : ''}<span>${escapeHtml(label)}</span></button>`;
-}
 
-function iconButton({ action, iconName, label, danger = false, attrs = '', disabled = false }) {
-  return `<button type="button" class="icon-button ${danger ? 'button-danger' : ''}" data-action="${escapeAttr(action)}" aria-label="${escapeAttr(label)}" title="${escapeAttr(label)}" ${disabled ? 'disabled' : ''} ${attrs}>${icon(iconName)}</button>`;
-}
 
-function toolbar(title, note, actions) {
-  return `<div class="page-toolbar"><div class="page-toolbar-copy"><h2>${escapeHtml(title)}</h2>${note ? `<p class="toolbar-note">${escapeHtml(note)}</p>` : ''}</div><div class="action-row">${actions}</div></div>`;
-}
 
-function panel(title, note, body, className = '') {
-  return `<section class="section-panel ${className}"><header class="section-header"><h2>${escapeHtml(title)}</h2>${note ? `<span class="section-header-note">${escapeHtml(note)}</span>` : ''}</header>${body}</section>`;
-}
 
-function emptyState(title, detail, iconName = 'server') {
-  return `<div class="empty-state"><div class="empty-state-inner">${icon(iconName)}<h3>${escapeHtml(title)}</h3><p>${escapeHtml(detail)}</p></div></div>`;
-}
 
-function skeleton() {
-  return `<div class="skeleton-stack"><div class="skeleton-toolbar"></div><div class="skeleton-metrics"><div class="skeleton-card"></div><div class="skeleton-card"></div><div class="skeleton-card"></div><div class="skeleton-card"></div></div><div class="skeleton-panel"></div></div>`;
-}
 
-function getToken() {
-  return sessionStorage.getItem(TOKEN_KEY) || '';
-}
 
-function setToken(value) {
-  if (value) sessionStorage.setItem(TOKEN_KEY, value);
-  else sessionStorage.removeItem(TOKEN_KEY);
-}
 
-async function api(path, options = {}) {
-  const headers = new Headers(options.headers || {});
-  const token = getToken();
-  if (token) headers.set('Authorization', `Bearer ${token}`);
-  if (options.body && !(options.body instanceof FormData)) headers.set('Content-Type', 'application/json');
-  const response = await fetch(`${API_ROOT}${path}`, { ...options, headers });
-  if (response.status === 204) return null;
-  let body = null;
-  try {
-    body = await response.json();
-  } catch {
-    // 2xx 却无法解析为 JSON：多半是旧后端进程缺路由，请求被 SPA 回退成
-    // index.html。给出可读错误，而不是让上层报 null.items 这类 TypeError。
-    if (!response.ok) throw new Error(`请求失败 (${response.status})`);
-    throw new Error(`管理 API 返回了非 JSON 响应（HTTP ${response.status}），请确认网关已升级并重启`);
-  }
-  if (!response.ok) {
-    const error = new Error(body?.detail || body?.error?.message || `请求失败 (${response.status})`);
-    error.status = response.status;
-    error.body = body;
-    if (response.status === 401) openAuthModal();
-    throw error;
-  }
-  return body;
-}
 
-const get = (path) => api(path);
-const post = (path, body = {}) => api(path, { method: 'POST', body: JSON.stringify(body) });
-const put = (path, body = {}) => api(path, { method: 'PUT', body: JSON.stringify(body) });
-const patch = (path, body = {}) => api(path, { method: 'PATCH', body: JSON.stringify(body) });
-const remove = (path) => api(path, { method: 'DELETE' });
 
-function toast(message, type = 'success') {
-  const node = document.createElement('div');
-  node.className = `toast ${type === 'error' ? 'is-error' : type === 'warning' ? 'is-warning' : ''}`;
-  node.innerHTML = `${icon(type === 'error' ? 'x' : type === 'warning' ? 'activity' : 'check')}<span>${escapeHtml(message)}</span>`;
-  elements.toasts.append(node);
-  window.setTimeout(() => node.remove(), 4200);
-}
 
-function openModal({ title, body, footer = '', mode = '' }) {
-  if (elements.modal.open) elements.modal.close();
-  state.modalMode = mode;
-  elements.modalTitle.textContent = title;
-  elements.modalBody.innerHTML = body;
-  elements.modalFooter.innerHTML = footer;
-  elements.modal.showModal();
-}
 
-function closeModal() {
-  if (elements.modal.open) elements.modal.close();
-}
 
-function openDrawer({ title, subtitle = '', body, footer = '' }) {
-  elements.drawerTitle.textContent = title;
-  elements.drawerSubtitle.textContent = subtitle;
-  elements.drawerSubtitle.hidden = !subtitle;
-  elements.drawerBody.innerHTML = body;
-  elements.drawerFooter.innerHTML = footer;
-  elements.drawer.classList.add('is-open');
-  elements.drawer.setAttribute('aria-hidden', 'false');
-}
 
-function closeDrawer() {
-  elements.drawer.classList.remove('is-open');
-  elements.drawer.setAttribute('aria-hidden', 'true');
-  state.drawerRoute = null;
-}
 
-function confirmAction({ title, message, confirmLabel = '确认', danger = false }) {
-  return new Promise((resolve) => {
-    state.confirmResolve = resolve;
-    openModal({
-      title,
-      mode: 'confirm',
-      body: `<p class="subtle-text">${escapeHtml(message)}</p>`,
-      footer: `${button({ action: 'confirm-cancel', label: '取消' })}${button({ action: 'confirm-accept', label: confirmLabel, primary: true, danger, iconName: danger ? 'trash-2' : 'check' })}`,
-    });
-  });
-}
 
-function resolveConfirmation(value) {
-  const resolve = state.confirmResolve;
-  state.confirmResolve = null;
-  closeModal();
-  if (resolve) resolve(value);
-}
 
 function setConnection(connected, trustedLocal = false) {
   state.connected = connected;
@@ -343,6 +156,14 @@ async function checkConnection({ renderAfter = false } = {}) {
   try {
     const system = await get('/system/status');
     state.system = system;
+    // P2-3: protocol registry comes from the gateway; failures keep the
+    // fallback constant.
+    try {
+      const registry = await get('/system/protocols');
+      if (registry.items?.length) state.protocols = registry.items.map((item) => item.id);
+    } catch {
+      // Gateway too old or unreachable: the fallback list still works.
+    }
     if (elements.topEndpoint) {
       elements.topEndpoint.textContent =
         (system.host || location.hostname) + ':' + (system.port ?? (location.port || '3000'));
@@ -387,9 +208,6 @@ function closeSidebar() {
   elements.sidebarScrim.classList.remove('is-visible');
 }
 
-function pageError(error) {
-  return `<div class="page-stack">${panel('无法加载页面', '', emptyState('请求管理 API 失败', error?.message || '请检查网关服务与访问权限。', 'activity'))}</div>`;
-}
 
 async function renderPage() {
   const path = currentPath();
@@ -411,13 +229,7 @@ async function renderPage() {
   }
 }
 
-function metric(label, value, foot, className = '', iconName = 'activity') {
-  return `<article class="metric-card ${className}"><div class="metric-heading"><span class="metric-icon">${icon(iconName)}</span><span class="metric-label">${escapeHtml(label)}</span></div><strong class="metric-value">${value}</strong><p class="metric-foot">${escapeHtml(foot)}</p></article>`;
-}
 
-function tokenMetric(label, value, className = '', iconName = 'database') {
-  return `<article class="token-metric ${className}"><div class="token-metric-heading"><span class="token-metric-icon">${icon(iconName)}</span><span>${escapeHtml(label)}</span></div><strong>${value}</strong></article>`;
-}
 
 function cacheHitCard(provider, metrics) {
   const rate = metrics?.cache_hit_rate ?? null;
@@ -544,7 +356,7 @@ async function loadDashboard(version) {
   const query = dashboardQuery();
   const summaryPath = query.toString() ? `/stats/summary?${query}` : '/stats/summary';
   const [summary, channelData, system] = await Promise.all([get(summaryPath), get('/channels'), get('/system/status')]);
-  if (version !== state.renderVersion) return;
+  if (version !== state.renderVersion || currentPath() !== '/') return;
   state.summary = summary;
   state.channels = channelData.items;
   state.system = system;
@@ -603,7 +415,9 @@ function renderDashboard() {
 
 async function loadProviders(version) {
   const [providerData, channelData, modelData] = await Promise.all([get('/providers'), get('/channels'), get('/channel-models')]);
-  if (version !== state.renderVersion) return;
+  // P2-9: this loader paints the providers page; it must never paint onto
+  // another page, even when the version counter somehow still matches.
+  if (version !== state.renderVersion || currentPath() !== '/providers') return;
   state.providers = providerData.items;
   state.channels = channelData.items;
   state.channelModels = modelData.items;
@@ -670,7 +484,7 @@ function channelForm(providerId = '', editing = null) {
     body: `<form class="form-stack" id="channel-form" data-form="channel" data-channel-id="${escapeAttr(editing?.id || '')}" data-original-protocols="${escapeAttr(JSON.stringify([...selected]))}">
       <div class="field"><label for="channel-provider">供应商</label><select class="select" id="channel-provider" name="provider_id" required ${editing ? 'disabled' : ''}><option value="">请选择供应商</option>${options}</select>${editing ? `<input type="hidden" name="provider_id" value="${escapeAttr(editing.provider_id)}">` : ''}</div>
       <div class="field"><label for="channel-name">渠道名称</label><input class="input" id="channel-name" name="name" required maxlength="120" value="${escapeAttr(editing?.name || '')}" autocomplete="off"></div>
-      <fieldset class="protocol-fieldset"><legend class="fieldset-title">支持的请求格式</legend><div class="protocol-options">${PROTOCOLS.map((protocol) => `<label class="protocol-option"><input type="checkbox" name="protocols" value="${protocol}" ${selected.has(protocol) ? 'checked' : ''}>${escapeHtml(protocol)}</label>`).join('')}</div></fieldset>
+      <fieldset class="protocol-fieldset"><legend class="fieldset-title">支持的请求格式</legend><div class="protocol-options">${protocolOptions().map((protocol) => `<label class="protocol-option"><input type="checkbox" name="protocols" value="${protocol}" ${selected.has(protocol) ? 'checked' : ''}>${escapeHtml(protocol)}</label>`).join('')}</div></fieldset>
       <div class="field"><label for="channel-api-key">${editing ? 'API Key（留空则保持不变）' : 'API Key'}</label><input class="input" id="channel-api-key" name="api_key" type="password" ${editing ? '' : 'required'} autocomplete="new-password" placeholder="${escapeAttr(editing?.api_key_hint || '')}"></div>
       <div class="field"><label for="channel-health-model">健康探测模型</label><select class="select" id="channel-health-model" name="health_check_model_id"><option value="" ${editing?.health_check_model_id ? '' : 'selected'}>自动（模型列表第一个）</option>${healthModelOptions}</select><span class="field-help">熔断到期或手动探测时使用；自动模式选择该渠道模型列表中的第一个可用模型。</span></div>
     </form>`,
@@ -690,6 +504,9 @@ async function saveProvider(form) {
 }
 
 async function saveChannel(form) {
+  // P2-9: captured before any await — the reload after the write must only
+  // paint while the providers page is still the current page.
+  const ctx = captureContext();
   const values = new FormData(form);
   const protocolsValue = values.getAll('protocols');
   if (!protocolsValue.length) throw new Error('至少选择一种请求格式');
@@ -702,55 +519,69 @@ async function saveChannel(form) {
   if (channelId) {
     const original = JSON.parse(form.dataset.originalProtocols || '[]');
     const protocolsChanged = original.length !== protocolsValue.length || original.some((value) => !protocolsValue.includes(value));
-    await patch(`/channels/${channelId}`, payload);
+    // P2-3: the API key is part of ONE atomic PATCH — fields and key either
+    // all commit or none do; a rejected key can no longer leave the channel
+    // half-updated.
     const apiKey = values.get('api_key').trim();
-    if (apiKey) await put(`/channels/${channelId}/api-key`, { api_key: apiKey });
+    if (apiKey) payload.api_key = apiKey;
+    await patch(`/channels/${channelId}`, payload);
     closeModal();
     toast('渠道已更新');
-    await refreshProviders();
-    if (protocolsChanged) await discoverChannel(channelId, { quiet: true });
+    if (isCurrent(ctx)) await refreshProviders(ctx.renderVersion);
+    if (protocolsChanged && isCurrent(ctx)) await discoverChannel(channelId, { quiet: true });
   } else {
     const apiKey = values.get('api_key').trim();
     await post('/channels', { provider_id: values.get('provider_id'), ...payload, api_key: apiKey });
     closeModal();
     toast('渠道已创建');
-    await refreshProviders();
+    if (isCurrent(ctx)) await refreshProviders(ctx.renderVersion);
   }
 }
 
-async function refreshProviders() {
-  await loadProviders(state.renderVersion);
+function refreshProviders(version = state.renderVersion) {
+  return loadProviders(version);
 }
 
 async function toggleChannel(channelId, enabled) {
+  const version = state.renderVersion;
   const channel = state.channels.find((item) => item.id === channelId);
   try {
     await patch(`/channels/${channelId}`, { manual_enabled: enabled });
     if (channel) channel.manual_enabled = enabled;
     toast(enabled ? '渠道已启用' : '渠道已禁用');
-    elements.page.innerHTML = renderProvidersMarkup();
+    renderIfCurrent(version, () => {
+      elements.page.innerHTML = renderProvidersMarkup();
+    });
   } catch (error) {
     toast(error.message, 'error');
-    elements.page.innerHTML = renderProvidersMarkup();
+    renderIfCurrent(version, () => {
+      elements.page.innerHTML = renderProvidersMarkup();
+    });
   }
 }
 
 async function discoverChannel(channelId, { quiet = false } = {}) {
+  // P2-9: the write (starting the run) always completes; the poll only
+  // continues while the providers page is still current, and the final
+  // reload never paints onto another page.
+  const ctx = captureContext();
+  const version = ctx.renderVersion;
   const result = await post(`/channels/${channelId}/discover-models`);
   if (!quiet) toast('模型探测已开始');
   for (let attempt = 0; attempt < 30; attempt += 1) {
     await new Promise((resolve) => window.setTimeout(resolve, 500));
+    if (!isCurrent(ctx)) return;
     const run = await get(`/discovery-runs/${result.run_id}`);
     if (run.status === 'succeeded') {
       toast(`探测到 ${run.model_count} 个模型`);
-      await refreshProviders();
+      if (isCurrent(ctx)) await loadProviders(version);
       return;
     }
     if (run.status === 'failed') {
       throw new Error(`模型探测失败：${run.error_kind || run.status_code}`);
     }
   }
-  toast('探测仍在后台运行', 'warning');
+  if (isCurrent(ctx)) toast('探测仍在后台运行', 'warning');
 }
 
 async function probeChannel(channelId) {
@@ -770,19 +601,21 @@ function showModels(channelId) {
 }
 
 async function deleteProvider(providerId) {
+  const version = state.renderVersion;
   const provider = state.providers.find((item) => item.id === providerId);
   if (!await confirmAction({ title: '删除供应商', message: `删除供应商“${provider?.name || ''}”？其全部渠道及相关路由候选项将一并删除。`, confirmLabel: '删除', danger: true })) return;
   await remove(`/providers/${providerId}`);
   toast('供应商已删除');
-  renderPage();
+  renderIfCurrent(version, renderPage);
 }
 
 async function deleteChannel(channelId) {
+  const version = state.renderVersion;
   const channel = state.channels.find((item) => item.id === channelId);
   if (!await confirmAction({ title: '删除渠道', message: `删除渠道“${channel?.name || ''}”？该渠道的模型和相关路由候选项将一并删除。`, confirmLabel: '删除', danger: true })) return;
   await remove(`/channels/${channelId}`);
   toast('渠道已删除');
-  renderPage();
+  renderIfCurrent(version, renderPage);
 }
 
 function routeOptions() {
@@ -796,7 +629,7 @@ function routeOptions() {
 
 async function loadRoutes(version) {
   const [routeData, modelData, profileData] = await Promise.all([get('/routes'), get('/channel-models'), get('/capability-profiles')]);
-  if (version !== state.renderVersion) return;
+  if (version !== state.renderVersion || currentPath() !== '/routes') return;
   state.routes = routeData.items;
   state.channelModels = modelData.items;
   state.profiles = profileData.items || [];
@@ -841,12 +674,16 @@ function routeForm() {
 }
 
 async function saveRoute(form) {
+  const ctx = captureContext();
   const requestedModelId = new FormData(form).get('requested_model_id');
   if (!requestedModelId) throw new Error('请选择模型');
   const created = await post('/routes', { requested_model_id: requestedModelId });
   closeModal();
   toast('模型路由已创建');
-  await loadRoutes(state.renderVersion);
+  // P2-9: the reload and the drawer only run on the page this mutation
+  // started from.
+  if (!isCurrent(ctx)) return;
+  await loadRoutes(ctx.renderVersion);
   openCandidates(created.id);
 }
 
@@ -948,6 +785,7 @@ function formBoolOrNull(values, name) {
 }
 
 async function saveCapabilities(form) {
+  const ctx = captureContext();
   const route = state.drawerRoute;
   if (!route) return;
   const values = new FormData(form);
@@ -976,10 +814,12 @@ async function saveCapabilities(form) {
   await put(`/model-capabilities/${encodeURIComponent(route.requested_model_id)}`, payload);
   closeDrawer();
   toast('模型能力已保存');
-  await loadRoutes(state.renderVersion);
+  // P2-9: the reload never paints onto a page the user navigated to.
+  if (isCurrent(ctx)) await loadRoutes(ctx.renderVersion);
 }
 
 async function detectCapabilities() {
+  const ctx = captureContext();
   const route = state.drawerRoute;
   if (!route) return;
   const capabilities = await post(`/model-capabilities/detect/${encodeURIComponent(route.requested_model_id)}`);
@@ -991,7 +831,7 @@ async function detectCapabilities() {
   });
   refreshCapsPreview();
   toast('已重新聚合上游能力，结果已显示在下方表单中');
-  await loadRoutes(state.renderVersion);
+  if (isCurrent(ctx)) await loadRoutes(ctx.renderVersion);
 }
 
 function openCandidates(routeId) {
@@ -1027,6 +867,7 @@ function openCandidates(routeId) {
 }
 
 async function saveCandidates() {
+  const ctx = captureContext();
   const route = state.drawerRoute;
   if (!route) return;
   const candidates = [...elements.drawerBody.querySelectorAll('[data-candidate-row]')]
@@ -1039,7 +880,7 @@ async function saveCandidates() {
   await put(`/routes/${route.id}/candidates`, { candidates });
   closeDrawer();
   toast('候选顺序已保存');
-  await loadRoutes(state.renderVersion);
+  if (isCurrent(ctx)) await loadRoutes(ctx.renderVersion);
 }
 
 function updateCandidateOrder() {
@@ -1080,7 +921,7 @@ function profileCapabilitySummary(profile) {
 
 async function loadProfiles(version) {
   const data = await get('/capability-profiles');
-  if (version !== state.renderVersion) return;
+  if (version !== state.renderVersion || currentPath() !== '/profiles') return;
   state.profiles = data.items || [];
   elements.page.innerHTML = renderProfilesPage();
 }
@@ -1116,6 +957,7 @@ function profileForm(profile = null) {
 }
 
 async function saveProfile(form) {
+  const ctx = captureContext();
   const values = new FormData(form);
   const name = String(values.get('name') || '').trim();
   if (!name) throw new Error('请填写档案名称');
@@ -1137,7 +979,7 @@ async function saveProfile(form) {
     reasoning: formBoolOrNull(values, 'reasoning'),
     thinking_level_map: thinkingLevelMap,
   };
-  if (state.modalMode === 'profile-edit') {
+  if (getModalMode() === 'profile-edit') {
     const profile = state.profiles.find((item) => item.id === form.dataset.profileId);
     if (!profile) throw new Error('档案不存在');
     await put(`/capability-profiles/${profile.id}`, payload);
@@ -1147,15 +989,16 @@ async function saveProfile(form) {
     toast('能力档案已创建');
   }
   closeModal();
-  await loadProfiles(state.renderVersion);
+  if (isCurrent(ctx)) await loadProfiles(ctx.renderVersion);
 }
 
 async function deleteProfile(profileId) {
+  const ctx = captureContext();
   const profile = state.profiles.find((item) => item.id === profileId);
   if (!await confirmAction({ title: '删除能力档案', message: `删除档案“${profile?.name || ''}”？引用它的模型将解除绑定（已应用的能力值保留）。`, confirmLabel: '删除', danger: true })) return;
   await remove(`/capability-profiles/${profileId}`);
   toast('能力档案已删除');
-  await loadProfiles(state.renderVersion);
+  if (isCurrent(ctx)) await loadProfiles(ctx.renderVersion);
 }
 
 function profileSelectOptions(selectedId) {
@@ -1253,7 +1096,7 @@ async function loadMappings(version) {
   const kind = mappingKindForPath(state.currentPath);
   const config = MAPPING_KINDS[kind];
   const [mappingData, modelData, presetData, routeData] = await Promise.all([get(config.api), get('/channel-models'), get(config.presetsApi), get('/routes')]);
-  if (version !== state.renderVersion) return;
+  if (version !== state.renderVersion || !['/mappings', '/codex-mappings'].includes(currentPath())) return;
   state.mappingKind = kind;
   state.mappings[kind] = mappingData?.items || [];
   state.channelModels = modelData?.items || [];
@@ -1312,7 +1155,7 @@ function mappingForm(editing = null) {
   const currentProtocol = editing?.upstream_protocol || 'openai_compatible';
   const protocolOptions = protocols.map((protocol) => `<option value="${protocol}" ${currentProtocol === protocol ? 'selected' : ''}>${escapeHtml(protocolLabel(protocol))}</option>`).join('');
   const presets = state.presets[kind]?.items || [];
-  const presetOptions = presets.map((preset) => `<option value="${escapeAttr(preset.id)}">${escapeHtml(preset.display_name || preset.id)}</option>`).join('');
+  const presetOptions = presetOptionsOf(state.presets[kind]);
   openModal({
     title: editing ? '编辑模型映射' : '新建模型映射',
     mode: editing ? 'mapping-edit' : 'mapping-create',
@@ -1328,6 +1171,7 @@ function mappingForm(editing = null) {
 }
 
 async function saveMapping(form) {
+  const ctx = captureContext();
   const kind = state.mappingKind;
   const config = MAPPING_KINDS[kind];
   const values = new FormData(form);
@@ -1347,7 +1191,7 @@ async function saveMapping(form) {
   }
   closeModal();
   toast(mappingId ? '映射已更新' : '映射已创建，候选渠道继承上游模型路由');
-  await loadMappings(state.renderVersion);
+  if (isCurrent(ctx)) await loadMappings(ctx.renderVersion);
 }
 
 
@@ -1361,26 +1205,83 @@ async function deleteMapping(mappingId) {
   renderPage();
 }
 
+// 预设刷新去重:一次刷新流程进行中时忽略重复点击 (P1-5)。
+let presetRefreshInFlight = false;
+
 async function refreshPresets() {
+  if (presetRefreshInFlight) return;
+  presetRefreshInFlight = true;
   const kind = state.mappingKind;
   const config = MAPPING_KINDS[kind];
+  const version = state.renderVersion;
   try {
-    await post(`${config.presetsApi}/refresh`);
-    toast('预设刷新已开始，正在查询上游渠道…');
-    await new Promise((resolve) => window.setTimeout(resolve, 2500));
-    state.presets[kind] = await get(config.presetsApi);
-    if (state.presets[kind]?.source === 'channels') toast(`已从上游渠道更新预设（${state.presets[kind]?.items?.length ?? 0} 个）`);
-    else toast('未发现可用的上游渠道，保留内置预设', 'warning');
-    const select = document.getElementById('mapping-preset');
-    if (select) {
+    let queued;
+    try {
+      queued = await post(`${config.presetsApi}/refresh`);
+    } catch (error) {
+      // 无可用渠道时后端返回明确 409,不得假装 queued (P1-5)。
+      toast(error.message || '预设刷新失败', 'error');
+      return;
+    }
+    const runIds = queued?.run_ids || [];
+    if (!runIds.length) return;
+    toast(`已排队 ${runIds.length} 个渠道的模型探测，完成后自动更新预设…`);
+    // 轮询每个 run 的终态;用户导航离开或关闭弹窗后立即放弃,
+    // 不覆盖新页面 (P1-5)。
+    const results = await pollDiscoveryRuns(runIds, () =>
+      version !== state.renderVersion || !document.getElementById('mapping-form'));
+    if (results === null) return;
+    const succeeded = results.filter((run) => run.status === 'succeeded').length;
+    const failed = results.length - succeeded;
+    if (failed === 0) {
+      toast(`预设已刷新（${succeeded} 个渠道）`);
+    } else if (succeeded > 0) {
+      toast(`预设部分刷新：成功 ${succeeded}，失败 ${failed}`, 'warning');
+    } else {
+      toast('所有渠道模型探测失败，请检查渠道配置', 'error');
+    }
+    // 重新拉取预设并刷新弹窗里的下拉框。
+    const presetData = await get(config.presetsApi);
+    if (version !== state.renderVersion || !document.getElementById('mapping-form')) return;
+    state.presets[kind] = presetData;
+    const select = document.querySelector('#mapping-preset');
+    if (select && !select.disabled) {
       const current = select.value;
-      const options = (state.presets[kind]?.items || []).map((preset) => `<option value="${escapeAttr(preset.id)}">${escapeHtml(preset.display_name || preset.id)}</option>`).join('');
-      select.innerHTML = `<option value="">-- 手动输入或从预设中选择 --</option>${options}`;
-      select.value = current;
+      select.innerHTML = `<option value="">-- 手动输入或从预设中选择 --</option>${presetOptionsOf(presetData)}`;
+      if (current) select.value = current;
     }
   } catch (error) {
     toast(error.message || '预设刷新失败', 'error');
+  } finally {
+    presetRefreshInFlight = false;
   }
+}
+
+function presetOptionsOf(presetData) {
+  return (presetData?.items || [])
+    .map((preset) => `<option value="${escapeAttr(preset.id)}">${escapeHtml(preset.display_name || preset.id)}</option>`)
+    .join('');
+}
+
+// 轮询 discovery runs 直到全部到达终态。页面上下文已消失(导航/关闭
+// 弹窗)时返回 null。
+async function pollDiscoveryRuns(runIds, gone) {
+  const terminal = new Map();
+  while (terminal.size < runIds.length) {
+    if (gone()) return null;
+    await Promise.all(runIds.filter((id) => !terminal.has(id)).map(async (id) => {
+      try {
+        const run = await get(`/discovery-runs/${id}`);
+        if (run.status === 'succeeded' || run.status === 'failed') terminal.set(id, run);
+      } catch {
+        // 单次轮询失败不终止流程,下一轮重试。
+      }
+    }));
+    if (terminal.size < runIds.length) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  }
+  return [...terminal.values()];
 }
 
 async function copyEntryUrl(url) {
@@ -1399,7 +1300,7 @@ async function loadLogs(version) {
   const query = new URLSearchParams({ page: String(page), page_size: '50' });
   Object.entries(filters).forEach(([key, value]) => { if (value) query.set(key, value); });
   const data = await get(`/requests?${query}`);
-  if (version !== state.renderVersion) return;
+  if (version !== state.renderVersion || currentPath() !== '/logs') return;
   state.logs = { ...state.logs, items: data.items, total: data.total, page: data.page };
   elements.page.innerHTML = renderLogsPage();
 }
@@ -1424,8 +1325,8 @@ function renderLogsPage() {
   return `<div class="page-stack">
     ${toolbar('请求与渠道尝试', '查看每一次请求的结果、响应时间与上游尝试', button({ action: 'refresh-logs', label: '刷新', iconName: 'refresh-cw' }))}
     ${panel('请求记录', '', `<form class="filter-bar" data-form="logs-filter"><span class="filter-label">筛选条件</span>
-      <select class="select" name="protocol" aria-label="入口协议"><option value="">全部入口协议</option>${PROTOCOLS.map((protocol) => `<option value="${protocol}" ${filters.protocol === protocol ? 'selected' : ''}>${protocol}</option>`).join('')}</select>
-      <select class="select" name="upstream_protocol" aria-label="上游协议"><option value="">全部上游协议</option>${PROTOCOLS.map((protocol) => `<option value="${protocol}" ${filters.upstream_protocol === protocol ? 'selected' : ''}>${protocol}</option>`).join('')}</select>
+      <select class="select" name="protocol" aria-label="入口协议"><option value="">全部入口协议</option>${protocolOptions().map((protocol) => `<option value="${protocol}" ${filters.protocol === protocol ? 'selected' : ''}>${protocol}</option>`).join('')}</select>
+      <select class="select" name="upstream_protocol" aria-label="上游协议"><option value="">全部上游协议</option>${protocolOptions().map((protocol) => `<option value="${protocol}" ${filters.upstream_protocol === protocol ? 'selected' : ''}>${protocol}</option>`).join('')}</select>
       <input class="input" name="model_id" value="${escapeAttr(filters.model_id)}" placeholder="请求模型" aria-label="请求模型" autocomplete="off">
       <input class="input" name="upstream_model_id" value="${escapeAttr(filters.upstream_model_id)}" placeholder="上游模型" aria-label="上游模型" autocomplete="off">
       <select class="select is-outcome" name="outcome" aria-label="请求结果"><option value="">全部结果</option>${['success', 'upstream_error', 'gateway_error', 'stream_interrupted', 'cancelled'].map((outcome) => `<option value="${outcome}" ${filters.outcome === outcome ? 'selected' : ''}>${outcomeInfo(outcome).label}</option>`).join('')}</select>
@@ -1458,21 +1359,110 @@ function openRequestLog(requestId) {
 }
 
 async function loadSettings(version) {
-  const settings = await get('/settings');
-  if (version !== state.renderVersion) return;
+  let settings;
+  try {
+    settings = await get('/settings');
+  } catch (error) {
+    if (version !== state.renderVersion || currentPath() !== '/settings') return;
+    if (error.body?.code === 'config_corrupted') {
+      // P1-3: 管理面因持久化配置损坏而 fail-closed。区分两种来源:
+      // 访问密钥损坏 → 密钥恢复页;运行时设置损坏 → 修复表单。
+      try {
+        const status = await get('/settings/access-keys/status');
+        if (version !== state.renderVersion || currentPath() !== '/settings') return;
+        state.recovery = status;
+        if (status.admin_key_status === 'corrupt' || status.gateway_key_status === 'corrupt') {
+          elements.page.innerHTML = renderRecoveryPage(status);
+          return;
+        }
+        state.settingsRepair = true;
+        state.settingsCorruptKeys = status.config_corrupted_keys || [];
+        elements.page.innerHTML = renderSettingsRepairPage();
+        return;
+      } catch {
+        elements.page.innerHTML = pageError(error);
+        return;
+      }
+    }
+    throw error;
+  }
+  if (version !== state.renderVersion || currentPath() !== '/settings') return;
   state.settings = settings;
   elements.page.innerHTML = renderSettingsPage();
 }
 
-function settingNumberField(name, label, value, min, max) {
-  return `<div class="field"><label for="setting-${name}">${escapeHtml(label)}</label><input class="number-input" id="setting-${name}" name="${name}" type="number" min="${min}" max="${max}" step="1" value="${number(value)}" required></div>`;
+function renderRecoveryPage(status) {
+  const keys = state.generatedKeys;
+  const corruptCount = [status.admin_key_status, status.gateway_key_status].filter((value) => value === 'corrupt').length;
+  const generated = keys ? `<div class="generated-keys"><div class="generated-key"><span>管理密钥</span><code>${escapeHtml(keys.admin_access_key)}</code>${iconButton({ action: 'copy-key', iconName: 'copy', label: '复制管理密钥', attrs: 'data-key-name="admin_access_key"' })}</div><div class="generated-key"><span>代理密钥</span><code>${escapeHtml(keys.gateway_access_key)}</code>${iconButton({ action: 'copy-key', iconName: 'copy', label: '复制代理密钥', attrs: 'data-key-name="gateway_access_key"' })}</div></div>` : '';
+  return `<div class="settings-stack">
+    ${toolbar('访问密钥已损坏', '管理端访问密钥无法解密，已进入恢复模式', `${button({ action: 'refresh-settings', label: '重试', iconName: 'refresh-cw' })}${button({ action: 'generate-keys', label: '随机生成两组密钥', iconName: 'key-round', primary: true })}`)}
+    ${panel('密钥恢复', '仅本机可执行，恢复后管理界面立即解锁', `<div class="section-body"><div class="notice is-error">检测到 ${corruptCount} 组访问密钥损坏，无法解密。点击"随机生成两组密钥"将原子地重新生成两组密钥，并立即恢复管理端访问。</div>${generated}</div></div>`, 'settings-panel')}
+  </div>`;
+}
+
+/// P1-3: 运行时设置损坏时的修复表单——经恢复模式端点(loopback + nonce)
+/// 原子重写损坏行,不接收访问密钥。初始值取默认值并明确提示。
+function renderSettingsRepairPage() {
+  const settings = { ...SETTINGS_DEFAULTS };
+  const corruptKeys = (state.settingsCorruptKeys || []).map(escapeHtml).join('、');
+  return `<form class="settings-stack" id="settings-form" data-form="settings">
+    ${toolbar('设置数据已损坏', '仅本机可修复', `${button({ action: 'submit-settings', label: '保存修复', iconName: 'check', primary: true })}`)}
+    ${panel('修复提示', '损坏的设置项无法安全读取', `<div class="section-body"><div class="notice is-error">检测到运行时设置数据损坏${corruptKeys ? `（${corruptKeys}）` : ''}，已锁定管理面与代理鉴权。请逐项确认下方设置（已预填默认值）并保存，将原子地覆盖损坏数据并立即恢复访问。</div></div>`, 'settings-panel')}
+    ${panel('局域网访问', '默认信任局域网请求', `<div class="section-body"><div class="form-stack"><div class="switch-row"><div class="switch-copy"><strong>信任局域网访问</strong><p id="trust-description">${settings.trust_local_network ? '代理和管理员界面不要求密钥' : '代理和管理员界面要求对应密钥'}</p></div><input class="switch-control" id="trust-local-network" name="trust_local_network" type="checkbox" aria-label="信任局域网访问" data-trust-toggle ${settings.trust_local_network ? 'checked' : ''}></div></div></div>`, 'settings-panel')}
+    ${settingsSectionsHtml(settings)}
+  </form>`;
+}
+
+
+// 设置表单 schema (P1-7): 一份定义同时驱动渲染、提交载荷与前端范围
+// 校验——新增字段不可能只接入一半。
+const SETTINGS_SECTIONS = [
+  { id: 'fault', title: '故障转移', note: '优先级路由与自动熔断', grid: '',
+    fields: [['failure_threshold', '连续失败阈值', 1, 20], ['circuit_open_seconds', '熔断时间（秒）', 30, 86400], ['max_failover_attempts', '最大渠道尝试', 1, 20]] },
+  { id: 'timeout', title: '超时', note: '上游连接与响应期限', grid: '',
+    fields: [['connect_timeout_seconds', '连接超时（秒）', 1, 120], ['first_byte_timeout_seconds', '首字节超时（秒）', 1, 600], ['first_token_timeout_seconds', '首 Token 超时（秒）', 1, 600], ['stream_idle_timeout_seconds', '流式空闲超时（秒）', 10, 3600], ['non_stream_total_timeout_seconds', '非流式总超时（秒）', 10, 3600]] },
+  { id: 'limits', title: '请求限制', note: '代理请求体与上游响应缓冲上限', grid: '', help: '映射转换等必须整体缓冲的上游响应硬上限；超过返回 502。流式转发不受此限制。',
+    fields: [['max_request_body_mb', '最大请求体（MiB）', 1, 1024], ['max_buffered_upstream_body_mb', '上游响应缓冲上限（MiB）', 1, 1024]] },
+  { id: 'maintenance', title: '维护', note: '周期任务与数据保留', grid: 'is-two',
+    fields: [['model_discovery_interval_hours', '模型探测周期（小时）', 1, 168], ['log_retention_days', '日志保留（天）', 1, 365]] },
+];
+
+// 设置损坏修复表单的初始值,与后端 RuntimeSettings::default() 一致
+// (P1-3)。损坏行无法安全读取,因此修复表单从这些默认值开始。
+const SETTINGS_DEFAULTS = {
+  trust_local_network: true,
+  failure_threshold: 3,
+  circuit_open_seconds: 900,
+  max_failover_attempts: 3,
+  connect_timeout_seconds: 10,
+  first_byte_timeout_seconds: 60,
+  first_token_timeout_seconds: 60,
+  stream_idle_timeout_seconds: 300,
+  non_stream_total_timeout_seconds: 600,
+  max_request_body_mb: 256,
+  max_buffered_upstream_body_mb: 64,
+  model_discovery_interval_hours: 24,
+  log_retention_days: 30,
+};
+
+function settingsSectionsHtml(settings) {
+  return SETTINGS_SECTIONS.map((section) => {
+    const fields = section.fields.map(([name, label, min, max]) =>
+      settingNumberField(name, label, settings[name], min, max)).join('');
+    const help = section.help ? `<span class="field-help">${escapeHtml(section.help)}</span>` : '';
+    return panel(section.title, section.note,
+      `<div class="section-body"><div class="form-grid ${section.grid}">${fields}${help}</div></div>`,
+      'settings-panel');
+  }).join('');
 }
 
 function renderSettingsPage() {
   const settings = state.settings || {};
   const keys = state.generatedKeys;
-  const keyBlock = `<div class="access-keys" id="access-keys" ${settings.trust_local_network ? 'hidden' : ''}>
+  const keyBlock = `<div class="access-keys" id="access-keys" ${settings.trust_local_network && settings.admin_key_status !== 'corrupt' && settings.gateway_key_status !== 'corrupt' ? 'hidden' : ''}>
       <div class="notice">关闭信任后，保存设置会立即启用密钥校验。留空表示保留现有密钥。</div>
+      ${settings.admin_key_status === 'corrupt' || settings.gateway_key_status === 'corrupt' ? '<div class="notice is-error">访问密钥数据损坏，请点击"随机生成两组密钥"恢复访问控制。</div>' : ''}
       <div class="form-grid is-two">
         <div class="field"><label for="admin-access-key">管理密钥</label><input class="input" id="admin-access-key" name="admin_access_key" type="password" autocomplete="new-password" placeholder="${escapeAttr(settings.admin_key_hint || '手动输入或使用随机生成')}"></div>
         <div class="field"><label for="gateway-access-key">代理密钥</label><input class="input" id="gateway-access-key" name="gateway_access_key" type="password" autocomplete="new-password" placeholder="${escapeAttr(settings.gateway_key_hint || '手动输入或使用随机生成')}"></div>
@@ -1482,32 +1472,57 @@ function renderSettingsPage() {
     </div>`;
   return `<form class="settings-stack" id="settings-form" data-form="settings">
     ${toolbar('访问与运行参数', '配置局域网信任、故障转移与运行时限制', `${button({ action: 'refresh-settings', label: '还原', iconName: 'refresh-cw' })}${button({ action: 'submit-settings', label: '保存设置', iconName: 'check', primary: true })}`)}
-    ${panel('局域网访问', '默认信任局域网请求', `<div class="section-body"><div class="form-stack"><div class="switch-row"><div class="switch-copy"><strong>信任局域网访问</strong><p id="trust-description">${settings.trust_local_network ? '代理和管理员界面不要求密钥' : '代理和管理员界面要求对应密钥'}</p></div><input class="switch-control" id="trust-local-network" name="trust_local_network" type="checkbox" aria-label="信任局域网访问" data-trust-toggle ${settings.trust_local_network ? 'checked' : ''}></div>${keyBlock}</div></div>`, 'settings-panel')}
-    ${panel('故障转移', '优先级路由与自动熔断', `<div class="section-body"><div class="form-grid">${settingNumberField('failure_threshold', '连续失败阈值', settings.failure_threshold, 1, 20)}${settingNumberField('circuit_open_seconds', '熔断时间（秒）', settings.circuit_open_seconds, 30, 86400)}${settingNumberField('max_failover_attempts', '最大渠道尝试', settings.max_failover_attempts, 1, 20)}</div></div>`, 'settings-panel')}
-    ${panel('超时', '上游连接与响应期限', `<div class="section-body"><div class="form-grid">${settingNumberField('connect_timeout_seconds', '连接超时（秒）', settings.connect_timeout_seconds, 1, 120)}${settingNumberField('first_byte_timeout_seconds', '首字节超时（秒）', settings.first_byte_timeout_seconds, 1, 600)}${settingNumberField('first_token_timeout_seconds', '首 Token 超时（秒）', settings.first_token_timeout_seconds, 1, 600)}${settingNumberField('stream_idle_timeout_seconds', '流式空闲超时（秒）', settings.stream_idle_timeout_seconds, 10, 3600)}${settingNumberField('non_stream_total_timeout_seconds', '非流式总超时（秒）', settings.non_stream_total_timeout_seconds, 10, 3600)}</div></div>`, 'settings-panel')}
-    ${panel('维护', '周期任务与数据保留', `<div class="section-body"><div class="form-grid is-two">${settingNumberField('model_discovery_interval_hours', '模型探测周期（小时）', settings.model_discovery_interval_hours, 1, 168)}${settingNumberField('log_retention_days', '日志保留（天）', settings.log_retention_days, 1, 365)}</div></div>`, 'settings-panel')}
+    ${panel('局域网访问', '默认信任局域网请求', `<div class="section-body"><div class="form-stack"><div class="switch-row"><div class="switch-copy"><strong>信任局域网访问</strong><p id="trust-description">${settings.trust_local_network ? '代理和管理员界面不要求密钥' : '代理和管理员界面要求对应密钥'}</p></div><input class="switch-control" id="trust-local-network" name="trust_local_network" type="checkbox" aria-label="信任局域网访问" data-trust-toggle ${settings.trust_local_network ? 'checked' : ''}></div>${settings.config_corrupted_keys?.length ? `<div class="notice is-error">以下设置项数据损坏（已显示默认值），重新填写并保存即可修复：${settings.config_corrupted_keys.map(escapeHtml).join('、')}</div>` : ''}${keyBlock}</div></div>`, 'settings-panel')}
+    ${settingsSectionsHtml(settings)}
   </form>`;
 }
 
 async function saveSettings(form) {
+  const version = state.renderVersion;
   const values = new FormData(form);
   const payload = {
     trust_local_network: values.get('trust_local_network') === 'on',
-    failure_threshold: Number(values.get('failure_threshold')),
-    circuit_open_seconds: Number(values.get('circuit_open_seconds')),
-    max_failover_attempts: Number(values.get('max_failover_attempts')),
-    connect_timeout_seconds: Number(values.get('connect_timeout_seconds')),
-    first_byte_timeout_seconds: Number(values.get('first_byte_timeout_seconds')),
-    first_token_timeout_seconds: Number(values.get('first_token_timeout_seconds')),
-    stream_idle_timeout_seconds: Number(values.get('stream_idle_timeout_seconds')),
-    non_stream_total_timeout_seconds: Number(values.get('non_stream_total_timeout_seconds')),
-    model_discovery_interval_hours: Number(values.get('model_discovery_interval_hours')),
-    log_retention_days: Number(values.get('log_retention_days')),
   };
+  // P1-7: the payload is generated from the SAME schema that renders the
+  // fields, and each value is range-checked client-side before the PATCH
+  // (the backend 422 stays as the second gate).
+  for (const [name, , min, max] of SETTINGS_SECTIONS.flatMap((section) => section.fields)) {
+    const raw = values.get(name);
+    const number = Number(raw);
+    if (!Number.isInteger(number) || number < min || number > max) {
+      toast(`设置 ${name} 必须在 ${min}–${max} 之间`, 'error');
+      return;
+    }
+    payload[name] = number;
+  }
   const adminKey = values.get('admin_access_key')?.trim();
   const gatewayKey = values.get('gateway_access_key')?.trim();
   if (adminKey) payload.admin_access_key = adminKey;
   if (gatewayKey) payload.gateway_access_key = gatewayKey;
+  if (state.settingsRepair) {
+    // P1-3: 设置损坏修复——loopback + 一次性 nonce 门控,不接收访问密钥。
+    try {
+      await patch('/settings/recovery-repair', payload, {
+        headers: { 'x-recovery-nonce': state.recovery?.recovery_nonce },
+      });
+    } catch (error) {
+      if (error.status === 401) {
+        // nonce 已失效(一次性/过期):重新进入恢复流程换取新 nonce。
+        state.settingsRepair = false;
+        state.settingsCorruptKeys = null;
+        await loadSettings(version);
+        toast('修复凭据已过期，请重新确认后保存', 'error');
+        return;
+      }
+      throw error;
+    }
+    state.settingsRepair = false;
+    state.settingsCorruptKeys = null;
+    toast('设置已修复');
+    await checkConnection();
+    renderIfCurrent(version, renderPage);
+    return;
+  }
   await patch('/settings', payload);
   if (!payload.trust_local_network) {
     const effectiveAdminKey = adminKey || state.generatedKeys?.admin_access_key;
@@ -1516,14 +1531,43 @@ async function saveSettings(form) {
   state.generatedKeys = null;
   toast('运行设置已保存');
   await checkConnection();
-  renderPage();
+  renderIfCurrent(version, renderPage);
 }
 
 async function generateKeys() {
-  const result = await post('/settings/access-keys/generate');
+  const version = state.renderVersion;
+  // P1-4: while in recovery mode the generate endpoint demands the
+  // one-time challenge issued with the recovery status; it is single-use,
+  // so a failure means re-entering recovery and getting a fresh one.
+  const nonce = state.recovery?.recovery_nonce;
+  const options = nonce ? { headers: { 'x-recovery-nonce': nonce } } : {};
+  let result;
+  try {
+    result = await api('/settings/access-keys/generate', { method: 'POST', body: '{}', ...options });
+  } catch (error) {
+    if (state.recovery) {
+      state.recovery = null;
+      await loadSettings(version);
+      toast(error.message || '生成失败，请重试', 'error');
+      return;
+    }
+    throw error;
+  }
   state.generatedKeys = result;
+  if (state.recovery) {
+    // Recovery mode: the keys are valid again — adopt the fresh admin key
+    // and reload the full settings page.
+    state.recovery = null;
+    setToken(result.admin_access_key);
+    await loadSettings(version);
+    toast('密钥已生成，请立即复制并保存', 'warning');
+    return;
+  }
+  if (version !== state.renderVersion) return;
   state.settings.trust_local_network = false;
-  elements.page.innerHTML = renderSettingsPage();
+  renderIfCurrent(version, () => {
+    elements.page.innerHTML = renderSettingsPage();
+  });
   toast('密钥已生成，请立即复制并保存', 'warning');
 }
 
@@ -1538,8 +1582,23 @@ async function copyKey(name) {
   }
 }
 
+function renderIfCurrent(version, render) {
+  if (version === state.renderVersion) render();
+}
+
+// P2-9: a mutation captures the page context when it starts; navigation
+// invalidates it. The data write still completes, but any reload/render the
+// mutation triggers afterwards only runs while the same page is still
+// current — a stale action can never paint its markup onto another page.
+function captureContext() {
+  return { path: currentPath(), renderVersion: state.renderVersion };
+}
+function isCurrent(context) {
+  return context.renderVersion === state.renderVersion && context.path === currentPath();
+}
+
 function openAuthModal() {
-  if (elements.modal.open && state.modalMode === 'auth') return;
+  if (elements.modal.open && getModalMode() === 'auth') return;
   openModal({
     title: '连接本地网关',
     mode: 'auth',
@@ -1699,6 +1758,8 @@ function handleChange(event) {
   if (target.closest('[data-form="caps"]')) refreshCapsPreview();
 }
 
+setUnauthorizedHandler(() => { if (!state.recovery) openAuthModal(); });
+
 document.addEventListener('click', (event) => {
   const routeLink = event.target.closest('[data-route]');
   if (routeLink) {
@@ -1756,9 +1817,11 @@ document.addEventListener('dragend', () => {
 });
 window.addEventListener('popstate', renderPage);
 elements.modal.addEventListener('cancel', () => {
-  if (state.confirmResolve) resolveConfirmation(false);
+  resolveConfirmation(false);
 });
-elements.modal.addEventListener('close', () => { state.modalMode = ''; });
+elements.modal.addEventListener('close', () => { closeModal(); });
+window.addEventListener('drawer-closed', () => { state.drawerRoute = null; });
 
 checkConnection();
 renderPage();
+

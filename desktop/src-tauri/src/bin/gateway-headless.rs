@@ -1,6 +1,5 @@
 use anyhow::Result;
 use local_ai_gateway::{config::AppConfig, server};
-use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -9,13 +8,27 @@ async fn main() -> Result<()> {
         .init();
     let config = AppConfig::load(std::path::PathBuf::from("data")).await?;
     let listener = server::bind(&config).await?;
-    let router = server::build(config.clone()).await?;
+    let server::GatewayRuntime {
+        state,
+        router,
+        telemetry_rx,
+        supervisor,
+    } = server::build(config.clone()).await?;
     tracing::info!(url = %config.local_url(), "gateway ready");
-    let cancel = CancellationToken::new();
-    let signal = cancel.clone();
+    // Ctrl-C cancels the runtime token; serve observes it for graceful
+    // shutdown.
+    let signal = supervisor.cancel.clone();
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
         signal.cancel();
     });
-    server::serve(listener, router, cancel).await
+    let limits = *state.limits;
+    let serve_cancel = supervisor.cancel.clone();
+    server::spawn_background(&supervisor, state, telemetry_rx, &limits).await;
+    // Serve runs until the token is cancelled (Ctrl-C) or fails. After it
+    // returns, one bounded drain stops every background task — no detached
+    // handles can outlive the process (P1-3).
+    let result = server::serve(listener, router, serve_cancel).await;
+    supervisor.shutdown(limits.shutdown_deadline).await;
+    result
 }

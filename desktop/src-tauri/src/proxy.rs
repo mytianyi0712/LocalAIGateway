@@ -2,7 +2,7 @@ use std::{
     convert::Infallible,
     pin::Pin,
     sync::Arc,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicI64, Ordering},
     task::{Context, Poll},
     time::Duration,
 };
@@ -18,24 +18,31 @@ use axum::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use sqlx::Row;
 
 use crate::{
-    capabilities, convert, protocol,
+    application::Context as AppContext,
+    capabilities, compression, convert,
+    crypto::SecretStore,
+    db::Database,
+    protocol,
     routing::{self, Candidate},
-    server::AppState,
+    runtime::RuntimeLimits,
     settings,
-    telemetry::{AttemptData, Event, Usage},
+    telemetry::{AttemptData, Event, Telemetry, Usage},
 };
-
-const MAX_REQUEST_BODY: usize = 8 * 1024 * 1024;
 
 /// Wraps an upstream byte stream so a client-side disconnect (which drops the
 /// response body without polling it to completion) still records a cancelled
 /// attempt instead of leaving the request permanently pending.
+///
+/// `finalized` marks a stream whose generator ran to its terminal telemetry
+/// (success, upstream error, or idle/first-token timeout) without being
+/// dropped early: such a stream already recorded its real outcome, so the
+/// `Drop` path must not append a duplicate `cancelled` finish.
 struct CancelAware<S> {
     inner: S,
     completed: Arc<AtomicBool>,
+    finalized: Arc<AtomicBool>,
     responded: Arc<AtomicBool>,
     on_cancel: Option<Box<dyn FnOnce() + Send>>,
 }
@@ -61,6 +68,7 @@ impl<S: futures_util::Stream + Unpin> futures_util::Stream for CancelAware<S> {
 impl<S> Drop for CancelAware<S> {
     fn drop(&mut self) {
         if !self.completed.load(Ordering::SeqCst)
+            && !self.finalized.load(Ordering::SeqCst)
             && let Some(callback) = self.on_cancel.take()
         {
             callback();
@@ -68,11 +76,46 @@ impl<S> Drop for CancelAware<S> {
     }
 }
 
-#[derive(Clone)]
-struct MappingTarget {
-    entry: String,
-    upstream_protocol: String,
-    upstream_model: String,
+/// Live stream statistics shared between a stream generator and its
+/// `CancelAware` Drop path. When a client disconnects mid-stream the
+/// generator's locals are gone, so the cancelled finish must read what was
+/// actually observed — bytes that flowed and usage that was parsed must not
+/// be replaced by a zeroed record.
+#[derive(Default)]
+struct SharedStreamStats {
+    bytes: AtomicI64,
+    usage: parking_lot::Mutex<Usage>,
+    first_byte_ms: parking_lot::Mutex<Option<i64>>,
+    first_token_ms: parking_lot::Mutex<Option<i64>>,
+}
+
+/// Usage snapshot from raw parts with the protocol's cache-miss derivation
+/// (mirror of the protocol adapters and of `converter_usage`).
+fn usage_from_parts(
+    stream_protocol: &str,
+    input: Option<i64>,
+    output: Option<i64>,
+    cache_read: Option<i64>,
+    cache_write: Option<i64>,
+) -> Usage {
+    let cache_miss = match stream_protocol {
+        "claude" => input,
+        "gemini" => input.map(|total| (total - cache_read.unwrap_or(0)).max(0)),
+        _ => match (input, cache_read) {
+            (Some(total), Some(read)) => {
+                Some((total - read - cache_write.unwrap_or(0)).max(0))
+            }
+            _ => None,
+        },
+    };
+    Usage {
+        input_tokens: input,
+        cache_read_tokens: cache_read,
+        cache_write_tokens: cache_write,
+        cache_miss_input_tokens: cache_miss,
+        output_tokens: output,
+        raw: None,
+    }
 }
 
 fn json_response(status: StatusCode, value: Value) -> Response<Body> {
@@ -90,27 +133,22 @@ fn gateway_error(
     message: &str,
     request_id: &str,
 ) -> Response<Body> {
-    if entry == "claude" {
-        json_response(
-            status,
-            json!({"type":"error","error":{"type":code,"message":message},"request_id":request_id}),
-        )
-    } else if entry == "gemini" {
-        json_response(
-            status,
-            json!({"error":{"code":status.as_u16(),"message":message,"status":code},"request_id":request_id}),
-        )
-    } else {
-        json_response(
-            status,
-            json!({"error":{"message":message,"type":code,"code":code,"request_id":request_id}}),
-        )
-    }
+    // P2-3: the public error shape comes from the protocol adapter.
+    let body = protocol::ProtocolId::parse(entry)
+        .map(|id| id.adapter().error_shape(status, code, message, request_id))
+        .unwrap_or_else(|| {
+            json!({"error": {"message": message, "type": code, "code": code, "request_id": request_id}})
+        });
+    json_response(status, body)
 }
 
 fn status_kind(status: StatusCode) -> (&'static str, bool) {
     if status == StatusCode::TOO_MANY_REQUESTS {
         ("rate_limit", true)
+    } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        // Auth failures count toward the circuit: a rotated/expired key is a
+        // persistent channel problem, not a client mistake (requirements 401/403).
+        ("auth_error", true)
     } else if status == StatusCode::REQUEST_TIMEOUT || status == StatusCode::GATEWAY_TIMEOUT {
         ("timeout", true)
     } else if status.is_server_error() {
@@ -119,6 +157,38 @@ fn status_kind(status: StatusCode) -> (&'static str, bool) {
         ("upstream_4xx", false)
     } else {
         ("upstream_error", false)
+    }
+}
+
+/// Kind of the last pure-transport failure (no upstream status was ever
+/// received), so the final gateway error can distinguish 504 timeouts from
+/// 502 unreachability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportFailure {
+    /// reqwest `send` failed with `error.is_timeout()` (connect timeout).
+    ConnectTimeout,
+    /// The send future itself hit the `first_byte_timeout` tokio timeout,
+    /// or an error-response body read hit the same outer timeout.
+    FirstByteTimeout,
+    /// Mapped-stream prelude produced no first token within the attempt's
+    /// absolute `first_token_timeout` window.
+    FirstTokenTimeout,
+    /// A non-streaming successful response body read hit its total timeout.
+    BodyTimeout,
+    /// Any other transport failure (reset, local key/URL/header construction
+    /// failure) — the tail maps this to 502.
+    ConnectionReset,
+}
+
+impl TransportFailure {
+    fn is_timeout(self) -> bool {
+        matches!(
+            self,
+            Self::ConnectTimeout
+                | Self::FirstByteTimeout
+                | Self::FirstTokenTimeout
+                | Self::BodyTimeout
+        )
     }
 }
 
@@ -138,7 +208,7 @@ fn response_with_headers(
 }
 
 fn mapped_path(
-    mapping: &MappingTarget,
+    mapping: &routing::MappingTarget,
     request_path: &str,
     stream_requested: bool,
     model: &str,
@@ -176,30 +246,6 @@ fn mapped_path(
         };
     }
     request_path.into()
-}
-
-async fn resolve_mapping(
-    state: &AppState,
-    entry: &str,
-    model: &str,
-) -> Result<Option<MappingTarget>> {
-    let (table, id_column) = match entry {
-        "claude" => ("claude_model_mappings", "claude_model_id"),
-        "openai_responses" => ("codex_model_mappings", "codex_model_id"),
-        _ => return Ok(None),
-    };
-    let sql = format!(
-        "SELECT upstream_protocol,upstream_model_id FROM {table} WHERE {id_column}=? AND enabled=1"
-    );
-    let row = sqlx::query(&sql)
-        .bind(model)
-        .fetch_optional(state.db.pool())
-        .await?;
-    Ok(row.map(|row| MappingTarget {
-        entry: entry.to_owned(),
-        upstream_protocol: row.get("upstream_protocol"),
-        upstream_model: row.get("upstream_model_id"),
-    }))
 }
 
 // Telemetry boundary assembler: fields come from disjoint call-site contexts
@@ -250,100 +296,207 @@ fn attempt_event(
     }))
 }
 
-/// Extracts the per-protocol usage object from a streamed SSE value or a
-/// non-streamed response root, mirroring the Python adapters.
-fn stream_usage_value(protocol: &str, value: &Value) -> Option<Value> {
-    match protocol {
-        "claude" => value
-            .get("message")
-            .and_then(|message| message.get("usage"))
-            .cloned()
-            .or_else(|| value.get("usage").cloned()),
-        "gemini" => value.get("usageMetadata").cloned(),
-        // OpenAI Responses API carries streamed usage inside the
-        // response.completed event's response object, not at the top level.
-        _ => value.get("usage").cloned().or_else(|| {
-            value
-                .get("response")
-                .and_then(|item| item.get("usage"))
-                .cloned()
-        }),
+/// Terminal outcome of one candidate attempt. Drives all three telemetry
+/// events (channel, attempt, request) so they can never disagree (P1-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptOutcome {
+    Success,
+    /// The gateway produced a protocol error itself (conversion failure,
+    /// upstream body over the buffer cap, undecodable body). The channel
+    /// is not necessarily at fault — `countable` is decided per site.
+    GatewayError,
+    /// Upstream answered with an error status or an error body.
+    UpstreamError,
+    /// Transport failed before any status was usable (connect/reset/timeout).
+    TransportError,
+    Cancelled,
+    /// The stream broke mid-body (idle timeout / upstream reset).
+    StreamInterrupted,
+}
+
+impl AttemptOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::GatewayError => "gateway_error",
+            Self::UpstreamError => "upstream_error",
+            Self::TransportError => "transport_error",
+            Self::Cancelled => "cancelled",
+            Self::StreamInterrupted => "stream_interrupted",
+        }
     }
 }
 
-/// Normalizes a raw usage object into the gateway's Usage model, mirroring the
-/// Python adapters (OpenAI chat/completions, OpenAI responses, Claude, Gemini).
-fn normalize_usage(protocol: &str, usage: &Value) -> Usage {
-    let raw = Some(usage.clone());
-    match protocol {
-        "claude" => {
-            let read = usage.get("cache_read_input_tokens").and_then(Value::as_i64);
-            let write = usage
-                .get("cache_creation_input_tokens")
-                .and_then(Value::as_i64);
-            let miss = usage.get("input_tokens").and_then(Value::as_i64);
-            let total = if miss.is_some() || read.is_some() || write.is_some() {
-                Some(miss.unwrap_or(0) + read.unwrap_or(0) + write.unwrap_or(0))
-            } else {
-                None
-            };
-            Usage {
-                input_tokens: total,
-                cache_read_tokens: read,
-                cache_write_tokens: write,
-                cache_miss_input_tokens: miss,
-                output_tokens: usage.get("output_tokens").and_then(Value::as_i64),
-                raw,
-            }
-        }
-        "gemini" => {
-            let total = usage.get("promptTokenCount").and_then(Value::as_i64);
-            let cache = usage.get("cachedContentTokenCount").and_then(Value::as_i64);
-            let miss = total.map(|value| (value - cache.unwrap_or(0)).max(0));
-            Usage {
-                input_tokens: total,
-                cache_read_tokens: cache,
-                cache_write_tokens: None,
-                cache_miss_input_tokens: miss,
-                output_tokens: usage.get("candidatesTokenCount").and_then(Value::as_i64),
-                raw,
-            }
-        }
-        _ => {
-            let details = usage
-                .get("prompt_tokens_details")
-                .or_else(|| usage.get("input_tokens_details"));
-            let total_input = usage
-                .get("prompt_tokens")
-                .and_then(Value::as_i64)
-                .or_else(|| usage.get("input_tokens").and_then(Value::as_i64));
-            let cache_read = details
-                .and_then(|item| item.get("cached_tokens"))
-                .and_then(Value::as_i64);
-            let cache_write = details
-                .and_then(|item| {
-                    item.get("cache_write_tokens")
-                        .or_else(|| item.get("cached_write_tokens"))
-                })
-                .and_then(Value::as_i64);
-            let miss = match (total_input, cache_read) {
-                (Some(total), Some(read)) => Some((total - read - cache_write.unwrap_or(0)).max(0)),
-                _ => None,
-            };
-            let output = usage
-                .get("completion_tokens")
-                .and_then(Value::as_i64)
-                .or_else(|| usage.get("output_tokens").and_then(Value::as_i64));
-            Usage {
-                input_tokens: total_input,
-                cache_read_tokens: cache_read,
-                cache_write_tokens: cache_write,
-                cache_miss_input_tokens: miss,
-                output_tokens: output,
-                raw,
-            }
+/// Emits the channel/attempt/request telemetry for one terminal attempt.
+/// Every finalization site must go through here so the three event streams
+/// stay consistent: one outcome, one error_kind, one status (P1-5).
+struct AttemptFinalizer {
+    telemetry: std::sync::Arc<dyn crate::ports::EventSink>,
+    request_id: String,
+    request_started: chrono::DateTime<chrono::Utc>,
+    failure_threshold: i64,
+    circuit_open_seconds: i64,
+}
+
+impl AttemptFinalizer {
+    fn new(
+        telemetry: std::sync::Arc<dyn crate::ports::EventSink>,
+        request_id: &str,
+        request_started: chrono::DateTime<chrono::Utc>,
+        failure_threshold: i64,
+        circuit_open_seconds: i64,
+    ) -> Self {
+        Self {
+            telemetry,
+            request_id: request_id.to_owned(),
+            request_started,
+            failure_threshold,
+            circuit_open_seconds,
         }
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize(
+        &self,
+        candidate: &Candidate,
+        attempt_no: i64,
+        started_at: chrono::DateTime<chrono::Utc>,
+        finished_at: chrono::DateTime<chrono::Utc>,
+        outcome: AttemptOutcome,
+        status: Option<i64>,
+        error_kind: Option<String>,
+        failover: bool,
+        response_started: bool,
+        first_byte_ms: Option<i64>,
+        first_token_ms: Option<i64>,
+        usage: Usage,
+        response_bytes: i64,
+        upstream_protocol: Option<String>,
+        upstream_model_id: Option<String>,
+        countable: bool,
+    ) {
+        match outcome {
+            AttemptOutcome::Success => {
+                self.telemetry.emit(Event::ChannelSuccess {
+                    channel_id: candidate.channel_id.clone(),
+                });
+            }
+            AttemptOutcome::Cancelled => {
+                // A client-side cancellation is not a channel verdict.
+            }
+            _ => {
+                self.telemetry.emit(Event::ChannelFailure {
+                    channel_id: candidate.channel_id.clone(),
+                    error_kind: error_kind
+                        .clone()
+                        .unwrap_or_else(|| outcome.as_str().to_owned()),
+                    status,
+                    threshold: self.failure_threshold,
+                    open_seconds: self.circuit_open_seconds,
+                    countable,
+                });
+            }
+        }
+        self.telemetry.emit(attempt_event(
+            &self.request_id,
+            candidate,
+            attempt_no,
+            started_at,
+            finished_at,
+            status,
+            outcome.as_str(),
+            error_kind,
+            failover,
+            response_started,
+            first_byte_ms,
+            first_token_ms,
+            usage,
+            response_bytes,
+            upstream_protocol,
+            upstream_model_id,
+        ));
+        self.telemetry.emit(Event::RequestFinish {
+            id: self.request_id.clone(),
+            finished_at: finished_at.to_rfc3339(),
+            duration_ms: finished_at
+                .signed_duration_since(self.request_started)
+                .num_milliseconds(),
+            status,
+            outcome: outcome.as_str().into(),
+            attempts: attempt_no,
+            channel_id: Some(candidate.channel_id.clone()),
+            response_bytes,
+        });
+    }
+}
+
+/// Reads a response body with a hard byte cap (P1-1). Returns the buffered
+/// bytes (at most `cap`) plus whether the cap was hit; the stream is not
+/// drained past the cap. The whole read is bounded by `timeout`: a transport
+/// error mid-body maps to `ConnectionReset`, an expired deadline to
+/// `FirstByteTimeout` — matching the pre-existing non-stream classification.
+async fn read_bounded_body<S>(
+    mut stream: S,
+    timeout: Duration,
+    cap: usize,
+) -> (Result<Vec<u8>, TransportFailure>, bool)
+where
+    S: futures_util::Stream<Item = Result<Bytes, crate::ports::UpstreamError>> + Unpin,
+{
+    let mut buf = Vec::with_capacity(cap.min(64 * 1024));
+    let mut truncated = false;
+    let read = async {
+        while let Some(item) = stream.next().await {
+            let chunk = item.map_err(|_| TransportFailure::ConnectionReset)?;
+            let remaining = cap - buf.len();
+            if chunk.len() > remaining {
+                buf.extend_from_slice(&chunk[..remaining]);
+                truncated = true;
+                // Hard cap reached: stop buffering. The undelivered tail is
+                // dropped with the stream (connection closes, no reuse).
+                break;
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok::<(), TransportFailure>(())
+    };
+    match tokio::time::timeout(timeout, read).await {
+        Ok(Ok(())) => (Ok(buf), truncated),
+        Ok(Err(kind)) => (Err(kind), truncated),
+        Err(_) => (Err(TransportFailure::FirstByteTimeout), truncated),
+    }
+}
+
+/// Terminal telemetry for a mapped response whose body could not be decoded
+/// (P1-2): one outcome drives channel/attempt/request, and the caller sends
+/// a stable 502. The plaintext the conversion needs does not exist.
+fn decode_failure(env: &AttemptEnv<'_>, failover: bool, response_bytes: i64) {
+    let finished = env.clock.now_utc();
+    AttemptFinalizer::new(
+        Arc::new(env.telemetry.clone()),
+        env.request_id,
+        env.started,
+        env.runtime.failure_threshold,
+        env.runtime.circuit_open_seconds,
+    )
+    .finalize(
+        env.candidate,
+        env.attempts,
+        env.attempt_started,
+        finished,
+        AttemptOutcome::GatewayError,
+        Some(502),
+        Some("upstream_decode_error".into()),
+        failover,
+        false,
+        None,
+        None,
+        Usage::default(),
+        response_bytes,
+        Some(env.upstream_protocol.into()),
+        Some(env.upstream_model.into()),
+        true,
+    );
 }
 
 /// Parses a non-streamed upstream response body into Usage.
@@ -351,67 +504,1258 @@ fn usage_from_body(protocol: &str, body: &[u8]) -> Usage {
     let Ok(value) = serde_json::from_slice::<Value>(body) else {
         return Usage::default();
     };
-    match stream_usage_value(protocol, &value) {
-        Some(usage) => normalize_usage(protocol, &usage),
+    match protocol::usage_value(protocol, &value) {
+        Some(usage) => protocol::normalize_usage(protocol, &usage),
         None => Usage::default(),
     }
 }
 
-async fn read_body(
-    request: Request,
-) -> Result<(axum::http::HeaderMap, String, Option<String>, Vec<u8>)> {
-    let headers = request.headers().clone();
-    let path = request.uri().path().to_owned();
-    let query = request.uri().query().map(str::to_owned);
-    let body = to_bytes(request.into_body(), MAX_REQUEST_BODY).await?;
-    Ok((headers, path, query, body.to_vec()))
+async fn read_body(request: Request, max_bytes: usize) -> Result<Bytes> {
+    to_bytes(request.into_body(), max_bytes)
+        .await
+        .map_err(Into::into)
 }
 
-async fn proxy(
-    state: AppState,
+/// Everything one candidate attempt needs besides the upstream response
+/// (P2-4): keeps the response-policy builders (transparent/mapped streaming,
+/// bounded non-stream) standalone functions instead of inline closures.
+#[derive(Clone)]
+struct AttemptEnv<'a> {
+    telemetry: &'a Telemetry,
+    clock: Arc<dyn crate::ports::Clock>,
+    request_id: &'a str,
+    started: chrono::DateTime<chrono::Utc>,
+    candidate: &'a Candidate,
+    attempts: i64,
+    attempt_started: chrono::DateTime<chrono::Utc>,
+    attempt_started_instant: tokio::time::Instant,
+    runtime: &'a settings::RuntimeSettings,
+    entry_protocol: &'a str,
+    entry_model: &'a str,
+    upstream_protocol: &'a str,
+    upstream_model: &'a str,
+    /// Mapped entry target, when this attempt runs on a mapping entry.
+    mapping: Option<&'a routing::MappingTarget>,
+    /// Remaining candidates after this one (failover eligibility flag).
+    candidates_len: i64,
+}
+
+/// Streamed non-mapped 2xx: transparent forwarding with bounded plaintext
+/// Terminal telemetry for a stream that ran to a known end (P1-5): every
+/// finalize site must go through [`AttemptFinalizer`], and streams that end
+/// on a terminal marker record their outcome BEFORE the client can hang up
+/// after the last event — a completed response must never degrade into a
+/// spurious `cancelled` with zeroed data.
+#[allow(clippy::too_many_arguments)]
+fn finalize_stream_attempt(
+    telemetry: &Telemetry,
+    request_id: &str,
+    started: chrono::DateTime<chrono::Utc>,
+    failure_threshold: i64,
+    circuit_open_seconds: i64,
+    candidate: &Candidate,
+    attempt_no: i64,
+    attempt_started: chrono::DateTime<chrono::Utc>,
+    finished: chrono::DateTime<chrono::Utc>,
+    outcome: AttemptOutcome,
+    final_status: i64,
+    error_kind: Option<String>,
+    countable: bool,
+    first_byte_ms: Option<i64>,
+    first_token_ms: Option<i64>,
+    usage: Usage,
+    response_bytes: i64,
+    upstream_protocol: String,
+    upstream_model: String,
+) {
+    AttemptFinalizer::new(
+        Arc::new(telemetry.clone()),
+        request_id,
+        started,
+        failure_threshold,
+        circuit_open_seconds,
+    )
+    .finalize(
+        candidate,
+        attempt_no,
+        attempt_started,
+        finished,
+        outcome,
+        Some(final_status),
+        error_kind,
+        false,
+        true,
+        first_byte_ms,
+        first_token_ms,
+        usage,
+        response_bytes,
+        Some(upstream_protocol),
+        Some(upstream_model),
+        countable,
+    );
+}
+
+/// Whether an SSE event carries its protocol's terminal marker — the
+/// response is complete and nothing of value follows:
+/// - openai chat: `data: [DONE]` (checked separately, it is not JSON)
+/// - openai responses: `response.completed` (carries the final usage)
+/// - claude: `message_stop`
+/// - gemini: the final chunk carries `finishReason`
+fn terminal_marker(protocol: &str, value: &Value) -> bool {
+    match protocol {
+        "openai_responses" => {
+            value.get("type").and_then(Value::as_str) == Some("response.completed")
+        }
+        "claude" => value.get("type").and_then(Value::as_str) == Some("message_stop"),
+        "gemini" => value.pointer("/candidates/0/finishReason").is_some(),
+        _ => false,
+    }
+}
+
+/// Parse SSE `data:` lines out of the pending buffer for observability
+/// (first-token detection, usage merge) and terminal-marker detection.
+/// Complete `\n`-terminated lines are consumed; with `tail` the final
+/// unterminated line is processed too (some upstreams end without a newline,
+/// and the last usage event may live there). Returns true when a terminal
+/// marker was seen. Observed first-token/usage values are mirrored into
+/// `stats` so a mid-stream client disconnect still records them.
+#[allow(clippy::too_many_arguments)]
+fn scan_observable_lines(
+    pending: &mut Vec<u8>,
+    tail: bool,
+    stream_protocol: &str,
+    usage: &mut Usage,
+    first_token_ms: &mut Option<i64>,
+    first_token_seen: &mut bool,
+    stats: &SharedStreamStats,
+    now: chrono::DateTime<chrono::Utc>,
+    attempt_started: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let mut terminal = false;
+    let mut consumed = 0usize;
+    while consumed < pending.len() {
+        let line_end = match pending[consumed..].iter().position(|byte| *byte == b'\n') {
+            Some(offset) => consumed + offset,
+            None => {
+                if !tail {
+                    break;
+                }
+                pending.len()
+            }
+        };
+        let line = &pending[consumed..line_end];
+        consumed = if line_end < pending.len() {
+            line_end + 1
+        } else {
+            line_end
+        };
+        let line = String::from_utf8_lossy(line);
+        let line = line.trim_end_matches('\r');
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() {
+            continue;
+        }
+        if stream_protocol == "openai_compatible" && data == "[DONE]" {
+            terminal = true;
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        if first_token_ms.is_none() && convert::chunk_has_content(stream_protocol, &value) {
+            *first_token_ms =
+                Some(now.signed_duration_since(attempt_started).num_milliseconds());
+            *stats.first_token_ms.lock() = *first_token_ms;
+            *first_token_seen = true;
+        }
+        if terminal_marker(stream_protocol, &value) {
+            terminal = true;
+        }
+        if let Some(raw_usage) = protocol::usage_value(stream_protocol, &value) {
+            let normalized = protocol::normalize_usage(stream_protocol, &raw_usage);
+            usage.merge(&normalized);
+            *stats.usage.lock() = usage.clone();
+        }
+    }
+    pending.drain(..consumed);
+    terminal
+}
+
+/// Usage snapshot from the mapped-stream converter (P1-5): meaningful only
+/// when the conversion was clean; the cache-miss derivation mirrors the
+/// protocol adapters.
+fn converter_usage(
+    converter: &convert::MappedStreamConverter,
+    stream_protocol: &str,
+    decode_failed: bool,
+) -> Usage {
+    if decode_failed {
+        return Usage::default();
+    }
+    let (input, output, cache_read, cache_write) = converter.usage();
+    usage_from_parts(stream_protocol, input, output, cache_read, cache_write)
+}
+
+/// Mirror the converter's current usage into the shared stats so a mid-stream
+/// client disconnect records what was already observed.
+fn sync_converter_usage(
+    converter: &convert::MappedStreamConverter,
+    stats: &SharedStreamStats,
+    stream_protocol: &str,
+) {
+    let (input, output, cache_read, cache_write) = converter.usage();
+    *stats.usage.lock() = usage_from_parts(stream_protocol, input, output, cache_read, cache_write);
+}
+
+/// observation (P1-1). Never buffers the body; mid-stream failures surface
+/// as `stream_interrupted` terminal events.
+fn transparent_stream(
+    env: AttemptEnv<'_>,
+    response: crate::ports::UpstreamResponse,
+    status: axum::http::StatusCode,
+    response_headers: axum::http::HeaderMap,
+) -> Response<Body> {
+    let AttemptEnv {
+        telemetry,
+        clock,
+        request_id,
+        started,
+        candidate,
+        attempts,
+        attempt_started,
+        runtime,
+        upstream_protocol,
+        upstream_model,
+        ..
+    } = env;
+    let upstream_stream = response.body.into_stream();
+    let mut response_headers_for_client = response_headers.clone();
+    response_headers_for_client.remove("content-length");
+    let decoder = compression::ObservableDecoder::new(compression::ContentDecoder::from_encoding(
+        response_headers.get("content-encoding"),
+    ));
+    let telemetry = telemetry.clone();
+    let request_id_stream = request_id.to_owned();
+    let candidate_stream = candidate.clone();
+    let upstream_protocol_stream = upstream_protocol.to_owned();
+    let upstream_model_stream = upstream_model.to_owned();
+    let stream_protocol = upstream_protocol_stream.clone();
+    let failure_threshold = runtime.failure_threshold;
+    let circuit_open_seconds = runtime.circuit_open_seconds;
+    // First-token accounting spans the whole attempt (P1-1): the deadline is
+    // anchored at attempt start, so a slow response head cannot extend the
+    // window. The send phase itself is bounded by first_byte_timeout.
+    let first_token_deadline = env.attempt_started_instant
+        + Duration::from_secs(runtime.first_token_timeout_seconds.max(1) as u64);
+    let stream_idle_timeout =
+        Duration::from_secs(runtime.stream_idle_timeout_seconds.max(1) as u64);
+    let stats = Arc::new(SharedStreamStats::default());
+    let cancel_completed = Arc::new(AtomicBool::new(false));
+    let cancel_finalized = Arc::new(AtomicBool::new(false));
+    let cancel_completed_flag = cancel_completed.clone();
+    let cancel_responded = Arc::new(AtomicBool::new(false));
+    let cancel_telemetry = telemetry.clone();
+    let cancel_request_id = request_id.to_owned();
+    let cancel_candidate = candidate.clone();
+    let cancel_attempt_no = attempts;
+    let cancel_attempt_started = attempt_started;
+    let cancel_started = started;
+    let cancel_status = status.as_u16() as i64;
+    let cancel_threshold = failure_threshold;
+    let cancel_open_seconds = circuit_open_seconds;
+    let cancel_upstream_protocol = upstream_protocol_stream.clone();
+    let cancel_upstream_model = upstream_model_stream.clone();
+    let cancel_responded_flag = cancel_responded.clone();
+    let cancel_clock = Arc::clone(&clock);
+    let cancel_stats = stats.clone();
+    let on_cancel: Box<dyn FnOnce() + Send> = Box::new(move || {
+        let finished = cancel_clock.now_utc();
+        AttemptFinalizer::new(
+            Arc::new(cancel_telemetry.clone()),
+            &cancel_request_id,
+            cancel_started,
+            cancel_threshold,
+            cancel_open_seconds,
+        )
+        .finalize(
+            &cancel_candidate,
+            cancel_attempt_no,
+            cancel_attempt_started,
+            finished,
+            AttemptOutcome::Cancelled,
+            Some(cancel_status),
+            None,
+            false,
+            cancel_responded_flag.load(Ordering::SeqCst),
+            *cancel_stats.first_byte_ms.lock(),
+            *cancel_stats.first_token_ms.lock(),
+            cancel_stats.usage.lock().clone(),
+            cancel_stats.bytes.load(Ordering::SeqCst),
+            Some(cancel_upstream_protocol),
+            Some(cancel_upstream_model),
+            false,
+        );
+    });
+    let cancel_aware = CancelAware {
+        inner: upstream_stream,
+        completed: cancel_completed,
+        finalized: cancel_finalized,
+        responded: cancel_responded,
+        on_cancel: Some(on_cancel),
+    };
+    let stream_body = stream! {
+        let mut upstream_stream = cancel_aware;
+        let mut decoder = decoder;
+        let mut response_bytes = 0i64;
+        let mut ok = true;
+        let mut idle_timeout = false;
+        let mut pending: Vec<u8> = Vec::new();
+        let mut first_byte_ms: Option<i64> = None;
+        let mut first_token_ms: Option<i64> = None;
+        let mut first_token_seen = false;
+        let mut usage: Usage = Usage::default();
+        loop {
+            // Before the first token the absolute deadline governs. The
+            // deadline is polled first (biased) so a first token that
+            // arrived past the window times out even when the bytes are
+            // already buffered (P1-1).
+            let next = if first_token_seen {
+                tokio::time::timeout(stream_idle_timeout, upstream_stream.next())
+                    .await
+                    .map_err(|_| ())
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(first_token_deadline) => Err(()),
+                    next = upstream_stream.next() => Ok(next),
+                }
+            };
+            match next {
+                Ok(Some(Ok(chunk))) => {
+                    response_bytes += chunk.len() as i64;
+                    stats.bytes.store(response_bytes, Ordering::SeqCst);
+                    let now = clock.now_utc();
+                    if first_byte_ms.is_none() {
+                        first_byte_ms = Some(
+                            now.signed_duration_since(attempt_started).num_milliseconds(),
+                        );
+                        *stats.first_byte_ms.lock() = first_byte_ms;
+                    }
+                    // Observability runs on the decoded plaintext; the client
+                    // still receives the raw compressed bytes with the
+                    // original content-encoding.
+                    let decoded = decoder.feed_observable(&chunk);
+                    pending.extend_from_slice(&decoded);
+                    let terminal = scan_observable_lines(
+                        &mut pending,
+                        false,
+                        &stream_protocol,
+                        &mut usage,
+                        &mut first_token_ms,
+                        &mut first_token_seen,
+                        &stats,
+                        now,
+                        attempt_started,
+                    );
+                    if terminal {
+                        // The terminal marker (e.g. `data: [DONE]`) is in
+                        // this chunk: the response is complete. Record the
+                        // terminal telemetry BEFORE handing the final bytes
+                        // to the client — a client that hangs up right after
+                        // the last event must not turn a completed stream
+                        // into a spurious `cancelled` with zeroed data.
+                        cancel_completed_flag.store(true, Ordering::SeqCst);
+                        let finished = clock.now_utc();
+                        finalize_stream_attempt(
+                            &telemetry,
+                            &request_id_stream,
+                            started,
+                            failure_threshold,
+                            circuit_open_seconds,
+                            &candidate_stream,
+                            attempts,
+                            attempt_started,
+                            finished,
+                            AttemptOutcome::Success,
+                            status.as_u16() as i64,
+                            None,
+                            false,
+                            first_byte_ms,
+                            first_token_ms,
+                            usage,
+                            response_bytes,
+                            upstream_protocol_stream.clone(),
+                            upstream_model_stream.clone(),
+                        );
+                        yield Ok::<Bytes, Infallible>(chunk);
+                        return;
+                    }
+                    yield Ok::<Bytes, Infallible>(chunk);
+                }
+                Ok(Some(Err(_))) => {
+                    ok = false;
+                    break;
+                }
+                Ok(None) => {
+                    // Parse any final unterminated line: usage (and
+                    // occasionally a terminal marker) may live in the last
+                    // line when the upstream ends without a trailing newline.
+                    let now = clock.now_utc();
+                    let terminal = scan_observable_lines(
+                        &mut pending,
+                        true,
+                        &stream_protocol,
+                        &mut usage,
+                        &mut first_token_ms,
+                        &mut first_token_seen,
+                        &stats,
+                        now,
+                        attempt_started,
+                    );
+                    if terminal {
+                        cancel_completed_flag.store(true, Ordering::SeqCst);
+                        let finished = clock.now_utc();
+                        finalize_stream_attempt(
+                            &telemetry,
+                            &request_id_stream,
+                            started,
+                            failure_threshold,
+                            circuit_open_seconds,
+                            &candidate_stream,
+                            attempts,
+                            attempt_started,
+                            finished,
+                            AttemptOutcome::Success,
+                            status.as_u16() as i64,
+                            None,
+                            false,
+                            first_byte_ms,
+                            first_token_ms,
+                            usage,
+                            response_bytes,
+                            upstream_protocol_stream.clone(),
+                            upstream_model_stream.clone(),
+                        );
+                        return;
+                    }
+                    break;
+                }
+                Err(_) => {
+                    ok = false;
+                    idle_timeout = true;
+                    break;
+                }
+            }
+        }
+        // The generator ran to its terminal telemetry (success, upstream
+        // error, idle/first-token timeout, or a clean end that never
+        // produced a first token): the Drop path must not append a duplicate
+        // `cancelled` finish.
+        cancel_completed_flag.store(true, Ordering::SeqCst);
+        let finished = clock.now_utc();
+        let (outcome, error_kind, final_status): (AttemptOutcome, Option<String>, i64) = if !ok {
+            if idle_timeout {
+                (
+                    AttemptOutcome::StreamInterrupted,
+                    Some("transport_timeout".into()),
+                    504,
+                )
+            } else {
+                (
+                    AttemptOutcome::StreamInterrupted,
+                    Some("stream_interrupted".into()),
+                    status.as_u16() as i64,
+                )
+            }
+        } else if first_token_ms.is_none() {
+            // The upstream closed the stream without ever producing a first
+            // token and without a terminal marker (e.g. an empty 200 body).
+            // That violates the first-token protection just as much as a
+            // stall does — count it against the circuit so a broken upstream
+            // trips instead of silently "succeeding" with an empty response.
+            (
+                AttemptOutcome::StreamInterrupted,
+                Some("no_first_token".into()),
+                status.as_u16() as i64,
+            )
+        } else {
+            (AttemptOutcome::Success, None, status.as_u16() as i64)
+        };
+        AttemptFinalizer::new(
+                Arc::new(telemetry.clone()),
+            &request_id_stream,
+            started,
+            failure_threshold,
+            circuit_open_seconds,
+        )
+        .finalize(
+            &candidate_stream,
+            attempts,
+            attempt_started,
+            finished,
+            outcome,
+            Some(final_status),
+            error_kind,
+            false,
+            true,
+            first_byte_ms,
+            first_token_ms,
+            usage,
+            response_bytes,
+            Some(upstream_protocol_stream),
+            Some(upstream_model_stream),
+            true,
+        );
+    };
+    let mut result = Response::new(Body::from_stream(stream_body));
+    *result.status_mut() = status;
+    *result.headers_mut() = response_headers_for_client;
+    result
+}
+/// Outcome of the mapped-stream builder: either a response to send, or a
+/// prelude-level failure that already emitted its terminal telemetry and
+/// should fail over to the next candidate (P2-4).
+enum MappedStreamResult {
+    Respond(Response<Body>),
+    FailOver(Option<TransportFailure>),
+}
+
+/// Mapped streaming: a short buffered prelude (so a 200 error body can
+/// still fail over) then incremental conversion of the live stream. The
+/// prelude decode is lossless (`RequiredDecoder`, P1-2) — a corrupt or
+/// oversized body fails the attempt instead of truncating the stream.
+async fn mapped_stream(
+    env: AttemptEnv<'_>,
+    response: crate::ports::UpstreamResponse,
+    status: axum::http::StatusCode,
+    response_headers: axum::http::HeaderMap,
+) -> MappedStreamResult {
+    let AttemptEnv {
+        telemetry,
+        clock,
+        request_id,
+        started,
+        candidate,
+        attempts,
+        attempt_started,
+        attempt_started_instant,
+        runtime,
+        entry_protocol,
+        entry_model,
+        upstream_protocol,
+        upstream_model,
+        candidates_len,
+        ..
+    } = env;
+    let failure_threshold = runtime.failure_threshold;
+    let circuit_open_seconds = runtime.circuit_open_seconds;
+    // Absolute first-token window anchored at attempt start (P1-1): a slow
+    // response head cannot extend it.
+    let first_token_deadline = attempt_started_instant
+        + Duration::from_secs(runtime.first_token_timeout_seconds.max(1) as u64);
+    let stream_idle_timeout =
+        Duration::from_secs(runtime.stream_idle_timeout_seconds.max(1) as u64);
+    let stats = Arc::new(SharedStreamStats::default());
+    let mut upstream_stream = response.body.into_stream();
+    // P1-2: mapped conversion REQUIRES the plaintext — a decode failure
+    // must fail the attempt, never degrade to silence.
+    let mut decoder = compression::RequiredDecoder::new(
+        compression::ContentDecoder::from_encoding(response_headers.get("content-encoding")),
+        (runtime.max_buffered_upstream_body_mb.max(1) as usize) * 1024 * 1024,
+    );
+    // Raw chunk + its decoded plaintext: the prelude is replayed through
+    // the converter exactly once (P1-3) — re-feeding the decoder would
+    // double-advance its state and corrupt output.
+    let mut prelude: Vec<(Bytes, Vec<u8>)> = Vec::new();
+    let mut prelude_bytes = 0usize;
+    let mut scan = convert::StreamScan::new(upstream_protocol);
+    // Absolute-deadline prelude scan. `timeout(remaining, ...)` polls the
+    // inner future first, so an already-buffered body would win against an
+    // expired deadline; the deadline is polled first (biased) so a late
+    // first token is a timeout even when the bytes are already available
+    // (P1-1).
+    enum PreludeEnd {
+        Ready,
+        UpstreamError(String),
+        DecodeError,
+        Deadline,
+    }
+    let prelude_outcome = async {
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(first_token_deadline) => {
+                    return PreludeEnd::Deadline;
+                }
+                next = upstream_stream.next() => next,
+            };
+            match next {
+                Some(Ok(chunk)) => {
+                    prelude_bytes += chunk.len();
+                    let decoded = match decoder.feed_required(&chunk) {
+                        Ok(decoded) => decoded,
+                        Err(error) => {
+                            tracing::warn!(
+                                request_id = %request_id,
+                                channel_id = %candidate.channel_id,
+                                error = ?error,
+                                "mapped response decode failed during prelude"
+                            );
+                            return PreludeEnd::DecodeError;
+                        }
+                    };
+                    prelude.push((chunk.clone(), decoded.clone()));
+                    if let Some(message) = scan.feed(upstream_protocol, &decoded) {
+                        return PreludeEnd::UpstreamError(message);
+                    }
+                    if scan.first_token_now || prelude_bytes >= 1024 * 1024 {
+                        return PreludeEnd::Ready;
+                    }
+                }
+                Some(Err(_)) => return PreludeEnd::Ready,
+                None => return PreludeEnd::Ready,
+            }
+        }
+    }
+    .await;
+    match prelude_outcome {
+        PreludeEnd::UpstreamError(_message) => {
+            // 2xx body carries an upstream error: record and fail over to
+            // the next candidate (Python prelude path).
+            let finished = clock.now_utc();
+            AttemptFinalizer::new(
+                Arc::new(telemetry.clone()),
+                request_id,
+                started,
+                failure_threshold,
+                circuit_open_seconds,
+            )
+            .finalize(
+                candidate,
+                attempts,
+                attempt_started,
+                finished,
+                AttemptOutcome::UpstreamError,
+                Some(502),
+                Some("upstream_error".into()),
+                attempts < candidates_len,
+                false,
+                None,
+                None,
+                Usage::default(),
+                prelude_bytes as i64,
+                Some(env.upstream_protocol.into()),
+                Some(env.upstream_model.into()),
+                true,
+            );
+            return MappedStreamResult::FailOver(None);
+        }
+        PreludeEnd::DecodeError => {
+            // The 200 body cannot be decoded (corrupt frame or over the
+            // buffered-body cap): the plaintext the conversion needs does
+            // not exist. Fail over.
+            let finished = clock.now_utc();
+            AttemptFinalizer::new(
+                Arc::new(telemetry.clone()),
+                request_id,
+                started,
+                failure_threshold,
+                circuit_open_seconds,
+            )
+            .finalize(
+                candidate,
+                attempts,
+                attempt_started,
+                finished,
+                AttemptOutcome::UpstreamError,
+                Some(502),
+                Some("upstream_decode_error".into()),
+                attempts < candidates_len,
+                false,
+                None,
+                None,
+                Usage::default(),
+                prelude_bytes as i64,
+                Some(env.upstream_protocol.into()),
+                Some(env.upstream_model.into()),
+                true,
+            );
+            return MappedStreamResult::FailOver(None);
+        }
+        PreludeEnd::Deadline => {
+            // No first token within the absolute attempt window: fail over
+            // (P1-1). Classified as a timeout so the tail maps a
+            // single-candidate run to 504 (P1-2).
+            let finished = clock.now_utc();
+            AttemptFinalizer::new(
+                Arc::new(telemetry.clone()),
+                request_id,
+                started,
+                failure_threshold,
+                circuit_open_seconds,
+            )
+            .finalize(
+                candidate,
+                attempts,
+                attempt_started,
+                finished,
+                AttemptOutcome::TransportError,
+                None,
+                Some("timeout".into()),
+                attempts < candidates_len,
+                false,
+                None,
+                None,
+                Usage::default(),
+                prelude_bytes as i64,
+                Some(env.upstream_protocol.into()),
+                Some(env.upstream_model.into()),
+                true,
+            );
+            return MappedStreamResult::FailOver(Some(TransportFailure::FirstTokenTimeout));
+        }
+        PreludeEnd::Ready => {}
+    }
+    let converter = match convert::MappedStreamConverter::new(
+        entry_protocol,
+        upstream_protocol,
+        entry_model,
+    ) {
+        Ok(converter) => converter,
+        Err(error) => {
+            tracing::error!(request_id = %request_id, error = %error, "stream converter init failed");
+            return MappedStreamResult::Respond(gateway_error(
+                entry_protocol,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "conversion_error",
+                "Conversion error",
+                request_id,
+            ));
+        }
+    };
+    let stream_protocol = upstream_protocol.to_owned();
+    let response_headers_for_client = response_headers.clone();
+    let telemetry = telemetry.clone();
+    let request_id_stream = request_id.to_owned();
+    let candidate_stream = candidate.clone();
+    let upstream_protocol_stream = upstream_protocol.to_owned();
+    let upstream_model_stream = upstream_model.to_owned();
+    let cancel_completed = Arc::new(AtomicBool::new(false));
+    let cancel_finalized = Arc::new(AtomicBool::new(false));
+    let cancel_completed_flag = cancel_completed.clone();
+    let cancel_responded = Arc::new(AtomicBool::new(false));
+    let cancel_telemetry = telemetry.clone();
+    let cancel_request_id = request_id.to_owned();
+    let cancel_candidate = candidate.clone();
+    let cancel_attempt_no = attempts;
+    let cancel_attempt_started = attempt_started;
+    let cancel_started = started;
+    let cancel_status = status.as_u16() as i64;
+    let cancel_threshold = failure_threshold;
+    let cancel_open_seconds = circuit_open_seconds;
+    let cancel_upstream_protocol = upstream_protocol_stream.clone();
+    let cancel_upstream_model = upstream_model_stream.clone();
+    let cancel_responded_flag = cancel_responded.clone();
+    let cancel_clock = Arc::clone(&clock);
+    let cancel_stats = stats.clone();
+    let on_cancel: Box<dyn FnOnce() + Send> = Box::new(move || {
+        let finished = cancel_clock.now_utc();
+        AttemptFinalizer::new(
+            Arc::new(cancel_telemetry.clone()),
+            &cancel_request_id,
+            cancel_started,
+            cancel_threshold,
+            cancel_open_seconds,
+        )
+        .finalize(
+            &cancel_candidate,
+            cancel_attempt_no,
+            cancel_attempt_started,
+            finished,
+            AttemptOutcome::Cancelled,
+            Some(cancel_status),
+            None,
+            false,
+            cancel_responded_flag.load(Ordering::SeqCst),
+            *cancel_stats.first_byte_ms.lock(),
+            *cancel_stats.first_token_ms.lock(),
+            cancel_stats.usage.lock().clone(),
+            cancel_stats.bytes.load(Ordering::SeqCst),
+            Some(cancel_upstream_protocol),
+            Some(cancel_upstream_model),
+            false,
+        );
+    });
+    let cancel_aware = CancelAware {
+        inner: upstream_stream,
+        completed: cancel_completed,
+        finalized: cancel_finalized,
+        responded: cancel_responded,
+        on_cancel: Some(on_cancel),
+    };
+    let stream_body = stream! {
+        let mut upstream_stream = cancel_aware;
+        let mut converter = converter;
+        let mut scan = scan;
+        let mut decoder = decoder;
+        let mut response_bytes = 0i64;
+        let mut ok = true;
+        let mut idle_timeout = false;
+        let mut decode_failed = false;
+        let mut received_any = !prelude.is_empty();
+        let mut first_byte_ms: Option<i64> = None;
+        let mut first_token_ms: Option<i64> = None;
+        // Replay the buffered prelude through the converter. The decoder was
+        // already advanced over these bytes during the scan; only the
+        // stored plaintext is fed here (P1-3).
+        for (raw, decoded) in prelude {
+            response_bytes += raw.len() as i64;
+            stats.bytes.store(response_bytes, Ordering::SeqCst);
+            if first_byte_ms.is_none() {
+                first_byte_ms = Some(
+                    clock.now_utc()
+                        .signed_duration_since(attempt_started)
+                        .num_milliseconds(),
+                );
+                *stats.first_byte_ms.lock() = first_byte_ms;
+            }
+            let converted = converter.feed(&decoded);
+            sync_converter_usage(&converter, &stats, &stream_protocol);
+            if converter.finished() {
+                // The whole stream fit in the prelude: record the terminal
+                // telemetry before the client has seen a single byte — a
+                // disconnect after the last event must not downgrade a
+                // completed stream to `cancelled`.
+                if first_token_ms.is_none() && scan.first_token() {
+                    first_token_ms = Some(
+                        clock.now_utc()
+                            .signed_duration_since(attempt_started)
+                            .num_milliseconds(),
+                    );
+                    *stats.first_token_ms.lock() = first_token_ms;
+                }
+                cancel_completed_flag.store(true, Ordering::SeqCst);
+                finalize_stream_attempt(
+                    &telemetry,
+                    &request_id_stream,
+                    started,
+                    failure_threshold,
+                    circuit_open_seconds,
+                    &candidate_stream,
+                    attempts,
+                    attempt_started,
+                    clock.now_utc(),
+                    AttemptOutcome::Success,
+                    status.as_u16() as i64,
+                    None,
+                    false,
+                    first_byte_ms,
+                    first_token_ms,
+                    converter_usage(&converter, &stream_protocol, false),
+                    response_bytes,
+                    upstream_protocol_stream.clone(),
+                    upstream_model_stream.clone(),
+                );
+                if !converted.is_empty() {
+                    yield Ok::<Bytes, Infallible>(Bytes::from(converted));
+                }
+                return;
+            }
+            if !converted.is_empty() {
+                yield Ok::<Bytes, Infallible>(Bytes::from(converted));
+            }
+        }
+        if first_token_ms.is_none() && scan.first_token() {
+            first_token_ms = Some(
+                clock.now_utc()
+                    .signed_duration_since(attempt_started)
+                    .num_milliseconds(),
+            );
+            *stats.first_token_ms.lock() = first_token_ms;
+        }
+        loop {
+            let next = tokio::time::timeout(stream_idle_timeout, upstream_stream.next()).await;
+            match next {
+                Ok(Some(Ok(chunk))) => {
+                    response_bytes += chunk.len() as i64;
+                    stats.bytes.store(response_bytes, Ordering::SeqCst);
+                    received_any = true;
+                    let now = clock.now_utc();
+                    if first_byte_ms.is_none() {
+                        first_byte_ms = Some(
+                            now.signed_duration_since(attempt_started)
+                                .num_milliseconds(),
+                        );
+                        *stats.first_byte_ms.lock() = first_byte_ms;
+                    }
+                    let decoded = match decoder.feed_required(&chunk) {
+                        Ok(decoded) => decoded,
+                        Err(error) => {
+                            // P1-2: the plaintext the conversion needs no
+                            // longer exists — emit a fixed gateway error
+                            // event and stop, never a silently truncated
+                            // stream.
+                            tracing::warn!(
+                                request_id = %request_id_stream,
+                                channel_id = %candidate_stream.channel_id,
+                                error = ?error,
+                                "mapped response decode failed mid-stream"
+                            );
+                            let converted = converter.error_event(
+                                "Upstream response could not be decoded",
+                            );
+                            // The error event is the terminal event: record
+                            // the outcome before the client can hang up.
+                            cancel_completed_flag.store(true, Ordering::SeqCst);
+                            finalize_stream_attempt(
+                                &telemetry,
+                                &request_id_stream,
+                                started,
+                                failure_threshold,
+                                circuit_open_seconds,
+                                &candidate_stream,
+                                attempts,
+                                attempt_started,
+                                clock.now_utc(),
+                                AttemptOutcome::GatewayError,
+                                status.as_u16() as i64,
+                                Some("upstream_decode_error".into()),
+                                true,
+                                first_byte_ms,
+                                first_token_ms,
+                                Usage::default(),
+                                response_bytes,
+                                upstream_protocol_stream.clone(),
+                                upstream_model_stream.clone(),
+                            );
+                            if !converted.is_empty() {
+                                yield Ok::<Bytes, Infallible>(Bytes::from(converted));
+                            }
+                            return;
+                        }
+                    };
+                    if let Some(message) = scan.feed(&stream_protocol, &decoded) {
+                        let converted = converter.error_event(&message);
+                        // The 2xx stream carries an upstream error; the
+                        // converted error event is terminal.
+                        cancel_completed_flag.store(true, Ordering::SeqCst);
+                        finalize_stream_attempt(
+                            &telemetry,
+                            &request_id_stream,
+                            started,
+                            failure_threshold,
+                            circuit_open_seconds,
+                            &candidate_stream,
+                            attempts,
+                            attempt_started,
+                            clock.now_utc(),
+                            AttemptOutcome::UpstreamError,
+                            status.as_u16() as i64,
+                            Some("upstream_error".into()),
+                            true,
+                            first_byte_ms,
+                            first_token_ms,
+                            converter_usage(&converter, &stream_protocol, false),
+                            response_bytes,
+                            upstream_protocol_stream.clone(),
+                            upstream_model_stream.clone(),
+                        );
+                        if !converted.is_empty() {
+                            yield Ok::<Bytes, Infallible>(Bytes::from(converted));
+                        }
+                        return;
+                    }
+                    if first_token_ms.is_none() && scan.first_token_now {
+                        first_token_ms = Some(
+                            now.signed_duration_since(attempt_started)
+                                .num_milliseconds(),
+                        );
+                        *stats.first_token_ms.lock() = first_token_ms;
+                    }
+                    let converted = converter.feed(&decoded);
+                    sync_converter_usage(&converter, &stats, &stream_protocol);
+                    if converter.finished() {
+                        // The terminal event (e.g. `response.completed`)
+                        // was produced: record the outcome BEFORE yielding
+                        // it, so a client that hangs up right after the
+                        // last event still leaves a success behind.
+                        cancel_completed_flag.store(true, Ordering::SeqCst);
+                        finalize_stream_attempt(
+                            &telemetry,
+                            &request_id_stream,
+                            started,
+                            failure_threshold,
+                            circuit_open_seconds,
+                            &candidate_stream,
+                            attempts,
+                            attempt_started,
+                            clock.now_utc(),
+                            AttemptOutcome::Success,
+                            status.as_u16() as i64,
+                            None,
+                            false,
+                            first_byte_ms,
+                            first_token_ms,
+                            converter_usage(&converter, &stream_protocol, false),
+                            response_bytes,
+                            upstream_protocol_stream.clone(),
+                            upstream_model_stream.clone(),
+                        );
+                        if !converted.is_empty() {
+                            yield Ok::<Bytes, Infallible>(Bytes::from(converted));
+                        }
+                        return;
+                    }
+                    if !converted.is_empty() {
+                        yield Ok::<Bytes, Infallible>(Bytes::from(converted));
+                    }
+                }
+                Ok(Some(Err(_))) => {
+                    ok = false;
+                    break;
+                }
+                Ok(None) => {
+                    if !decoder.finished() && received_any {
+                        // The body ended mid-frame: the plaintext is
+                        // incomplete (P1-2). A body that carried NO bytes at
+                        // all is an empty stream (the no-first-token case),
+                        // not a decode failure.
+                        decode_failed = true;
+                    }
+                    break;
+                }
+                Err(_) => {
+                    ok = false;
+                    idle_timeout = true;
+                    break;
+                }
+            }
+        }
+        // Close any remaining items on a clean finish. When the converter
+        // finishes here (upstream ended WITHOUT a terminal marker — a bare
+        // close), record the outcome before the tail events reach the
+        // client. A bare close that never produced a first token is a
+        // first-token protection violation, not a success.
+        if !decode_failed && ok {
+            let tail = converter.flush();
+            if converter.finished() {
+                let (outcome, error_kind, countable) = if first_token_ms.is_none() {
+                    (
+                        AttemptOutcome::StreamInterrupted,
+                        Some("no_first_token".into()),
+                        true,
+                    )
+                } else {
+                    (AttemptOutcome::Success, None, false)
+                };
+                cancel_completed_flag.store(true, Ordering::SeqCst);
+                finalize_stream_attempt(
+                    &telemetry,
+                    &request_id_stream,
+                    started,
+                    failure_threshold,
+                    circuit_open_seconds,
+                    &candidate_stream,
+                    attempts,
+                    attempt_started,
+                    clock.now_utc(),
+                    outcome,
+                    status.as_u16() as i64,
+                    error_kind,
+                    countable,
+                    first_byte_ms,
+                    first_token_ms,
+                    converter_usage(&converter, &stream_protocol, false),
+                    response_bytes,
+                    upstream_protocol_stream.clone(),
+                    upstream_model_stream.clone(),
+                );
+                if !tail.is_empty() {
+                    yield Ok::<Bytes, Infallible>(Bytes::from(tail));
+                }
+                return;
+            }
+            if !tail.is_empty() {
+                yield Ok::<Bytes, Infallible>(Bytes::from(tail));
+            }
+        }
+        // The generator ran to its terminal telemetry (mid-frame end,
+        // upstream error, or idle/first-token timeout): the Drop path must
+        // not append a duplicate `cancelled` finish.
+        cancel_completed_flag.store(true, Ordering::SeqCst);
+        let finished = clock.now_utc();
+        let (outcome, error_kind, final_status, countable): (
+            AttemptOutcome,
+            Option<String>,
+            i64,
+            bool,
+        ) = if decode_failed {
+            (
+                AttemptOutcome::GatewayError,
+                Some("upstream_decode_error".into()),
+                status.as_u16() as i64,
+                true,
+            )
+        } else if !ok {
+            if idle_timeout {
+                (
+                    AttemptOutcome::StreamInterrupted,
+                    Some("transport_timeout".into()),
+                    504,
+                    true,
+                )
+            } else {
+                (
+                    AttemptOutcome::StreamInterrupted,
+                    Some("stream_interrupted".into()),
+                    status.as_u16() as i64,
+                    true,
+                )
+            }
+        } else if first_token_ms.is_none() {
+            // Passthrough conversion (entry == upstream protocol): no
+            // terminal marker exists to detect, and the upstream closed
+            // without ever producing a first token. Count it against the
+            // circuit like the transparent path does.
+            (
+                AttemptOutcome::StreamInterrupted,
+                Some("no_first_token".into()),
+                status.as_u16() as i64,
+                true,
+            )
+        } else {
+            (AttemptOutcome::Success, None, status.as_u16() as i64, false)
+        };
+        finalize_stream_attempt(
+            &telemetry,
+            &request_id_stream,
+            started,
+            failure_threshold,
+            circuit_open_seconds,
+            &candidate_stream,
+            attempts,
+            attempt_started,
+            finished,
+            outcome,
+            final_status,
+            error_kind,
+            countable,
+            first_byte_ms,
+            first_token_ms,
+            converter_usage(&converter, &stream_protocol, decode_failed),
+            response_bytes,
+            upstream_protocol_stream,
+            upstream_model_stream,
+        );
+    };
+    let mut result = Response::new(Body::from_stream(stream_body));
+    *result.status_mut() = status;
+    let mut headers = response_headers_for_client;
+    headers.remove("content-length");
+    // The converted stream is plaintext; the original encoding header must
+    // not leak through.
+    headers.remove("content-encoding");
+    headers.insert(
+        "content-type",
+        HeaderValue::from_static("text/event-stream"),
+    );
+    *result.headers_mut() = headers;
+    MappedStreamResult::Respond(result)
+}
+
+/// Result of the request-preparation phase (P2-4): everything the attempt
+/// loop needs, or an early gateway error response.
+struct PreparedRequest {
+    runtime: settings::RuntimeSettings,
+    headers: axum::http::HeaderMap,
+    path: String,
+    query: Option<String>,
+    entry_model: String,
+    stream_requested: bool,
+    mapping: Option<routing::MappingTarget>,
+    upstream_protocol: String,
+    upstream_model: String,
+    converted_body: Bytes,
+    candidates: Vec<Candidate>,
+}
+
+/// Request preparation (P2-4): settings, body read, gateway auth, model
+/// inspection, mapping resolution and candidate routing. Any failure
+/// produces an early gateway-error response instead of entering the attempt
+/// loop.
+async fn prepare_request(
+    svc: &ProxyService,
     request: Request,
     entry_protocol: &str,
     fixed_path: Option<String>,
-) -> Response<Body> {
-    let request_id = uuid::Uuid::new_v4().to_string();
-    let started = chrono::Utc::now();
+    request_id: &str,
+    started: chrono::DateTime<chrono::Utc>,
+) -> Result<PreparedRequest, Response<Body>> {
     let started_at = started.to_rfc3339();
-    let (headers, request_path, query_string, body) = match read_body(request).await {
-        Ok(value) => value,
-        Err(error) => {
-            return gateway_error(
-                entry_protocol,
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "request_too_large",
-                &error.to_string(),
-                &request_id,
-            );
-        }
+    let (headers, request_path, query_string) = {
+        let headers = request.headers().clone();
+        let path = request.uri().path().to_owned();
+        let query = request.uri().query().map(str::to_owned);
+        (headers, path, query)
     };
     let path = fixed_path.unwrap_or(request_path);
     let query = query_string.as_deref();
-    if !settings::authorize_gateway(&state, &headers, query, entry_protocol)
+    let runtime = match settings::runtime_settings_from(&svc.db).await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(request_id = %request_id, error = %error, "settings load failed");
+            return Err(gateway_error(
+                entry_protocol,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "settings_error",
+                "Settings error",
+                request_id,
+            ));
+        }
+    };
+    let body = match read_body(
+        request,
+        (runtime.max_request_body_mb.max(1) as usize) * 1024 * 1024,
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(_) => {
+            tracing::error!(request_id, "request body read failed");
+            return Err(gateway_error(
+                entry_protocol,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_too_large",
+                "Request body exceeds the configured limit.",
+                request_id,
+            ));
+        }
+    };
+    if !settings::authorize_gateway_from(&svc.db, &svc.secrets, &headers, query, entry_protocol)
         .await
         .unwrap_or(false)
     {
-        return gateway_error(
+        return Err(gateway_error(
             entry_protocol,
             StatusCode::UNAUTHORIZED,
             "unauthorized",
             "Gateway access denied.",
-            &request_id,
-        );
+            request_id,
+        ));
     }
     let (entry_model, stream_requested) =
         protocol::inspect_request(entry_protocol, &path, query, &body);
     let Some(entry_model) = entry_model else {
-        return gateway_error(
+        return Err(gateway_error(
             entry_protocol,
             StatusCode::BAD_REQUEST,
             "model_required",
             "Unable to determine model from request.",
-            &request_id,
-        );
+            request_id,
+        ));
     };
     // Model mappings only apply to the dedicated mapping entry points
     // (/codex/v1/responses, /claudecode/v1/messages); the regular protocol
@@ -420,16 +1764,21 @@ async fn proxy(
     let is_mapped_entry = (entry_protocol == "openai_responses" && path.starts_with("/codex/"))
         || (entry_protocol == "claude" && path.starts_with("/claudecode/"));
     let mapping = if is_mapped_entry {
-        match resolve_mapping(&state, entry_protocol, &entry_model).await {
+        match svc
+            .routes
+            .resolve_mapping(entry_protocol, &entry_model)
+            .await
+        {
             Ok(value) => value,
             Err(error) => {
-                return gateway_error(
+                tracing::error!(request_id = %request_id, error = %error, "mapping lookup failed");
+                return Err(gateway_error(
                     entry_protocol,
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "database_error",
-                    &error.to_string(),
-                    &request_id,
-                );
+                    "Database error",
+                    request_id,
+                ));
             }
         }
     } else {
@@ -439,9 +1788,9 @@ async fn proxy(
     // clear 404 (Python: `unknown_mapped_model`) instead of silently routing
     // the request as a regular protocol request.
     if is_mapped_entry && mapping.is_none() {
-        let finished = chrono::Utc::now();
-        state.telemetry.emit(Event::RequestStart {
-            id: request_id.clone(),
+        let finished = svc.clock.now_utc();
+        svc.telemetry.emit(Event::RequestStart {
+            id: request_id.to_owned(),
             protocol: entry_protocol.to_owned(),
             model_id: Some(entry_model.clone()),
             endpoint: path.clone(),
@@ -449,8 +1798,8 @@ async fn proxy(
             started_at: started_at.clone(),
             request_bytes: body.len() as i64,
         });
-        state.telemetry.emit(Event::RequestFinish {
-            id: request_id.clone(),
+        svc.telemetry.emit(Event::RequestFinish {
+            id: request_id.to_owned(),
             finished_at: finished.to_rfc3339(),
             duration_ms: finished.signed_duration_since(started).num_milliseconds(),
             status: Some(404),
@@ -459,13 +1808,13 @@ async fn proxy(
             channel_id: None,
             response_bytes: 0,
         });
-        return gateway_error(
+        return Err(gateway_error(
             entry_protocol,
             StatusCode::NOT_FOUND,
             "unknown_mapped_model",
             &format!("Model '{entry_model}' is not a configured model mapping."),
-            &request_id,
-        );
+            request_id,
+        ));
     }
     let upstream_protocol = mapping
         .as_ref()
@@ -482,15 +1831,15 @@ async fn proxy(
             &value.upstream_model,
             &body,
         ) {
-            Ok(body) => body,
+            Ok(body) => Bytes::from(body),
             Err(error) => {
-                return gateway_error(
+                return Err(gateway_error(
                     entry_protocol,
                     StatusCode::BAD_REQUEST,
                     "invalid_request",
                     &error.to_string(),
-                    &request_id,
-                );
+                    request_id,
+                ));
             }
         }
     } else {
@@ -500,8 +1849,8 @@ async fn proxy(
         protocol::inspect_request(upstream_protocol, &path, query, &converted_body);
     let stream_requested = stream_requested || stream;
     let route_model = model_id.as_deref().unwrap_or(upstream_model);
-    state.telemetry.emit(Event::RequestStart {
-        id: request_id.clone(),
+    svc.telemetry.emit(Event::RequestStart {
+        id: request_id.to_owned(),
         protocol: entry_protocol.to_owned(),
         model_id: Some(entry_model.clone()),
         endpoint: path.clone(),
@@ -509,42 +1858,34 @@ async fn proxy(
         started_at: started_at.clone(),
         request_bytes: body.len() as i64,
     });
-    let runtime = match settings::runtime_settings(&state).await {
-        Ok(value) => value,
-        Err(error) => {
-            return gateway_error(
-                entry_protocol,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "settings_error",
-                &error.to_string(),
-                &request_id,
-            );
-        }
-    };
-    let candidates = match routing::resolve_candidates(
-        &state,
-        upstream_protocol,
-        route_model,
-        runtime.max_failover_attempts,
-    )
-    .await
+    let candidates = match svc
+        .routes
+        .resolve_candidates(
+            upstream_protocol,
+            route_model,
+            runtime.max_failover_attempts,
+        )
+        .await
     {
         Ok(value) => value,
         Err(error) => {
-            return gateway_error(
+            tracing::error!(request_id = %request_id, error = %error, "candidate resolution failed");
+            return Err(gateway_error(
                 entry_protocol,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "routing_error",
-                &error.to_string(),
-                &request_id,
-            );
+                "Routing error",
+                request_id,
+            ));
         }
     };
     if candidates.is_empty() {
-        state.telemetry.emit(Event::RequestFinish {
-            id: request_id.clone(),
-            finished_at: chrono::Utc::now().to_rfc3339(),
-            duration_ms: chrono::Utc::now()
+        svc.telemetry.emit(Event::RequestFinish {
+            id: request_id.to_owned(),
+            finished_at: svc.clock.now_utc().to_rfc3339(),
+            duration_ms: svc
+                .clock
+                .now_utc()
                 .signed_duration_since(started)
                 .num_milliseconds(),
             status: Some(503),
@@ -553,794 +1894,345 @@ async fn proxy(
             channel_id: None,
             response_bytes: 0,
         });
-        return gateway_error(
+        return Err(gateway_error(
             entry_protocol,
             StatusCode::SERVICE_UNAVAILABLE,
             "no_active_channel",
             "No active channel is available for this model.",
-            &request_id,
-        );
+            request_id,
+        ));
     }
-    let mut last_error: Option<(StatusCode, axum::http::HeaderMap, Vec<u8>, String)> = None;
-    let mut attempts = 0i64;
-    for (index, candidate) in candidates.iter().enumerate() {
-        attempts = index as i64 + 1;
-        let attempt_started = chrono::Utc::now();
-        let api_key = match state.secrets.decrypt(&candidate.api_key_encrypted) {
-            Ok(value) => value,
-            Err(error) => {
-                last_error = None;
-                state.telemetry.emit(attempt_event(
-                    &request_id,
-                    candidate,
-                    attempts,
-                    attempt_started,
-                    chrono::Utc::now(),
-                    None,
-                    "transport_error",
-                    Some("key_decrypt_error".into()),
-                    attempts < candidates.len() as i64,
-                    false,
-                    None,
-                    None,
-                    Usage::default(),
-                    0,
-                    Some(upstream_protocol.into()),
-                    Some(upstream_model.into()),
-                ));
-                let _ = error;
-                continue;
-            }
-        };
-        let target_path = mapping
-            .as_ref()
-            .map(|value| mapped_path(value, &path, stream_requested, &value.upstream_model))
-            .unwrap_or_else(|| path.clone());
-        let target_url = match protocol::upstream_url(
-            &candidate.base_url,
-            &target_path,
-            query,
-            upstream_protocol,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                last_error = None;
-                let _ = error;
-                continue;
-            }
-        };
-        let outbound = match protocol::outbound_headers(&headers, upstream_protocol, &api_key) {
-            Ok(value) => value,
-            Err(error) => {
-                let _ = error;
-                continue;
-            }
-        };
-        let send = state
-            .http
-            .request(reqwest::Method::from_bytes(b"POST").unwrap(), target_url)
-            .headers(outbound)
-            .body(converted_body.clone())
-            .send();
-        let response = match tokio::time::timeout(
-            Duration::from_secs(runtime.first_byte_timeout_seconds.max(1) as u64),
-            send,
-        )
-        .await
-        {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => {
-                let finished = chrono::Utc::now();
-                state.telemetry.emit(Event::ChannelFailure {
-                    channel_id: candidate.channel_id.clone(),
-                    error_kind: "transport_error".into(),
-                    status: None,
-                    threshold: runtime.failure_threshold,
-                    open_seconds: runtime.circuit_open_seconds,
-                    countable: true,
-                });
-                state.telemetry.emit(attempt_event(
-                    &request_id,
-                    candidate,
-                    attempts,
-                    attempt_started,
-                    finished,
-                    None,
-                    "transport_error",
-                    Some(error.to_string()),
-                    attempts < candidates.len() as i64,
-                    false,
-                    None,
-                    None,
-                    Usage::default(),
-                    0,
-                    Some(upstream_protocol.into()),
-                    Some(upstream_model.into()),
-                ));
-                continue;
-            }
-            Err(_) => {
-                let finished = chrono::Utc::now();
-                state.telemetry.emit(Event::ChannelFailure {
-                    channel_id: candidate.channel_id.clone(),
-                    error_kind: "timeout".into(),
-                    status: None,
-                    threshold: runtime.failure_threshold,
-                    open_seconds: runtime.circuit_open_seconds,
-                    countable: true,
-                });
-                state.telemetry.emit(attempt_event(
-                    &request_id,
-                    candidate,
-                    attempts,
-                    attempt_started,
-                    finished,
-                    None,
-                    "transport_error",
-                    Some("timeout".into()),
-                    attempts < candidates.len() as i64,
-                    false,
-                    None,
-                    None,
-                    Usage::default(),
-                    0,
-                    Some(upstream_protocol.into()),
-                    Some(upstream_model.into()),
-                ));
-                continue;
-            }
-        };
-        let status = response.status();
-        let response_headers = protocol::response_headers(response.headers());
-        if status.is_success() {
-            if stream_requested && mapping.is_none() {
-                let upstream_stream = response.bytes_stream();
-                let response_headers_for_client = response_headers.clone();
-                let telemetry = state.telemetry.clone();
-                let request_id_stream = request_id.clone();
-                let candidate_stream = candidate.clone();
-                let upstream_protocol_stream = upstream_protocol.to_owned();
-                let upstream_model_stream = upstream_model.to_owned();
-                let stream_protocol = upstream_protocol_stream.clone();
-                let failure_threshold = runtime.failure_threshold;
-                let circuit_open_seconds = runtime.circuit_open_seconds;
-                let cancel_completed = Arc::new(AtomicBool::new(false));
-                let cancel_responded = Arc::new(AtomicBool::new(false));
-                let cancel_telemetry = state.telemetry.clone();
-                let cancel_request_id = request_id.clone();
-                let cancel_candidate = candidate.clone();
-                let cancel_attempt_no = attempts;
-                let cancel_attempt_started = attempt_started;
-                let cancel_status = status.as_u16() as i64;
-                let cancel_upstream_protocol = upstream_protocol_stream.clone();
-                let cancel_upstream_model = upstream_model_stream.clone();
-                let cancel_responded_flag = cancel_responded.clone();
-                let on_cancel: Box<dyn FnOnce() + Send> = Box::new(move || {
-                    let finished = chrono::Utc::now();
-                    cancel_telemetry.emit(attempt_event(
-                        &cancel_request_id,
-                        &cancel_candidate,
-                        cancel_attempt_no,
-                        cancel_attempt_started,
-                        finished,
-                        Some(cancel_status),
-                        "cancelled",
-                        None,
-                        false,
-                        cancel_responded_flag.load(Ordering::SeqCst),
-                        None,
-                        None,
-                        Usage::default(),
-                        0,
-                        Some(cancel_upstream_protocol),
-                        Some(cancel_upstream_model),
-                    ));
-                    cancel_telemetry.emit(Event::RequestFinish {
-                        id: cancel_request_id,
-                        finished_at: finished.to_rfc3339(),
-                        duration_ms: finished
-                            .signed_duration_since(cancel_attempt_started)
-                            .num_milliseconds(),
-                        status: Some(cancel_status),
-                        outcome: "cancelled".into(),
-                        attempts: cancel_attempt_no,
-                        channel_id: Some(cancel_candidate.channel_id),
-                        response_bytes: 0,
-                    });
-                });
-                let cancel_aware = CancelAware {
-                    inner: upstream_stream,
-                    completed: cancel_completed,
-                    responded: cancel_responded,
-                    on_cancel: Some(on_cancel),
-                };
-                let stream_body = stream! {
-                    let mut upstream_stream = cancel_aware;
-                    let mut response_bytes = 0i64;
-                    let mut ok = true;
-                    let mut pending: Vec<u8> = Vec::new();
-                    let mut first_byte_ms: Option<i64> = None;
-                    let mut first_token_ms: Option<i64> = None;
-                    let mut usage: Usage = Usage::default();
-                    while let Some(chunk) = upstream_stream.next().await {
-                        match chunk {
-                            Ok(chunk) => {
-                                response_bytes += chunk.len() as i64;
-                                let now = chrono::Utc::now();
-                                if first_byte_ms.is_none() {
-                                    first_byte_ms = Some(
-                                        now.signed_duration_since(attempt_started).num_milliseconds(),
-                                    );
-                                }
-                                pending.extend_from_slice(&chunk);
-                                let mut consumed = 0usize;
-                                while let Some(offset) =
-                                    pending[consumed..].iter().position(|byte| *byte == b'\n')
-                                {
-                                    let end = consumed + offset;
-                                    let line = &pending[consumed..end];
-                                    consumed = end + 1;
-                                    let line = String::from_utf8_lossy(line);
-                                    let line = line.trim_end_matches('\r');
-                                    let Some(data) = line.strip_prefix("data:") else {
-                                        continue;
-                                    };
-                                    let data = data.trim();
-                                    if data.is_empty() || data == "[DONE]" {
-                                        continue;
-                                    }
-                                    let Ok(value) = serde_json::from_str::<Value>(data) else {
-                                        continue;
-                                    };
-                                    if first_token_ms.is_none()
-                                        && convert::chunk_has_content(&stream_protocol, &value)
-                                    {
-                                        first_token_ms = Some(
-                                            now.signed_duration_since(attempt_started)
-                                                .num_milliseconds(),
-                                        );
-                                    }
-                                    if let Some(raw_usage) =
-                                        stream_usage_value(&stream_protocol, &value)
-                                    {
-                                        usage = normalize_usage(&stream_protocol, &raw_usage);
-                                    }
-                                }
-                                pending.drain(..consumed);
-                                yield Ok::<Bytes, Infallible>(chunk);
-                            }
-                            Err(_) => {
-                                ok = false;
-                                break;
-                            }
-                        }
-                    }
-                    let finished = chrono::Utc::now();
-                    let finished_str = finished.to_rfc3339();
-                    let outcome = if ok { "success" } else { "stream_interrupted" };
-                    if ok { telemetry.emit(Event::ChannelSuccess { channel_id:candidate_stream.channel_id.clone() }); }
-                    else { telemetry.emit(Event::ChannelFailure { channel_id:candidate_stream.channel_id.clone(), error_kind:"stream_interrupted".into(), status:Some(status.as_u16() as i64), threshold:failure_threshold, open_seconds:circuit_open_seconds, countable:true }); }
-                    telemetry.emit(attempt_event(&request_id_stream,&candidate_stream,attempts,attempt_started,finished,Some(status.as_u16() as i64),outcome, if ok {None}else{Some("stream_interrupted".into())},false,true,first_byte_ms,first_token_ms,usage,response_bytes,Some(upstream_protocol_stream),Some(upstream_model_stream)));
-                    telemetry.emit(Event::RequestFinish { id:request_id_stream, finished_at:finished_str, duration_ms:chrono::Utc::now().signed_duration_since(started).num_milliseconds(), status:Some(status.as_u16() as i64), outcome:outcome.into(), attempts, channel_id:Some(candidate_stream.channel_id), response_bytes });
-                };
-                let mut result = Response::new(Body::from_stream(stream_body));
-                *result.status_mut() = status;
-                *result.headers_mut() = response_headers_for_client;
-                return result;
-            }
-            // C2: mapped entries stream through an incremental converter. A
-            // short prelude is buffered first so a 200 response whose body is
-            // actually an upstream error can still fail over, and
-            // `first_token_timeout_seconds` is honored like the Python
-            // gateway. The remaining body is converted event-by-event so the
-            // client sees a live stream.
-            if stream_requested {
-                let failure_threshold = runtime.failure_threshold;
-                let circuit_open_seconds = runtime.circuit_open_seconds;
-                let first_token_timeout =
-                    Duration::from_secs(runtime.first_token_timeout_seconds.max(1) as u64);
-                let stream_idle_timeout =
-                    Duration::from_secs(runtime.stream_idle_timeout_seconds.max(1) as u64);
-                let mut upstream_stream = response.bytes_stream();
-                let mut prelude: Vec<Bytes> = Vec::new();
-                let mut prelude_bytes = 0usize;
-                let mut scan = convert::StreamScan::new(upstream_protocol);
-                let prelude_outcome = tokio::time::timeout(first_token_timeout, async {
-                    loop {
-                        match upstream_stream.next().await {
-                            Some(Ok(chunk)) => {
-                                prelude_bytes += chunk.len();
-                                prelude.push(chunk.clone());
-                                if let Some(message) = scan.feed(upstream_protocol, &chunk) {
-                                    break Err(message);
-                                }
-                                if scan.first_token_now || prelude_bytes >= 1024 * 1024 {
-                                    break Ok(());
-                                }
-                            }
-                            Some(Err(_)) => break Ok(()),
-                            None => break Ok(()),
-                        }
-                    }
-                })
-                .await;
-                match prelude_outcome {
-                    Ok(Err(message)) => {
-                        // 2xx body carries an upstream error: record and fail
-                        // over to the next candidate (Python prelude path).
-                        let finished = chrono::Utc::now();
-                        state.telemetry.emit(Event::ChannelFailure {
-                            channel_id: candidate.channel_id.clone(),
-                            error_kind: "upstream_error".into(),
-                            status: Some(502),
-                            threshold: failure_threshold,
-                            open_seconds: circuit_open_seconds,
-                            countable: true,
-                        });
-                        state.telemetry.emit(attempt_event(
-                            &request_id,
-                            candidate,
-                            attempts,
-                            attempt_started,
-                            finished,
-                            Some(502),
-                            "http_error",
-                            Some("upstream_error".into()),
-                            attempts < candidates.len() as i64,
-                            false,
-                            None,
-                            None,
-                            Usage::default(),
-                            prelude_bytes as i64,
-                            Some(upstream_protocol.into()),
-                            Some(upstream_model.into()),
-                        ));
-                        let _ = message;
-                        continue;
-                    }
-                    Err(_) => {
-                        // No first token within first_token_timeout: fail over.
-                        let finished = chrono::Utc::now();
-                        state.telemetry.emit(Event::ChannelFailure {
-                            channel_id: candidate.channel_id.clone(),
-                            error_kind: "timeout".into(),
-                            status: None,
-                            threshold: failure_threshold,
-                            open_seconds: circuit_open_seconds,
-                            countable: true,
-                        });
-                        state.telemetry.emit(attempt_event(
-                            &request_id,
-                            candidate,
-                            attempts,
-                            attempt_started,
-                            finished,
-                            None,
-                            "transport_error",
-                            Some("timeout".into()),
-                            attempts < candidates.len() as i64,
-                            false,
-                            None,
-                            None,
-                            Usage::default(),
-                            prelude_bytes as i64,
-                            Some(upstream_protocol.into()),
-                            Some(upstream_model.into()),
-                        ));
-                        continue;
-                    }
-                    Ok(Ok(())) => {}
-                }
-                let converter = match convert::MappedStreamConverter::new(
-                    entry_protocol,
-                    upstream_protocol,
-                    &entry_model,
-                ) {
-                    Ok(converter) => converter,
-                    Err(error) => {
-                        return gateway_error(
-                            entry_protocol,
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "conversion_error",
-                            &error.to_string(),
-                            &request_id,
-                        );
-                    }
-                };
-                let stream_protocol = upstream_protocol.to_owned();
-                let response_headers_for_client = response_headers.clone();
-                let telemetry = state.telemetry.clone();
-                let request_id_stream = request_id.clone();
-                let candidate_stream = candidate.clone();
-                let upstream_protocol_stream = upstream_protocol.to_owned();
-                let upstream_model_stream = upstream_model.to_owned();
-                let cancel_completed = Arc::new(AtomicBool::new(false));
-                let cancel_responded = Arc::new(AtomicBool::new(false));
-                let cancel_telemetry = state.telemetry.clone();
-                let cancel_request_id = request_id.clone();
-                let cancel_candidate = candidate.clone();
-                let cancel_attempt_no = attempts;
-                let cancel_attempt_started = attempt_started;
-                let cancel_status = status.as_u16() as i64;
-                let cancel_upstream_protocol = upstream_protocol_stream.clone();
-                let cancel_upstream_model = upstream_model_stream.clone();
-                let cancel_responded_flag = cancel_responded.clone();
-                let on_cancel: Box<dyn FnOnce() + Send> = Box::new(move || {
-                    let finished = chrono::Utc::now();
-                    cancel_telemetry.emit(attempt_event(
-                        &cancel_request_id,
-                        &cancel_candidate,
-                        cancel_attempt_no,
-                        cancel_attempt_started,
-                        finished,
-                        Some(cancel_status),
-                        "cancelled",
-                        None,
-                        false,
-                        cancel_responded_flag.load(Ordering::SeqCst),
-                        None,
-                        None,
-                        Usage::default(),
-                        0,
-                        Some(cancel_upstream_protocol),
-                        Some(cancel_upstream_model),
-                    ));
-                    cancel_telemetry.emit(Event::RequestFinish {
-                        id: cancel_request_id,
-                        finished_at: finished.to_rfc3339(),
-                        duration_ms: finished
-                            .signed_duration_since(cancel_attempt_started)
-                            .num_milliseconds(),
-                        status: Some(cancel_status),
-                        outcome: "cancelled".into(),
-                        attempts: cancel_attempt_no,
-                        channel_id: Some(cancel_candidate.channel_id),
-                        response_bytes: 0,
-                    });
-                });
-                let cancel_aware = CancelAware {
-                    inner: upstream_stream,
-                    completed: cancel_completed,
-                    responded: cancel_responded,
-                    on_cancel: Some(on_cancel),
-                };
-                let stream_body = stream! {
-                    let mut upstream_stream = cancel_aware;
-                    let mut converter = converter;
-                    let mut scan = scan;
-                    let mut response_bytes = 0i64;
-                    let mut ok = true;
-                    let mut idle_timeout = false;
-                    let mut error_message: Option<String> = None;
-                    let mut first_byte_ms: Option<i64> = None;
-                    let mut first_token_ms: Option<i64> = None;
-                    // Replay the buffered prelude through the converter.
-                    for chunk in prelude {
-                        response_bytes += chunk.len() as i64;
-                        if first_byte_ms.is_none() {
-                            first_byte_ms = Some(
-                                chrono::Utc::now()
-                                    .signed_duration_since(attempt_started)
-                                    .num_milliseconds(),
-                            );
-                        }
-                        let converted = converter.feed(&chunk);
-                        if !converted.is_empty() {
-                            yield Ok::<Bytes, Infallible>(Bytes::from(converted));
-                        }
-                    }
-                    if first_token_ms.is_none() && scan.first_token() {
-                        first_token_ms = Some(
-                            chrono::Utc::now()
-                                .signed_duration_since(attempt_started)
-                                .num_milliseconds(),
-                        );
-                    }
-                    loop {
-                        let next = tokio::time::timeout(stream_idle_timeout, upstream_stream.next()).await;
-                        match next {
-                            Ok(Some(Ok(chunk))) => {
-                                response_bytes += chunk.len() as i64;
-                                let now = chrono::Utc::now();
-                                if first_byte_ms.is_none() {
-                                    first_byte_ms = Some(
-                                        now.signed_duration_since(attempt_started)
-                                            .num_milliseconds(),
-                                    );
-                                }
-                                if let Some(message) = scan.feed(&stream_protocol, &chunk) {
-                                    error_message = Some(message);
-                                    let converted = converter.error_event(
-                                        error_message
-                                            .as_deref()
-                                            .unwrap_or("Upstream stream error"),
-                                    );
-                                    if !converted.is_empty() {
-                                        yield Ok::<Bytes, Infallible>(Bytes::from(converted));
-                                    }
-                                    break;
-                                }
-                                if first_token_ms.is_none() && scan.first_token_now {
-                                    first_token_ms = Some(
-                                        now.signed_duration_since(attempt_started)
-                                            .num_milliseconds(),
-                                    );
-                                }
-                                let converted = converter.feed(&chunk);
-                                if !converted.is_empty() {
-                                    yield Ok::<Bytes, Infallible>(Bytes::from(converted));
-                                }
-                            }
-                            Ok(Some(Err(_))) => {
-                                ok = false;
-                                break;
-                            }
-                            Ok(None) => break,
-                            Err(_) => {
-                                ok = false;
-                                idle_timeout = true;
-                                break;
-                            }
-                        }
-                    }
-                    // Close any remaining items on a clean finish.
-                    if error_message.is_none() && ok {
-                        let tail = converter.flush();
-                        if !tail.is_empty() {
-                            yield Ok::<Bytes, Infallible>(Bytes::from(tail));
-                        }
-                    }
-                    let finished = chrono::Utc::now();
-                    let finished_str = finished.to_rfc3339();
-                    let (outcome, error_kind, final_status): (&str, Option<String>, i64) =
-                        if error_message.is_some() {
-                            (
-                                "upstream_error",
-                                Some("upstream_error".into()),
-                                status.as_u16() as i64,
-                            )
-                        } else if !ok {
-                            if idle_timeout {
-                                (
-                                    "stream_interrupted",
-                                    Some("transport_timeout".into()),
-                                    504,
-                                )
-                            } else {
-                                (
-                                    "stream_interrupted",
-                                    Some("stream_interrupted".into()),
-                                    status.as_u16() as i64,
-                                )
-                            }
-                        } else {
-                            ("success", None, status.as_u16() as i64)
-                        };
-                    let (input, output, cache_read, cache_write) = converter.usage();
-                    let cache_miss = match stream_protocol.as_str() {
-                        "claude" => input,
-                        "gemini" => input.map(|total| (total - cache_read.unwrap_or(0)).max(0)),
-                        _ => match (input, cache_read) {
-                            (Some(total), Some(read)) => {
-                                Some((total - read - cache_write.unwrap_or(0)).max(0))
-                            }
-                            _ => None,
-                        },
-                    };
-                    let usage = Usage {
-                        input_tokens: input,
-                        cache_read_tokens: cache_read,
-                        cache_write_tokens: cache_write,
-                        cache_miss_input_tokens: cache_miss,
-                        output_tokens: output,
-                        raw: None,
-                    };
-                    if outcome == "success" {
-                        telemetry.emit(Event::ChannelSuccess {
-                            channel_id: candidate_stream.channel_id.clone(),
-                        });
-                    } else {
-                        telemetry.emit(Event::ChannelFailure {
-                            channel_id: candidate_stream.channel_id.clone(),
-                            error_kind: error_kind
-                                .clone()
-                                .unwrap_or_else(|| "upstream_error".into()),
-                            status: Some(final_status),
-                            threshold: failure_threshold,
-                            open_seconds: circuit_open_seconds,
-                            countable: true,
-                        });
-                    }
-                    telemetry.emit(attempt_event(
-                        &request_id_stream,
-                        &candidate_stream,
-                        attempts,
-                        attempt_started,
-                        finished,
-                        Some(final_status),
-                        outcome,
-                        error_kind,
-                        false,
-                        true,
-                        first_byte_ms,
-                        first_token_ms,
-                        usage,
-                        response_bytes,
-                        Some(upstream_protocol_stream),
-                        Some(upstream_model_stream),
-                    ));
-                    telemetry.emit(Event::RequestFinish {
-                        id: request_id_stream,
-                        finished_at: finished_str,
-                        duration_ms: chrono::Utc::now()
-                            .signed_duration_since(started)
-                            .num_milliseconds(),
-                        status: Some(final_status),
-                        outcome: outcome.into(),
-                        attempts,
-                        channel_id: Some(candidate_stream.channel_id),
-                        response_bytes,
-                    });
-                };
-                let mut result = Response::new(Body::from_stream(stream_body));
-                *result.status_mut() = status;
-                let mut headers = response_headers_for_client;
-                headers.remove("content-length");
-                headers.insert(
-                    "content-type",
-                    HeaderValue::from_static("text/event-stream"),
-                );
-                *result.headers_mut() = headers;
-                return result;
-            }
-            let read = tokio::time::timeout(
-                Duration::from_secs(runtime.non_stream_total_timeout_seconds.max(1) as u64),
-                response.bytes(),
-            )
-            .await;
-            let raw = match read {
-                Ok(Ok(value)) => value.to_vec(),
-                _ => {
-                    state.telemetry.emit(Event::ChannelFailure {
-                        channel_id: candidate.channel_id.clone(),
-                        error_kind: "timeout".into(),
-                        status: None,
-                        threshold: runtime.failure_threshold,
-                        open_seconds: runtime.circuit_open_seconds,
-                        countable: true,
-                    });
-                    continue;
-                }
-            };
-            let usage = usage_from_body(upstream_protocol, &raw);
-            let mut conversion_failed = false;
-            let result_body = if let Some(value) = mapping.as_ref() {
-                match convert::convert_response(
-                    &value.entry,
-                    &value.upstream_protocol,
-                    &entry_model,
-                    &raw,
-                ) {
-                    Ok(converted) => converted,
-                    Err(error) => {
-                        // Conversion failure produces a gateway error body in
-                        // the entry format (Python `_mapped_error_body`) plus a
-                        // channel_failure telemetry event; the HTTP status
-                        // stays 200 like the Python gateway.
-                        let payload = if entry_protocol == "claude" {
-                            json!({"type": "error", "error": {"type": "gateway_error", "message": error.to_string()}})
-                        } else {
-                            json!({"error": {"message": error.to_string(), "type": "gateway_error", "code": "conversion_error"}})
-                        };
-                        conversion_failed = true;
-                        state.telemetry.emit(Event::ChannelFailure {
-                            channel_id: candidate.channel_id.clone(),
-                            error_kind: "conversion_error".into(),
-                            status: None,
-                            threshold: runtime.failure_threshold,
-                            open_seconds: runtime.circuit_open_seconds,
-                            countable: false,
-                        });
-                        serde_json::to_vec(&payload).unwrap_or_else(|_| raw.clone())
-                    }
-                }
-            } else {
-                raw
-            };
-            let mut result = response_with_headers(status, response_headers, result_body.clone());
-            if mapping.is_some() {
-                result.headers_mut().remove("content-length");
-                result
-                    .headers_mut()
-                    .insert("content-type", HeaderValue::from_static("application/json"));
-            }
-            if !conversion_failed {
-                state.telemetry.emit(Event::ChannelSuccess {
-                    channel_id: candidate.channel_id.clone(),
-                });
-            }
-            let finished_at = chrono::Utc::now();
-            state.telemetry.emit(attempt_event(
-                &request_id,
-                candidate,
-                attempts,
-                attempt_started,
-                finished_at,
-                Some(status.as_u16() as i64),
-                "success",
-                None,
-                false,
-                true,
-                None,
-                None,
-                usage,
-                result_body.len() as i64,
-                Some(upstream_protocol.into()),
-                Some(upstream_model.into()),
-            ));
-            state.telemetry.emit(Event::RequestFinish {
-                id: request_id,
-                finished_at: chrono::Utc::now().to_rfc3339(),
-                duration_ms: chrono::Utc::now()
-                    .signed_duration_since(started)
-                    .num_milliseconds(),
-                status: Some(status.as_u16() as i64),
-                outcome: "success".into(),
-                attempts,
-                channel_id: Some(candidate.channel_id.clone()),
-                response_bytes: result_body.len() as i64,
-            });
-            return result;
-        }
-        let raw = match tokio::time::timeout(
-            Duration::from_secs(runtime.first_byte_timeout_seconds.max(1) as u64),
-            response.bytes(),
-        )
-        .await
-        {
-            Ok(Ok(value)) => value.to_vec(),
-            _ => Vec::new(),
-        };
-        let (kind, countable) = status_kind(status);
-        state.telemetry.emit(Event::ChannelFailure {
-            channel_id: candidate.channel_id.clone(),
-            error_kind: kind.into(),
-            status: Some(status.as_u16() as i64),
-            threshold: runtime.failure_threshold,
-            open_seconds: runtime.circuit_open_seconds,
-            countable,
-        });
+    let upstream_protocol = upstream_protocol.to_owned();
+    let upstream_model = upstream_model.to_owned();
+    Ok(PreparedRequest {
+        runtime,
+        headers,
+        path,
+        query: query.map(str::to_owned),
+        entry_model,
+        stream_requested,
+        mapping,
+        upstream_protocol,
+        upstream_model,
+        converted_body,
+        candidates,
+    })
+}
+
+/// Outcome of the bounded non-stream builder (P2-4): a response to send,
+/// or a transport failure that already emitted its terminal telemetry and
+/// should fail over to the next candidate.
+enum NonStreamResult {
+    Respond(Response<Body>),
+    FailOver(Option<TransportFailure>),
+}
+
+/// Non-stream success responses (mapped and non-mapped): bounded buffering
+/// (P1-1), lossless decode for mapped conversion (P1-2), conversion, and
+/// the unified terminal telemetry (P1-5).
+async fn bounded_non_stream(
+    env: AttemptEnv<'_>,
+    response: crate::ports::UpstreamResponse,
+    status: axum::http::StatusCode,
+    response_headers: axum::http::HeaderMap,
+) -> NonStreamResult {
+    // P1-1: mapped non-stream responses must be fully buffered for
+    // conversion, but the buffering is bounded — Content-Length is
+    // pre-checked and the chunked accumulation enforces a hard cap.
+    let buffered_cap = (env.runtime.max_buffered_upstream_body_mb.max(1) as usize) * 1024 * 1024;
+    // Read from the raw reqwest headers: `response_headers` strips
+    // content-length as hop-by-hop, but the declared size is exactly
+    // what the pre-check needs.
+    if let Some(content_length) = response
+        .headers
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        && content_length > buffered_cap
+    {
+        // Declared larger than the cap: reject without reading.
         let finished = chrono::Utc::now();
-        state.telemetry.emit(attempt_event(
-            &request_id,
-            candidate,
-            attempts,
-            attempt_started,
+        AttemptFinalizer::new(
+            Arc::new(env.telemetry.clone()),
+            env.request_id,
+            env.started,
+            env.runtime.failure_threshold,
+            env.runtime.circuit_open_seconds,
+        )
+        .finalize(
+            env.candidate,
+            env.attempts,
+            env.attempt_started,
             finished,
-            Some(status.as_u16() as i64),
-            "http_error",
-            Some(kind.into()),
-            attempts < candidates.len() as i64,
+            AttemptOutcome::GatewayError,
+            Some(502),
+            Some("upstream_response_too_large".into()),
+            env.attempts < env.candidates_len,
             false,
             None,
             None,
             Usage::default(),
-            raw.len() as i64,
-            Some(upstream_protocol.into()),
-            Some(upstream_model.into()),
+            0,
+            Some(env.upstream_protocol.into()),
+            Some(env.upstream_model.into()),
+            true,
+        );
+        return NonStreamResult::Respond(gateway_error(
+            env.entry_protocol,
+            StatusCode::BAD_GATEWAY,
+            "upstream_response_too_large",
+            "Upstream response exceeds the configured buffered-body limit.",
+            env.request_id,
         ));
-        last_error = Some((status, response_headers, raw, candidate.channel_id.clone()));
     }
+    let (raw_result, truncated) = read_bounded_body(
+        response.body.into_stream(),
+        Duration::from_secs(env.runtime.non_stream_total_timeout_seconds.max(1) as u64),
+        buffered_cap,
+    )
+    .await;
+    let raw = match raw_result {
+        Ok(raw) if !truncated => raw,
+        Ok(_) => {
+            // Cap hit mid-body: stop reading, never convert a
+            // partial JSON body.
+            let finished = chrono::Utc::now();
+            AttemptFinalizer::new(
+                Arc::new(env.telemetry.clone()),
+                env.request_id,
+                env.started,
+                env.runtime.failure_threshold,
+                env.runtime.circuit_open_seconds,
+            )
+            .finalize(
+                env.candidate,
+                env.attempts,
+                env.attempt_started,
+                finished,
+                AttemptOutcome::GatewayError,
+                Some(502),
+                Some("upstream_response_too_large".into()),
+                env.attempts < env.candidates_len,
+                false,
+                None,
+                None,
+                Usage::default(),
+                buffered_cap as i64,
+                Some(env.upstream_protocol.into()),
+                Some(env.upstream_model.into()),
+                true,
+            );
+            return NonStreamResult::Respond(gateway_error(
+                env.entry_protocol,
+                StatusCode::BAD_GATEWAY,
+                "upstream_response_too_large",
+                "Upstream response exceeds the configured buffered-body limit.",
+                env.request_id,
+            ));
+        }
+        Err(kind) => {
+            // Transport failure mid-body: reset carries its own
+            // attempt event (the tail maps it to 502); the total
+            // timeout classifies as BodyTimeout (504).
+            let (failure, error_kind) = match kind {
+                TransportFailure::ConnectionReset => {
+                    (TransportFailure::ConnectionReset, "transport_error")
+                }
+                _ => (TransportFailure::BodyTimeout, "timeout"),
+            };
+            let finished = chrono::Utc::now();
+
+            AttemptFinalizer::new(
+                Arc::new(env.telemetry.clone()),
+                env.request_id,
+                env.started,
+                env.runtime.failure_threshold,
+                env.runtime.circuit_open_seconds,
+            )
+            .finalize(
+                env.candidate,
+                env.attempts,
+                env.attempt_started,
+                finished,
+                AttemptOutcome::TransportError,
+                None,
+                Some(error_kind.into()),
+                env.attempts < env.candidates_len,
+                false,
+                None,
+                None,
+                Usage::default(),
+                0,
+                Some(env.upstream_protocol.into()),
+                Some(env.upstream_model.into()),
+                true,
+            );
+            return NonStreamResult::FailOver(Some(failure));
+        }
+    };
+    // Mapped conversion REQUIRES the plaintext: a decode failure is
+    // terminal (P1-2) — a stable gateway error, never a truncated
+    // body handed to the converter. Non-mapped responses only need
+    // best-effort observability, so their decode is soft.
+    let decoded = if env.mapping.is_some() {
+        let mut decoder = compression::RequiredDecoder::new(
+            compression::ContentDecoder::from_encoding(response_headers.get("content-encoding")),
+            buffered_cap,
+        );
+        match decoder.feed_required(&raw) {
+            Ok(decoded) if decoder.finished() => decoded,
+            Ok(_) => {
+                // The body ended mid-frame: the plaintext is
+                // incomplete and cannot be converted.
+                tracing::warn!(
+                    request_id = %env.request_id,
+                    channel_id = %env.candidate.channel_id,
+                    "mapped response truncated mid-frame"
+                );
+                decode_failure(&env, env.attempts < env.candidates_len, raw.len() as i64);
+                return NonStreamResult::Respond(gateway_error(
+                    env.entry_protocol,
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_decode_error",
+                    "Upstream response could not be decoded.",
+                    env.request_id,
+                ));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    request_id = %env.request_id,
+                    channel_id = %env.candidate.channel_id,
+                    error = ?error,
+                    "mapped response decode failed"
+                );
+                decode_failure(&env, env.attempts < env.candidates_len, raw.len() as i64);
+                return NonStreamResult::Respond(gateway_error(
+                    env.entry_protocol,
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_decode_error",
+                    "Upstream response could not be decoded.",
+                    env.request_id,
+                ));
+            }
+        }
+    } else {
+        let mut decoder = compression::ObservableDecoder::new(
+            compression::ContentDecoder::from_encoding(response_headers.get("content-encoding")),
+        );
+        decoder.feed_observable(&raw)
+    };
+    let usage = usage_from_body(env.upstream_protocol, &decoded);
+    let (result_body, conversion_failed, mapped) = if let Some(value) = env.mapping {
+        match convert::convert_response(
+            &value.entry,
+            &value.upstream_protocol,
+            env.entry_model,
+            &decoded,
+        ) {
+            Ok(converted) => (converted, false, true),
+            Err(error) => {
+                // Conversion failure produces a gateway error body in
+                // the entry format (Python `_mapped_error_body`); the
+                // HTTP status stays 200 like the Python gateway. The
+                // message is a fixed string — internal conversion
+                // text must not leak to the client (P1-8).
+                tracing::error!(request_id = %env.request_id, error = %error, "response conversion failed");
+                let payload = if env.entry_protocol == "claude" {
+                    json!({"type": "error", "error": {"type": "gateway_error", "message": "Response conversion failed"}})
+                } else {
+                    json!({"error": {"message": "Response conversion failed", "type": "gateway_error", "code": "conversion_error"}})
+                };
+                (
+                    serde_json::to_vec(&payload).unwrap_or_else(|_| raw.clone()),
+                    true,
+                    true,
+                )
+            }
+        }
+    } else {
+        // Non-mapped: forward the raw bytes with the original
+        // headers (content-length included — the body is complete).
+        (raw, false, false)
+    };
+    let mut result = response_with_headers(status, response_headers, result_body.clone());
+    if mapped {
+        // The converted body is plaintext; the original length and
+        // encoding no longer describe it.
+        result.headers_mut().remove("content-length");
+        result.headers_mut().remove("content-encoding");
+        result
+            .headers_mut()
+            .insert("content-type", HeaderValue::from_static("application/json"));
+    }
+    let finished_at = chrono::Utc::now();
+    // P1-5: one outcome drives all three events. A conversion failure
+    // is a gateway error — never success — with no usage and no
+    // ChannelSuccess; the channel verdict stays untouched.
+    let (outcome, error_kind, usage, countable): (AttemptOutcome, Option<String>, Usage, bool) =
+        if conversion_failed {
+            (
+                AttemptOutcome::GatewayError,
+                Some("conversion_error".into()),
+                Usage::default(),
+                false,
+            )
+        } else {
+            (AttemptOutcome::Success, None, usage, false)
+        };
+    AttemptFinalizer::new(
+        Arc::new(env.telemetry.clone()),
+        env.request_id,
+        env.started,
+        env.runtime.failure_threshold,
+        env.runtime.circuit_open_seconds,
+    )
+    .finalize(
+        env.candidate,
+        env.attempts,
+        env.attempt_started,
+        finished_at,
+        outcome,
+        Some(status.as_u16() as i64),
+        error_kind,
+        false,
+        true,
+        None,
+        None,
+        usage,
+        result_body.len() as i64,
+        Some(env.upstream_protocol.into()),
+        Some(env.upstream_model.into()),
+        countable,
+    );
+    NonStreamResult::Respond(result)
+}
+
+/// Final gateway response after every candidate failed (P2-4): replays the
+/// last upstream error, classifies pure-transport failures into 502/504,
+/// and writes the request terminal telemetry.
+#[allow(clippy::too_many_arguments)]
+fn final_gateway_response(
+    telemetry: &Telemetry,
+    clock: &dyn crate::ports::Clock,
+    entry_protocol: &str,
+    request_id: &str,
+    started: chrono::DateTime<chrono::Utc>,
+    attempts: i64,
+    mapping: Option<&routing::MappingTarget>,
+    last_error: Option<(StatusCode, axum::http::HeaderMap, Vec<u8>, String)>,
+    last_transport_kind: Option<TransportFailure>,
+) -> Response<Body> {
     if let Some((status, headers, raw, channel_id)) = last_error {
         let result_body = if let Some(value) = mapping.as_ref() {
             convert::convert_error(&value.entry, &value.upstream_protocol, &raw)
         } else {
             raw
         };
-        state.telemetry.emit(Event::RequestFinish {
-            id: request_id,
-            finished_at: chrono::Utc::now().to_rfc3339(),
-            duration_ms: chrono::Utc::now()
+        telemetry.emit(Event::RequestFinish {
+            id: request_id.to_owned(),
+            finished_at: clock.now_utc().to_rfc3339(),
+            duration_ms: clock
+                .now_utc()
                 .signed_duration_since(started)
                 .num_milliseconds(),
             status: Some(status.as_u16() as i64),
@@ -1351,10 +2243,33 @@ async fn proxy(
         });
         return response_with_headers(status, headers, result_body);
     }
-    state.telemetry.emit(Event::RequestFinish {
-        id: request_id.clone(),
-        finished_at: chrono::Utc::now().to_rfc3339(),
-        duration_ms: chrono::Utc::now()
+    if last_transport_kind.is_some_and(|kind| kind.is_timeout()) {
+        telemetry.emit(Event::RequestFinish {
+            id: request_id.to_owned(),
+            finished_at: clock.now_utc().to_rfc3339(),
+            duration_ms: clock
+                .now_utc()
+                .signed_duration_since(started)
+                .num_milliseconds(),
+            status: Some(504),
+            outcome: "gateway_error".into(),
+            attempts,
+            channel_id: None,
+            response_bytes: 0,
+        });
+        return gateway_error(
+            entry_protocol,
+            StatusCode::GATEWAY_TIMEOUT,
+            "upstream_timeout",
+            "Upstream did not respond within the configured timeout.",
+            request_id,
+        );
+    }
+    telemetry.emit(Event::RequestFinish {
+        id: request_id.to_owned(),
+        finished_at: clock.now_utc().to_rfc3339(),
+        duration_ms: clock
+            .now_utc()
             .signed_duration_since(started)
             .num_milliseconds(),
         status: Some(502),
@@ -1368,43 +2283,457 @@ async fn proxy(
         StatusCode::BAD_GATEWAY,
         "upstream_unreachable",
         "All eligible upstream channels failed before a response was available.",
-        &request_id,
+        request_id,
     )
 }
 
+/// Proxy service (P2-1): the gateway request orchestration, reached by the
+/// entry handlers through `Context::proxy`. All upstream/route access goes
+/// through the ports inside its context; the pipeline stages live in the
+/// policy builders (`prepare_request`, `transparent_stream`,
+/// `mapped_stream`, `bounded_non_stream`, `final_gateway_response`).
+pub struct ProxyService {
+    db: Database,
+    secrets: SecretStore,
+    http: Arc<dyn crate::ports::UpstreamClient>,
+    routes: Arc<dyn crate::ports::RouteRepository>,
+    telemetry: Telemetry,
+    clock: Arc<dyn crate::ports::Clock>,
+    limits: Arc<RuntimeLimits>,
+}
+
+impl ProxyService {
+    pub fn new(
+        db: Database,
+        secrets: SecretStore,
+        http: Arc<dyn crate::ports::UpstreamClient>,
+        routes: Arc<dyn crate::ports::RouteRepository>,
+        telemetry: Telemetry,
+        clock: Arc<dyn crate::ports::Clock>,
+        limits: Arc<RuntimeLimits>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            db,
+            secrets,
+            http,
+            routes,
+            telemetry,
+            clock,
+            limits,
+        })
+    }
+
+    /// Full proxy pipeline for one entry protocol (P2-4).
+    pub async fn proxy(
+        &self,
+        request: Request,
+        entry_protocol: &str,
+        fixed_path: Option<String>,
+    ) -> Response<Body> {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let started = self.clock.now_utc();
+        // P2-4: preparation (settings, auth, mapping, candidates) is its own
+        // phase; failures short-circuit here with a gateway error.
+        let prepared = match prepare_request(
+            self,
+            request,
+            entry_protocol,
+            fixed_path,
+            &request_id,
+            started,
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(response) => return response,
+        };
+        let PreparedRequest {
+            runtime,
+            headers,
+            path,
+            query,
+            entry_model,
+            stream_requested,
+            mapping,
+            upstream_protocol,
+            upstream_model,
+            converted_body,
+            candidates,
+            ..
+        } = prepared;
+        let upstream_protocol = upstream_protocol.as_str();
+        let upstream_model = upstream_model.as_str();
+        let query = query.as_deref();
+
+        let mut last_error: Option<(StatusCode, axum::http::HeaderMap, Vec<u8>, String)> = None;
+        // Tracks the kind of the last pure-transport failure (no upstream status
+        // was ever received) so the final gateway error can distinguish 504
+        // timeouts from 502 unreachability.
+        let mut last_transport_kind: Option<TransportFailure> = None;
+        let mut attempts = 0i64;
+        for (index, candidate) in candidates.iter().enumerate() {
+            attempts = index as i64 + 1;
+            let attempt_started = self.clock.now_utc();
+            // Absolute anchor for first-token accounting: the deadline covers the
+            // whole attempt, so a slow response head cannot extend the window.
+            let attempt_started_instant = tokio::time::Instant::now();
+            let api_key = match self.secrets.decrypt(&candidate.api_key_encrypted) {
+                Ok(value) => value,
+                Err(error) => {
+                    let finished = self.clock.now_utc();
+                    last_error = None;
+                    last_transport_kind = Some(TransportFailure::ConnectionReset);
+                    AttemptFinalizer::new(
+                        Arc::new(self.telemetry.clone()),
+                        &request_id,
+                        started,
+                        runtime.failure_threshold,
+                        runtime.circuit_open_seconds,
+                    )
+                    .finalize(
+                        candidate,
+                        attempts,
+                        attempt_started,
+                        finished,
+                        AttemptOutcome::TransportError,
+                        None,
+                        Some("key_decrypt_error".into()),
+                        attempts < candidates.len() as i64,
+                        false,
+                        None,
+                        None,
+                        Usage::default(),
+                        0,
+                        Some(upstream_protocol.into()),
+                        Some(upstream_model.into()),
+                        true,
+                    );
+                    let _ = error;
+                    continue;
+                }
+            };
+            let target_path = mapping
+                .as_ref()
+                .map(|value| mapped_path(value, &path, stream_requested, &value.upstream_model))
+                .unwrap_or_else(|| path.clone());
+            let target_url = match protocol::upstream_url(
+                &candidate.base_url,
+                &target_path,
+                query,
+                upstream_protocol,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    last_error = None;
+                    last_transport_kind = Some(TransportFailure::ConnectionReset);
+                    let _ = error;
+                    continue;
+                }
+            };
+            let outbound = match protocol::outbound_headers(&headers, upstream_protocol, &api_key) {
+                Ok(value) => value,
+                Err(error) => {
+                    last_transport_kind = Some(TransportFailure::ConnectionReset);
+                    let _ = error;
+                    continue;
+                }
+            };
+            // P2-1: the upstream port applies connect timeout and the send
+            // deadline; the classified error decides the transport kind.
+            let response = match self
+                .http
+                .send(crate::ports::UpstreamRequest {
+                    url: target_url,
+                    headers: outbound,
+                    body: Some(converted_body.clone()),
+                    connect_timeout: Duration::from_secs(
+                        runtime.connect_timeout_seconds.max(1) as u64
+                    ),
+                    deadline: Duration::from_secs(runtime.first_byte_timeout_seconds.max(1) as u64),
+                })
+                .await
+            {
+                Ok(response) => response,
+                Err(crate::ports::UpstreamError::ConnectTimeout) => {
+                    let finished = self.clock.now_utc();
+                    last_transport_kind = Some(TransportFailure::ConnectTimeout);
+                    AttemptFinalizer::new(
+                        Arc::new(self.telemetry.clone()),
+                        &request_id,
+                        started,
+                        runtime.failure_threshold,
+                        runtime.circuit_open_seconds,
+                    )
+                    .finalize(
+                        candidate,
+                        attempts,
+                        attempt_started,
+                        finished,
+                        AttemptOutcome::TransportError,
+                        None,
+                        Some("connect_timeout".into()),
+                        attempts < candidates.len() as i64,
+                        false,
+                        None,
+                        None,
+                        Usage::default(),
+                        0,
+                        Some(upstream_protocol.into()),
+                        Some(upstream_model.into()),
+                        true,
+                    );
+                    continue;
+                }
+                Err(crate::ports::UpstreamError::Transport(error)) => {
+                    let finished = self.clock.now_utc();
+                    last_transport_kind = Some(TransportFailure::ConnectionReset);
+                    AttemptFinalizer::new(
+                        Arc::new(self.telemetry.clone()),
+                        &request_id,
+                        started,
+                        runtime.failure_threshold,
+                        runtime.circuit_open_seconds,
+                    )
+                    .finalize(
+                        candidate,
+                        attempts,
+                        attempt_started,
+                        finished,
+                        AttemptOutcome::TransportError,
+                        None,
+                        Some(error),
+                        attempts < candidates.len() as i64,
+                        false,
+                        None,
+                        None,
+                        Usage::default(),
+                        0,
+                        Some(upstream_protocol.into()),
+                        Some(upstream_model.into()),
+                        true,
+                    );
+                    continue;
+                }
+                Err(crate::ports::UpstreamError::Deadline) => {
+                    let finished = self.clock.now_utc();
+                    last_transport_kind = Some(TransportFailure::FirstByteTimeout);
+                    AttemptFinalizer::new(
+                        Arc::new(self.telemetry.clone()),
+                        &request_id,
+                        started,
+                        runtime.failure_threshold,
+                        runtime.circuit_open_seconds,
+                    )
+                    .finalize(
+                        candidate,
+                        attempts,
+                        attempt_started,
+                        finished,
+                        AttemptOutcome::TransportError,
+                        None,
+                        Some("timeout".into()),
+                        attempts < candidates.len() as i64,
+                        false,
+                        None,
+                        None,
+                        Usage::default(),
+                        0,
+                        Some(upstream_protocol.into()),
+                        Some(upstream_model.into()),
+                        true,
+                    );
+                    continue;
+                }
+            };
+            let status = response.status;
+            let response_headers = protocol::response_headers(&response.headers);
+            if status.is_success() {
+                if stream_requested && mapping.is_none() {
+                    // P2-4: transparent forwarding lives in its own builder.
+                    let env = AttemptEnv {
+                        telemetry: &self.telemetry,
+                        clock: Arc::clone(&self.clock),
+                        request_id: &request_id,
+                        started,
+                        candidate,
+                        attempts,
+                        attempt_started,
+                        attempt_started_instant,
+                        runtime: &runtime,
+                        entry_protocol,
+                        entry_model: &entry_model,
+                        upstream_protocol,
+                        upstream_model,
+                        mapping: mapping.as_ref(),
+                        candidates_len: candidates.len() as i64,
+                    };
+                    return transparent_stream(env, response, status, response_headers);
+                }
+                // C2: mapped entries stream through an incremental converter. A
+                // short prelude is buffered first so a 200 response whose body is
+                // actually an upstream error can still fail over, and
+                // `first_token_timeout_seconds` is honored like the Python
+                // gateway. The remaining body is converted event-by-event so the
+                // client sees a live stream.
+                if stream_requested {
+                    // P2-4: the mapped stream pipeline (prelude + incremental
+                    // conversion) lives in its own builder; prelude failures
+                    // fail over with their transport classification.
+                    let env = AttemptEnv {
+                        telemetry: &self.telemetry,
+                        clock: Arc::clone(&self.clock),
+                        request_id: &request_id,
+                        started,
+                        candidate,
+                        attempts,
+                        attempt_started,
+                        attempt_started_instant,
+                        runtime: &runtime,
+                        entry_protocol,
+                        entry_model: &entry_model,
+                        upstream_protocol,
+                        upstream_model,
+                        mapping: mapping.as_ref(),
+                        candidates_len: candidates.len() as i64,
+                    };
+                    match mapped_stream(env, response, status, response_headers).await {
+                        MappedStreamResult::Respond(result) => return result,
+                        MappedStreamResult::FailOver(transport) => {
+                            last_transport_kind = transport;
+                            continue;
+                        }
+                    }
+                }
+                let env = AttemptEnv {
+                    telemetry: &self.telemetry,
+                    clock: Arc::clone(&self.clock),
+                    request_id: &request_id,
+                    started,
+                    candidate,
+                    attempts,
+                    attempt_started,
+                    attempt_started_instant,
+                    runtime: &runtime,
+                    entry_protocol,
+                    entry_model: &entry_model,
+                    upstream_protocol,
+                    upstream_model,
+                    mapping: mapping.as_ref(),
+                    candidates_len: candidates.len() as i64,
+                };
+                match bounded_non_stream(env, response, status, response_headers).await {
+                    NonStreamResult::Respond(result) => return result,
+                    NonStreamResult::FailOver(transport) => {
+                        last_transport_kind = transport;
+                        continue;
+                    }
+                }
+            }
+            // P1-1: error bodies are buffered only for replay/conversion and are
+            // capped at 1 MiB; beyond that the body is truncated and recorded.
+            let (raw_result, truncated) = read_bounded_body(
+                response.body.into_stream(),
+                Duration::from_secs(runtime.first_byte_timeout_seconds.max(1) as u64),
+                self.limits.error_body_max,
+            )
+            .await;
+            let raw = match raw_result {
+                Ok(raw) => raw,
+                Err(TransportFailure::ConnectionReset) => {
+                    last_transport_kind = Some(TransportFailure::ConnectionReset);
+                    Vec::new()
+                }
+                Err(_) => {
+                    last_transport_kind = Some(TransportFailure::FirstByteTimeout);
+                    Vec::new()
+                }
+            };
+            if truncated {
+                tracing::warn!(
+                    request_id = %request_id,
+                    channel_id = %candidate.channel_id,
+                    status = %status,
+                    bytes_captured = self.limits.error_body_max,
+                    body_truncated = true,
+                    "upstream error body truncated at the error-body cap"
+                );
+            }
+            let (kind, countable) = status_kind(status);
+            let finished = self.clock.now_utc();
+            AttemptFinalizer::new(
+                Arc::new(self.telemetry.clone()),
+                &request_id,
+                started,
+                runtime.failure_threshold,
+                runtime.circuit_open_seconds,
+            )
+            .finalize(
+                candidate,
+                attempts,
+                attempt_started,
+                finished,
+                AttemptOutcome::UpstreamError,
+                Some(status.as_u16() as i64),
+                Some(kind.into()),
+                attempts < candidates.len() as i64,
+                false,
+                None,
+                None,
+                Usage::default(),
+                raw.len() as i64,
+                Some(upstream_protocol.into()),
+                Some(upstream_model.into()),
+                countable,
+            );
+            last_error = Some((status, response_headers, raw, candidate.channel_id.clone()));
+        }
+        final_gateway_response(
+            &self.telemetry,
+            self.clock.as_ref(),
+            entry_protocol,
+            &request_id,
+            started,
+            attempts,
+            mapping.as_ref(),
+            last_error,
+            last_transport_kind,
+        )
+    }
+}
+
 async fn normal(
-    State(state): State<AppState>,
+    State(state): State<AppContext>,
     request: Request,
     protocol: &'static str,
 ) -> Response<Body> {
-    proxy(state, request, protocol, None).await
+    state.proxy.proxy(request, protocol, None).await
 }
 
-pub async fn openai(State(state): State<AppState>, request: Request) -> Response<Body> {
+pub async fn openai(State(state): State<AppContext>, request: Request) -> Response<Body> {
     normal(State(state), request, "openai_compatible").await
 }
-pub async fn responses(State(state): State<AppState>, request: Request) -> Response<Body> {
+pub async fn responses(State(state): State<AppContext>, request: Request) -> Response<Body> {
     normal(State(state), request, "openai_responses").await
 }
-pub async fn claude(State(state): State<AppState>, request: Request) -> Response<Body> {
+pub async fn claude(State(state): State<AppContext>, request: Request) -> Response<Body> {
     normal(State(state), request, "claude").await
 }
 pub async fn gemini(
-    State(state): State<AppState>,
+    State(state): State<AppContext>,
     Path(_action): Path<String>,
     request: Request,
 ) -> Response<Body> {
     normal(State(state), request, "gemini").await
 }
-pub async fn claudecode(State(state): State<AppState>, request: Request) -> Response<Body> {
+pub async fn claudecode(State(state): State<AppContext>, request: Request) -> Response<Body> {
     normal(State(state), request, "claude").await
 }
-pub async fn codex(State(state): State<AppState>, request: Request) -> Response<Body> {
+pub async fn codex(State(state): State<AppContext>, request: Request) -> Response<Body> {
     normal(State(state), request, "openai_responses").await
 }
 
 pub async fn models(
-    State(state): State<AppState>,
+    State(state): State<AppContext>,
     request: Request,
     protocol: &'static str,
 ) -> Response<Body> {
@@ -1420,14 +2749,15 @@ pub async fn models(
             "catalog",
         );
     }
-    let items = match routing::list_routable_models(&state, Some(protocol)).await {
+    let items = match state.routes.list_routable_models(Some(protocol)).await {
         Ok(value) => value,
         Err(error) => {
+            tracing::error!(error = %error, "model catalog query failed");
             return gateway_error(
                 protocol,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "database_error",
-                &error.to_string(),
+                "Database error",
                 "catalog",
             );
         }
@@ -1451,18 +2781,19 @@ pub async fn models(
                 "owned_by": "local-gateway",
                 "created": item.created_at,
             });
-            match routing::list_routable_model_endpoints(&state, &item.id).await {
+            match state.routes.routable_endpoints_for_model(&item.id).await {
                 Ok(endpoints) => {
                     if !endpoints.is_empty() {
                         value["x_local_gateway"]["supported_endpoints"] = json!(endpoints);
                     }
                 }
                 Err(error) => {
+                    tracing::error!(error = %error, "model endpoints query failed");
                     return gateway_error(
                         protocol,
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "database_error",
-                        &error.to_string(),
+                        "Database error",
                         "catalog",
                     );
                 }
@@ -1476,11 +2807,12 @@ pub async fn models(
                     }
                 }
                 Err(error) => {
+                    tracing::error!(error = %error, "model caps query failed");
                     return gateway_error(
                         protocol,
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "database_error",
-                        &error.to_string(),
+                        "Database error",
                         "catalog",
                     );
                 }
@@ -1492,7 +2824,7 @@ pub async fn models(
 }
 
 pub async fn mapped_models(
-    State(state): State<AppState>,
+    State(state): State<AppContext>,
     request: Request,
     entry: &'static str,
 ) -> Response<Body> {
@@ -1508,14 +2840,15 @@ pub async fn mapped_models(
             "catalog",
         );
     }
-    let items = match routing::list_mapping_models(&state, entry).await {
+    let items = match state.routes.list_mapping_models(entry).await {
         Ok(value) => value,
         Err(error) => {
+            tracing::error!(error = %error, "mapping model catalog query failed");
             return gateway_error(
                 entry,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "database_error",
-                &error.to_string(),
+                "Database error",
                 "catalog",
             );
         }
@@ -1526,7 +2859,7 @@ pub async fn mapped_models(
     )
 }
 
-pub async fn claudecode_info(State(state): State<AppState>, request: Request) -> Response<Body> {
+pub async fn claudecode_info(State(state): State<AppContext>, request: Request) -> Response<Body> {
     if !settings::authorize_gateway(&state, request.headers(), request.uri().query(), "claude")
         .await
         .unwrap_or(false)
@@ -1545,7 +2878,7 @@ pub async fn claudecode_info(State(state): State<AppState>, request: Request) ->
         )
     }
 }
-pub async fn codex_info(State(state): State<AppState>, request: Request) -> Response<Body> {
+pub async fn codex_info(State(state): State<AppContext>, request: Request) -> Response<Body> {
     if !settings::authorize_gateway(
         &state,
         request.headers(),
@@ -1570,21 +2903,1646 @@ pub async fn codex_info(State(state): State<AppState>, request: Request) -> Resp
     }
 }
 
-pub async fn openai_models(State(state): State<AppState>, request: Request) -> Response<Body> {
+pub async fn openai_models(State(state): State<AppContext>, request: Request) -> Response<Body> {
     models(State(state), request, "openai_compatible").await
 }
-pub async fn responses_models(State(state): State<AppState>, request: Request) -> Response<Body> {
+pub async fn responses_models(State(state): State<AppContext>, request: Request) -> Response<Body> {
     models(State(state), request, "openai_responses").await
 }
-pub async fn claude_models(State(state): State<AppState>, request: Request) -> Response<Body> {
+pub async fn claude_models(State(state): State<AppContext>, request: Request) -> Response<Body> {
     models(State(state), request, "claude").await
 }
-pub async fn gemini_models(State(state): State<AppState>, request: Request) -> Response<Body> {
+pub async fn gemini_models(State(state): State<AppContext>, request: Request) -> Response<Body> {
     models(State(state), request, "gemini").await
 }
-pub async fn claudecode_models(State(state): State<AppState>, request: Request) -> Response<Body> {
+pub async fn claudecode_models(
+    State(state): State<AppContext>,
+    request: Request,
+) -> Response<Body> {
     mapped_models(State(state), request, "claude").await
 }
-pub async fn codex_models(State(state): State<AppState>, request: Request) -> Response<Body> {
+pub async fn codex_models(State(state): State<AppContext>, request: Request) -> Response<Body> {
     mapped_models(State(state), request, "openai_responses").await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::AppConfig, db::Database, telemetry::Telemetry};
+    use futures_util::stream;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::sync::CancellationToken;
+
+    /// In-memory-free test scaffold: temp dir, real migrations, a seeded
+    /// openai_compatible route pointing at a raw TCP upstream we control.
+    struct TestGateway {
+        db: Database,
+        state: AppContext,
+        writer_cancel: CancellationToken,
+        writer: tokio::task::JoinHandle<()>,
+        _dir: std::path::PathBuf,
+    }
+
+    impl TestGateway {
+        /// Stop the writer task: release the telemetry sender first (the
+        /// writer only exits once the channel closes), then join it.
+        async fn shutdown(self) {
+            drop(self.state);
+            self.writer_cancel.cancel();
+            let _ = self.writer.await;
+        }
+    }
+
+    async fn temp_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("lagw-proxy-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    async fn test_gateway(upstream_port: u16, extra_settings: &[(&str, &str)]) -> TestGateway {
+        test_gateway_inner(upstream_port, extra_settings, false).await
+    }
+
+    /// Same scaffold plus a claude model mapping (`mapped-model` ->
+    /// openai_compatible `test-model`) so requests through
+    /// `/claudecode/v1/messages` take the mapped stream pipeline.
+    async fn test_gateway_mapped(
+        upstream_port: u16,
+        extra_settings: &[(&str, &str)],
+    ) -> TestGateway {
+        test_gateway_inner(upstream_port, extra_settings, true).await
+    }
+
+    async fn test_gateway_inner(
+        upstream_port: u16,
+        extra_settings: &[(&str, &str)],
+        mapped: bool,
+    ) -> TestGateway {
+        let dir = temp_dir().await;
+        let db = Database::open(&dir.join("test.db")).await.unwrap();
+        let secrets = crate::crypto::SecretStore::load(&dir.join("master.key"))
+            .await
+            .unwrap();
+        let time = "2026-08-04T01:00:00+00:00";
+        sqlx::query("INSERT INTO providers(id,name,base_url,created_at,updated_at) VALUES('prov-1','mock',?,?,?)")
+            .bind(format!("http://127.0.0.1:{upstream_port}"))
+            .bind(time)
+            .bind(time)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channels(id,provider_id,name,protocol,api_key_encrypted,api_key_hint,manual_enabled,created_at,updated_at) VALUES('ch-1','prov-1','chan','openai_compatible',?,?,1,?,?)")
+            .bind(secrets.encrypt("test-key"))
+            .bind("...key")
+            .bind(time)
+            .bind(time)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channel_models(id,channel_id,model_id,display_name,source,available,first_seen_at,created_at,updated_at) VALUES('cm-1','ch-1','test-model','Test Model','discovered',1,?,?,?)")
+            .bind(time)
+            .bind(time)
+            .bind(time)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channel_model_protocols(channel_model_id,protocol) VALUES('cm-1','openai_compatible')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO model_routes(id,protocol,requested_model_id,enabled,created_at,updated_at) VALUES('route-1','openai_compatible','test-model',1,?,?)")
+            .bind(time)
+            .bind(time)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO route_candidates(id,route_id,channel_model_id,priority,enabled,created_at,updated_at) VALUES('rc-1','route-1','cm-1',1,1,?,?)")
+            .bind(time)
+            .bind(time)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channel_health(channel_id,state,consecutive_failures,updated_at) VALUES('ch-1','active',0,?)")
+            .bind(time)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        if mapped {
+            sqlx::query("INSERT INTO claude_model_mappings(id,claude_model_id,display_name,upstream_protocol,upstream_model_id,enabled,created_at,updated_at) VALUES('map-1','mapped-model','Mapped','openai_compatible','test-model',1,?,?)")
+                .bind(time)
+                .bind(time)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        for (key, raw) in extra_settings {
+            sqlx::query("INSERT INTO settings(key,value_json,updated_at) VALUES(?,?,?)")
+                .bind(key)
+                .bind(raw)
+                .bind(time)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        let (telemetry, rx) = Telemetry::new(1000);
+        let cancel = CancellationToken::new();
+        let writer = tokio::spawn(Telemetry::run_writer(
+            db.clone(),
+            rx,
+            cancel.clone(),
+            telemetry.dropped_handle(),
+        ));
+        let http: Arc<dyn crate::ports::UpstreamClient> =
+            Arc::new(crate::infrastructure::HttpClientPool::default());
+        let routes: Arc<dyn crate::ports::RouteRepository> =
+            crate::infrastructure::SqliteRouteRepository::new(db.clone());
+        let channels: Arc<dyn crate::ports::ChannelRepository> =
+            crate::infrastructure::SqliteChannelRepository::new(db.clone());
+        let clock: Arc<dyn crate::ports::Clock> = Arc::new(crate::infrastructure::SystemClock);
+        let background = crate::infrastructure::RuntimeSupervisor::new(
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let limits = Arc::new(crate::runtime::RuntimeLimits::default());
+        let discovery = crate::discovery::DiscoveryService::new(
+            db.clone(),
+            secrets.clone(),
+            Arc::clone(&http),
+            Arc::clone(&channels),
+            Arc::clone(&clock),
+            Arc::clone(&background),
+            Arc::clone(&limits),
+        );
+        let proxy = crate::proxy::ProxyService::new(
+            db.clone(),
+            secrets.clone(),
+            Arc::clone(&http),
+            routes.clone(),
+            telemetry.clone(),
+            Arc::clone(&clock),
+            Arc::clone(&limits),
+        );
+        let state = crate::application::Context {
+            config: Arc::new(AppConfig::default()),
+            db: db.clone(),
+            secrets: secrets.clone(),
+            http,
+            routes,
+            channels,
+            clock,
+            discovery,
+            proxy,
+            telemetry,
+            background,
+            limits,
+            admin: crate::admin::AdminService::new(db.clone(), secrets.clone()),
+            recovery: crate::auth::RecoverySession::new(),
+        };
+        TestGateway {
+            db,
+            state,
+            writer_cancel: cancel,
+            writer,
+            _dir: dir,
+        }
+    }
+
+    /// Request through the claude mapping entry (/claudecode/v1/messages).
+    fn chat_request_mapped(stream: bool) -> axum::extract::Request {
+        let body = format!(
+            r#"{{"model":"mapped-model","max_tokens":10,"stream":{stream},"messages":[{{"role":"user","content":"hi"}}]}}"#
+        );
+        axum::extract::Request::builder()
+            .method("POST")
+            .uri("/claudecode/v1/messages")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
+
+    /// Raw HTTP/1.1 upstream: reads the request headers, writes `response`,
+    /// then either closes (default) or keeps the connection open.
+    async fn spawn_upstream(response: Vec<u8>, hang: bool) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let mut total = 0usize;
+                loop {
+                    match stream.read(&mut buf[total..]).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            total += n;
+                            if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let _ = stream.write_all(&response).await;
+                if hang {
+                    let mut sink = [0u8; 1024];
+                    let _ = stream.read(&mut sink).await;
+                }
+            }
+        });
+        port
+    }
+
+    /// Raw HTTP/1.1 upstream that writes `parts` sequentially (with `gap`
+    /// between writes) then closes, so reqwest observes several body chunks.
+    async fn spawn_upstream_parts(parts: Vec<Vec<u8>>, gap: Duration) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let mut total = 0usize;
+                loop {
+                    match stream.read(&mut buf[total..]).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            total += n;
+                            if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for part in parts {
+                    let _ = stream.write_all(&part).await;
+                    if !gap.is_zero() {
+                        tokio::time::sleep(gap).await;
+                    }
+                }
+            }
+        });
+        port
+    }
+
+    /// Raw HTTP/1.1 upstream that answers only after `delay` has elapsed
+    /// (after reading the request head), then writes `response` and closes.
+    async fn spawn_upstream_delayed(response: Vec<u8>, delay: Duration) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let mut total = 0usize;
+                loop {
+                    match stream.read(&mut buf[total..]).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            total += n;
+                            if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                tokio::time::sleep(delay).await;
+                let _ = stream.write_all(&response).await;
+            }
+        });
+        port
+    }
+
+    fn sse_event(payload: &str) -> String {
+        format!("data: {payload}\n\n")
+    }
+
+    fn stream_response(body: &str, content_length: Option<usize>) -> String {
+        let mut head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n".to_owned();
+        match content_length {
+            Some(len) => head.push_str(&format!("content-length: {len}\r\n")),
+            None => head.push_str("transfer-encoding: chunked\r\n"),
+        }
+        head.push_str("\r\n");
+        head + body
+    }
+
+    fn chat_request(stream: bool) -> axum::extract::Request {
+        let body = format!(
+            r#"{{"model":"test-model","stream":{stream},"messages":[{{"role":"user","content":"hi"}}]}}"#
+        );
+        axum::extract::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
+
+    async fn latest_log(db: &Database) -> Option<(String, String, i64, Option<i64>)> {
+        sqlx::query_as("SELECT id,outcome,attempt_count,final_status_code FROM request_logs ORDER BY started_at DESC LIMIT 1")
+            .fetch_optional(db.pool())
+            .await
+            .unwrap()
+    }
+
+    async fn wait_for_outcome(
+        db: &Database,
+        expected: &str,
+        timeout: Duration,
+    ) -> (String, String, i64, Option<i64>) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some((id, outcome, attempts, status)) = latest_log(db).await
+                && outcome == expected
+            {
+                return (id, outcome, attempts, status);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for outcome {expected:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// P1-4: auth failures are countable circuit failures; plain 4xx are not.
+    #[test]
+    fn status_kind_classifies_auth_errors_countable() {
+        assert_eq!(status_kind(StatusCode::UNAUTHORIZED), ("auth_error", true));
+        assert_eq!(status_kind(StatusCode::FORBIDDEN), ("auth_error", true));
+        assert_eq!(
+            status_kind(StatusCode::BAD_REQUEST),
+            ("upstream_4xx", false)
+        );
+        assert_eq!(
+            status_kind(StatusCode::TOO_MANY_REQUESTS),
+            ("rate_limit", true)
+        );
+        assert_eq!(status_kind(StatusCode::REQUEST_TIMEOUT), ("timeout", true));
+        assert_eq!(status_kind(StatusCode::GATEWAY_TIMEOUT), ("timeout", true));
+        assert_eq!(
+            status_kind(StatusCode::INTERNAL_SERVER_ERROR),
+            ("upstream_5xx", true)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_aware_terminates_exactly_once() {
+        use std::sync::atomic::AtomicUsize;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        // (i) Stream polled to None then dropped: no cancel callback.
+        let completed = Arc::new(AtomicBool::new(false));
+        let finalized = Arc::new(AtomicBool::new(false));
+        let responded = Arc::new(AtomicBool::new(false));
+        let calls_i = calls.clone();
+        let cancel_aware = CancelAware {
+            inner: stream::iter(vec![
+                Ok::<Bytes, Infallible>(Bytes::from("a")),
+                Ok::<Bytes, Infallible>(Bytes::from("b")),
+            ]),
+            completed: completed.clone(),
+            finalized: finalized.clone(),
+            responded,
+            on_cancel: Some(Box::new(move || {
+                calls_i.fetch_add(1, Ordering::SeqCst);
+            })),
+        };
+        let mut cancel_aware = Box::pin(cancel_aware);
+        while cancel_aware.next().await.is_some() {}
+        drop(cancel_aware);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(completed.load(Ordering::SeqCst));
+
+        // (ii) Dropped before completion: cancel callback fires exactly once.
+        let completed = Arc::new(AtomicBool::new(false));
+        let finalized = Arc::new(AtomicBool::new(false));
+        let responded = Arc::new(AtomicBool::new(false));
+        let calls_ii = calls.clone();
+        let cancel_aware = CancelAware {
+            inner: stream::iter(vec![
+                Ok::<Bytes, Infallible>(Bytes::from("a")),
+                Ok::<Bytes, Infallible>(Bytes::from("b")),
+            ]),
+            completed: completed.clone(),
+            finalized: finalized.clone(),
+            responded,
+            on_cancel: Some(Box::new(move || {
+                calls_ii.fetch_add(1, Ordering::SeqCst);
+            })),
+        };
+        drop(cancel_aware);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // (iii) Finalized before drop: no cancel callback.
+        let completed = Arc::new(AtomicBool::new(false));
+        let finalized = Arc::new(AtomicBool::new(true));
+        let responded = Arc::new(AtomicBool::new(false));
+        let calls_iii = calls.clone();
+        let cancel_aware = CancelAware {
+            inner: stream::iter(vec![
+                Ok::<Bytes, Infallible>(Bytes::from("a")),
+                Ok::<Bytes, Infallible>(Bytes::from("b")),
+            ]),
+            completed: completed.clone(),
+            finalized: finalized.clone(),
+            responded,
+            on_cancel: Some(Box::new(move || {
+                calls_iii.fetch_add(1, Ordering::SeqCst);
+            })),
+        };
+        drop(cancel_aware);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Report §8 scenario 1: upstream closes mid-stream. The request must be
+    /// finalized exactly once as `stream_interrupted` — never overwritten by
+    /// a spurious `cancelled` finish from the generator's Drop path.
+    #[tokio::test]
+    async fn upstream_error_mid_stream_records_single_interrupted_finish() {
+        let body =
+            sse_event(r#"{"id":"1","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#);
+        let response = stream_response(&body, Some(1000));
+        let port = spawn_upstream(response.into_bytes(), false).await;
+        let gateway = test_gateway(port, &[]).await;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request(true), "openai_compatible", None)
+            .await;
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(
+            !bytes.is_empty(),
+            "partial upstream data must reach the client"
+        );
+        let (_, outcome, attempts, status) =
+            wait_for_outcome(&gateway.db, "stream_interrupted", Duration::from_secs(5)).await;
+        assert_eq!(outcome, "stream_interrupted");
+        assert_eq!(attempts, 1);
+        assert_eq!(status, Some(200));
+        let attempt_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_attempts WHERE request_id=(SELECT id FROM request_logs ORDER BY started_at DESC LIMIT 1)")
+                .fetch_one(gateway.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(attempt_count, 1);
+        let attempt_outcome: String = sqlx::query_scalar(
+            "SELECT outcome FROM request_attempts ORDER BY attempt_no DESC LIMIT 1",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(attempt_outcome, "stream_interrupted");
+        let failures: i64 = sqlx::query_scalar(
+            "SELECT consecutive_failures FROM channel_health WHERE channel_id='ch-1'",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(failures, 1, "mid-stream errors count toward the circuit");
+        gateway.shutdown().await;
+    }
+
+    /// Report §8 scenario 2: client disconnects mid-stream. Exactly one
+    /// `cancelled` finish is recorded and the cancellation is not countable.
+    #[tokio::test]
+    async fn client_disconnect_records_single_cancelled_finish() {
+        let body =
+            sse_event(r#"{"id":"1","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#);
+        let response = stream_response(&body, Some(1000));
+        let port = spawn_upstream(response.into_bytes(), true).await;
+        let gateway = test_gateway(port, &[]).await;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request(true), "openai_compatible", None)
+            .await;
+        let mut frames = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(Duration::from_secs(5), frames.next())
+            .await
+            .expect("first frame must arrive")
+            .expect("stream must not end");
+        assert!(!first.unwrap().is_empty());
+        drop(frames);
+        let (_, outcome, attempts, _) =
+            wait_for_outcome(&gateway.db, "cancelled", Duration::from_secs(5)).await;
+        assert_eq!(outcome, "cancelled");
+        assert_eq!(attempts, 1);
+        let failures: i64 = sqlx::query_scalar(
+            "SELECT consecutive_failures FROM channel_health WHERE channel_id='ch-1'",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(failures, 0, "client cancellation must not open the circuit");
+        gateway.shutdown().await;
+    }
+
+    /// A client disconnect mid-stream must record what the gateway actually
+    /// observed — bytes that flowed and usage that was parsed — instead of a
+    /// zeroed `cancelled` row (the Drop path used to hardcode 0 / empty).
+    #[tokio::test]
+    async fn cancelled_stream_records_observed_bytes_and_usage() {
+        let body = sse_event(
+            r#"{"id":"1","choices":[{"delta":{"content":"hi"},"finish_reason":null}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}"#,
+        );
+        let response = stream_response(&body, Some(1000));
+        let port = spawn_upstream(response.into_bytes(), true).await;
+        let gateway = test_gateway(port, &[]).await;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request(true), "openai_compatible", None)
+            .await;
+        let mut frames = response.into_body().into_data_stream();
+        // Read until the upstream stalls (all buffered chunks processed), then
+        // hang up like a client that gave up mid-stream.
+        while let Ok(Some(Ok(chunk))) =
+            tokio::time::timeout(Duration::from_millis(300), frames.next()).await
+        {
+            assert!(!chunk.is_empty());
+        }
+        drop(frames);
+        let (_, outcome, attempts, _) =
+            wait_for_outcome(&gateway.db, "cancelled", Duration::from_secs(5)).await;
+        assert_eq!(outcome, "cancelled");
+        assert_eq!(attempts, 1);
+        let (input, output, response_bytes, first_token_ms): (
+            Option<i64>,
+            Option<i64>,
+            i64,
+            Option<i64>,
+        ) = sqlx::query_as(
+            "SELECT input_tokens, output_tokens, response_bytes, first_token_ms \
+             FROM request_attempts LIMIT 1",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            input, Some(42),
+            "usage seen before the disconnect must be recorded"
+        );
+        assert_eq!(output, Some(7));
+        assert!(
+            response_bytes > 0,
+            "bytes observed before the disconnect must be recorded"
+        );
+        assert!(
+            first_token_ms.is_some(),
+            "the observed first token must be recorded"
+        );
+        gateway.shutdown().await;
+    }
+
+    /// Same guarantee on the mapped path: a client that hangs up after the
+    /// converter consumed content + usage leaves a cancelled row with the
+    /// real bytes and usage, not zeros.
+    #[tokio::test]
+    async fn mapped_cancelled_stream_records_observed_bytes_and_usage() {
+        let body = format!(
+            "{}{}",
+            sse_event(r#"{"id":"1","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#),
+            sse_event(r#"{"id":"2","choices":[{"delta":{},"finish_reason":null}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}"#),
+        );
+        let response = stream_response(&body, Some(1000));
+        let port = spawn_upstream(response.into_bytes(), true).await;
+        let gateway = test_gateway_mapped(port, &[]).await;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request_mapped(true), "claude", None)
+            .await;
+        let mut frames = response.into_body().into_data_stream();
+        while let Ok(Some(Ok(chunk))) =
+            tokio::time::timeout(Duration::from_millis(300), frames.next()).await
+        {
+            assert!(!chunk.is_empty());
+        }
+        drop(frames);
+        let (_, outcome, attempts, _) =
+            wait_for_outcome(&gateway.db, "cancelled", Duration::from_secs(5)).await;
+        assert_eq!(outcome, "cancelled");
+        assert_eq!(attempts, 1);
+        let (input, output, response_bytes, first_token_ms): (
+            Option<i64>,
+            Option<i64>,
+            i64,
+            Option<i64>,
+        ) = sqlx::query_as(
+            "SELECT input_tokens, output_tokens, response_bytes, first_token_ms \
+             FROM request_attempts LIMIT 1",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            input, Some(42),
+            "converter usage must survive the disconnect"
+        );
+        assert_eq!(output, Some(7));
+        assert!(
+            response_bytes > 0,
+            "upstream bytes must survive the disconnect"
+        );
+        assert!(
+            first_token_ms.is_some(),
+            "the observed first token must survive the disconnect"
+        );
+        gateway.shutdown().await;
+    }
+
+    /// Regression guard: a clean stream records a single success.
+    #[tokio::test]
+    async fn normal_stream_completes_with_single_success() {
+        let body = format!(
+            "{}{}",
+            sse_event(r#"{"id":"1","choices":[{"delta":{"content":"Hel"},"finish_reason":null}]}"#),
+            sse_event(
+                r#"{"id":"2","choices":[{"delta":{"content":"lo"},"finish_reason":null}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}}"#
+            )
+        );
+        let response = stream_response(&body, Some(body.len()));
+        let port = spawn_upstream(response.into_bytes(), false).await;
+        let gateway = test_gateway(port, &[]).await;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request(true), "openai_compatible", None)
+            .await;
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(!bytes.is_empty());
+        let (_, outcome, attempts, status) =
+            wait_for_outcome(&gateway.db, "success", Duration::from_secs(5)).await;
+        assert_eq!(outcome, "success");
+        assert_eq!(attempts, 1);
+        assert_eq!(status, Some(200));
+        let failures: i64 = sqlx::query_scalar(
+            "SELECT consecutive_failures FROM channel_health WHERE channel_id='ch-1'",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(failures, 0);
+        gateway.shutdown().await;
+    }
+
+    /// A mapped-stream client (e.g. the Codex CLI) that hangs up right after
+    /// receiving the terminal event (`response.completed`/`message_stop`)
+    /// must leave a SUCCESS behind with its usage and bytes — the outcome is
+    /// recorded before the terminal event is handed out, so the Drop path
+    /// cannot downgrade it to a zeroed `cancelled`.
+    #[tokio::test]
+    async fn mapped_client_close_after_terminal_event_records_success() {
+        let body = format!(
+            "{}{}{}",
+            sse_event(r#"{"id":"1","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#),
+            sse_event(r#"{"id":"2","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#),
+            "data: [DONE]\n\n",
+        );
+        let response = stream_response(&body, Some(body.len()));
+        let port = spawn_upstream(response.into_bytes(), false).await;
+        let gateway = test_gateway_mapped(port, &[]).await;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request_mapped(true), "claude", None)
+            .await;
+        let mut frames = response.into_body().into_data_stream();
+        // Read frames until the terminal claude event arrives, then drop the
+        // body exactly like a CLI that considers the turn finished.
+        let mut saw_terminal = false;
+        for _ in 0..64 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), frames.next())
+                .await
+                .expect("frame must arrive")
+                .expect("stream must not end yet");
+            let bytes = frame.unwrap();
+            if String::from_utf8_lossy(&bytes).contains("message_stop") {
+                saw_terminal = true;
+                break;
+            }
+        }
+        assert!(saw_terminal, "the client must observe the terminal event");
+        drop(frames);
+        let (_, outcome, attempts, status) =
+            wait_for_outcome(&gateway.db, "success", Duration::from_secs(5)).await;
+        assert_eq!(outcome, "success", "the completed stream must stay a success");
+        assert_eq!(attempts, 1);
+        assert_eq!(status, Some(200));
+        let (input, output, response_bytes): (Option<i64>, Option<i64>, i64) = sqlx::query_as(
+            "SELECT input_tokens, output_tokens, response_bytes FROM request_attempts LIMIT 1",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(input, Some(10), "usage must be recorded, not zeroed");
+        assert_eq!(output, Some(5));
+        assert!(
+            response_bytes > 0,
+            "response bytes must be recorded, not zeroed"
+        );
+        gateway.shutdown().await;
+    }
+
+    /// Streaming usage is reported across several chunks; a later chunk that
+    /// omits cache details must not wipe the cache fields an earlier chunk
+    /// carried (per-field merge, latest-non-None wins).
+    #[tokio::test]
+    async fn passthrough_usage_merges_fields_across_chunks() {
+        let body = format!(
+            "{}{}{}",
+            sse_event(r#"{"id":"1","choices":[{"delta":{"content":"hi"},"finish_reason":null}],"usage":{"prompt_tokens":100,"completion_tokens":0,"prompt_tokens_details":{"cached_tokens":60},"total_tokens":100}}"#),
+            sse_event(r#"{"id":"2","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}"#),
+            "data: [DONE]\n\n",
+        );
+        let response = stream_response(&body, Some(body.len()));
+        let port = spawn_upstream(response.into_bytes(), false).await;
+        let gateway = test_gateway(port, &[]).await;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request(true), "openai_compatible", None)
+            .await;
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(!bytes.is_empty());
+        let (_, outcome, attempts, _) =
+            wait_for_outcome(&gateway.db, "success", Duration::from_secs(5)).await;
+        assert_eq!(outcome, "success");
+        assert_eq!(attempts, 1);
+        let (input, cache_read, cache_miss, output): (
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        ) = sqlx::query_as(
+            "SELECT input_tokens, cache_read_tokens, cache_miss_input_tokens, output_tokens \
+             FROM request_attempts LIMIT 1",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(input, Some(100), "input from the first chunk must survive");
+        assert_eq!(
+            cache_read, Some(60),
+            "cache_read from the first chunk must survive the second chunk"
+        );
+        assert_eq!(cache_miss, Some(40), "cache_miss derives from merged values");
+        assert_eq!(output, Some(50), "output from the last chunk wins");
+        gateway.shutdown().await;
+    }
+
+    /// The final SSE line may lack a trailing newline; usage living there
+    /// must still be captured when the upstream ends.
+    #[tokio::test]
+    async fn passthrough_tail_line_without_newline_captures_usage() {
+        let body = format!(
+            "{}{}",
+            sse_event(r#"{"id":"1","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#),
+            r#"data: {"id":"2","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}"#,
+        );
+        let response = stream_response(&body, Some(body.len()));
+        let port = spawn_upstream(response.into_bytes(), false).await;
+        let gateway = test_gateway(port, &[]).await;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request(true), "openai_compatible", None)
+            .await;
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(!bytes.is_empty());
+        let (_, outcome, attempts, _) =
+            wait_for_outcome(&gateway.db, "success", Duration::from_secs(5)).await;
+        assert_eq!(outcome, "success");
+        assert_eq!(attempts, 1);
+        let (input, output): (Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT input_tokens, output_tokens FROM request_attempts LIMIT 1",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(input, Some(7), "usage in the unterminated tail line");
+        assert_eq!(output, Some(3));
+        gateway.shutdown().await;
+    }
+
+    /// First-token protection: a 200 stream that closes cleanly WITHOUT ever
+    /// producing a first token (empty body, no terminal marker) is a
+    /// protection violation, not a success — it must count against the
+    /// circuit instead of silently "succeeding".
+    #[tokio::test]
+    async fn plain_stream_empty_close_without_token_fails_circuit() {
+        let response = stream_response("", Some(0));
+        let port = spawn_upstream(response.into_bytes(), false).await;
+        let gateway = test_gateway(port, &[("failure_threshold", "1")]).await;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request(true), "openai_compatible", None)
+            .await;
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(bytes.is_empty(), "the client receives the empty stream");
+        let (_, outcome, attempts, status) =
+            wait_for_outcome(&gateway.db, "stream_interrupted", Duration::from_secs(5)).await;
+        assert_eq!(outcome, "stream_interrupted");
+        assert_eq!(attempts, 1);
+        assert_eq!(status, Some(200));
+        let error_kind: Option<String> = sqlx::query_scalar(
+            "SELECT error_kind FROM request_attempts ORDER BY attempt_no DESC LIMIT 1",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            error_kind.as_deref(),
+            Some("no_first_token"),
+            "the missing first token must be named"
+        );
+        let (failures, state): (i64, String) = sqlx::query_as(
+            "SELECT consecutive_failures, state FROM channel_health WHERE channel_id='ch-1'",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(failures, 1, "no-first-token must trip the circuit");
+        assert_eq!(state, "open");
+        gateway.shutdown().await;
+    }
+
+    /// A stream that carries its explicit terminal marker without any
+    /// content (`data: [DONE]` only) is a legitimate empty completion — the
+    /// upstream explicitly finished, so it must NOT trip the circuit.
+    #[tokio::test]
+    async fn plain_stream_done_only_is_success() {
+        let body = "data: [DONE]\n\n";
+        let response = stream_response(body, Some(body.len()));
+        let port = spawn_upstream(response.into_bytes(), false).await;
+        let gateway = test_gateway(port, &[("failure_threshold", "1")]).await;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request(true), "openai_compatible", None)
+            .await;
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(!bytes.is_empty());
+        let (_, outcome, attempts, status) =
+            wait_for_outcome(&gateway.db, "success", Duration::from_secs(5)).await;
+        assert_eq!(outcome, "success");
+        assert_eq!(attempts, 1);
+        assert_eq!(status, Some(200));
+        let failures: i64 = sqlx::query_scalar(
+            "SELECT consecutive_failures FROM channel_health WHERE channel_id='ch-1'",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(failures, 0, "an explicit [DONE] is a normal completion");
+        gateway.shutdown().await;
+    }
+
+    /// First-token protection on the mapped path: a passthrough mapping
+    /// (entry == upstream protocol) whose upstream closes without any token
+    /// must also fail the circuit.
+    #[tokio::test]
+    async fn mapped_passthrough_empty_close_fails_circuit() {
+        let response = stream_response("", Some(0));
+        let port = spawn_upstream(response.into_bytes(), false).await;
+        let gateway = test_gateway_mapped(port, &[("failure_threshold", "1")]).await;
+        sqlx::query("INSERT INTO claude_model_mappings(id,claude_model_id,display_name,upstream_protocol,upstream_model_id,enabled,created_at,updated_at) VALUES('map-2','passthrough-model','Passthrough','claude','test-model',1,?,?)")
+            .bind("2026-08-04T01:00:00+00:00")
+            .bind("2026-08-04T01:00:00+00:00")
+            .execute(gateway.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channel_model_protocols(channel_model_id,protocol) VALUES('cm-1','claude')")
+            .execute(gateway.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO model_routes(id,protocol,requested_model_id,enabled,created_at,updated_at) VALUES('route-2','claude','test-model',1,?,?)")
+            .bind("2026-08-04T01:00:00+00:00")
+            .bind("2026-08-04T01:00:00+00:00")
+            .execute(gateway.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO route_candidates(id,route_id,channel_model_id,priority,enabled,created_at,updated_at) VALUES('rc-2','route-2','cm-1',1,1,?,?)")
+            .bind("2026-08-04T01:00:00+00:00")
+            .bind("2026-08-04T01:00:00+00:00")
+            .execute(gateway.db.pool())
+            .await
+            .unwrap();
+        let request = axum::extract::Request::builder()
+            .method("POST")
+            .uri("/claudecode/v1/messages")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"model":"passthrough-model","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let response = gateway
+            .state
+            .proxy
+            .proxy(request, "claude", None)
+            .await;
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(bytes.is_empty());
+        let (_, outcome, attempts, _) =
+            wait_for_outcome(&gateway.db, "stream_interrupted", Duration::from_secs(5)).await;
+        assert_eq!(outcome, "stream_interrupted");
+        assert_eq!(attempts, 1);
+        let error_kind: Option<String> = sqlx::query_scalar(
+            "SELECT error_kind FROM request_attempts ORDER BY attempt_no DESC LIMIT 1",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(error_kind.as_deref(), Some("no_first_token"));
+        let (failures, state): (i64, String) = sqlx::query_as(
+            "SELECT consecutive_failures, state FROM channel_health WHERE channel_id='ch-1'",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(failures, 1);
+        assert_eq!(state, "open");
+        gateway.shutdown().await;
+    }
+
+    /// P1-1: a stream that stalls after its first token is finalized by the
+    /// generator as 504 transport_timeout instead of hanging forever.
+    #[tokio::test]
+    async fn plain_stream_idle_timeout_finalizes_as_504() {
+        let body =
+            sse_event(r#"{"id":"1","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#);
+        let response = stream_response(&body, Some(1000));
+        let port = spawn_upstream(response.into_bytes(), true).await;
+        let gateway = test_gateway(port, &[("stream_idle_timeout_seconds", "1")]).await;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request(true), "openai_compatible", None)
+            .await;
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(!bytes.is_empty());
+        let (_, outcome, attempts, status) =
+            wait_for_outcome(&gateway.db, "stream_interrupted", Duration::from_secs(10)).await;
+        assert_eq!(outcome, "stream_interrupted");
+        assert_eq!(attempts, 1);
+        assert_eq!(status, Some(504), "idle timeout must finalize as 504");
+        let error_kind: Option<String> = sqlx::query_scalar(
+            "SELECT error_kind FROM request_attempts ORDER BY attempt_no DESC LIMIT 1",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(error_kind.as_deref(), Some("transport_timeout"));
+        gateway.shutdown().await;
+    }
+
+    /// P1-3: an oversized request body is rejected with a stable 413 payload
+    /// (no internal buffer error text) instead of being buffered.
+    #[tokio::test]
+    async fn oversized_body_rejected_with_stable_413() {
+        let port = spawn_upstream(Vec::new(), false).await;
+        let gateway = test_gateway(port, &[("max_request_body_mb", "1")]).await;
+        let request = axum::extract::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from("x".repeat(2 * 1024 * 1024)))
+            .unwrap();
+        let response = gateway
+            .state
+            .proxy
+            .proxy(request, "openai_compatible", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value.pointer("/error/message").and_then(Value::as_str),
+            Some("Request body exceeds the configured limit.")
+        );
+        gateway.shutdown().await;
+    }
+
+    /// P1-9: a gzip-encoded SSE response is forwarded to the client byte-for-
+    /// byte (raw bytes + content-encoding header) while usage observability
+    /// runs on the decoded plaintext.
+    #[tokio::test]
+    async fn gzip_stream_is_forwarded_raw_and_usage_still_observed() {
+        use std::io::Write;
+        let plain = format!(
+            "{}{}",
+            sse_event(r#"{"id":"1","choices":[{"delta":{"content":"Hel"},"finish_reason":null}]}"#),
+            sse_event(
+                r#"{"id":"2","choices":[{"delta":{"content":"lo"},"finish_reason":null}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#
+            )
+        );
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(plain.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut response_bytes =
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-encoding: gzip\r\n"
+                .as_bytes()
+                .to_vec();
+        response_bytes
+            .extend_from_slice(format!("content-length: {}\r\n\r\n", compressed.len()).as_bytes());
+        response_bytes.extend_from_slice(&compressed);
+        let port = spawn_upstream(response_bytes, false).await;
+        let gateway = test_gateway(port, &[]).await;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request(true), "openai_compatible", None)
+            .await;
+        assert_eq!(
+            response
+                .headers()
+                .get("content-encoding")
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "the encoding header must be forwarded untouched"
+        );
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(
+            bytes.as_ref(),
+            compressed.as_slice(),
+            "the client must receive the raw compressed bytes"
+        );
+        wait_for_outcome(&gateway.db, "success", Duration::from_secs(5)).await;
+        let raw_usage: Option<String> = sqlx::query_scalar(
+            "SELECT raw_usage_json FROM request_attempts ORDER BY attempt_no DESC LIMIT 1",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert!(
+            raw_usage.is_some(),
+            "usage must be extracted from the decoded stream"
+        );
+        gateway.shutdown().await;
+    }
+
+    /// P1-1: the first-token window spans the whole attempt. An upstream that
+    /// answers headers + content 2s after the request starts, with a 1s
+    /// first-token budget, must finalize as 504 (the deadline expired before
+    /// the response head arrived) instead of succeeding because the content
+    /// arrived right after the headers.
+    #[tokio::test]
+    async fn first_token_deadline_counts_from_attempt_start_plain() {
+        let body = format!(
+            "{}{}",
+            sse_event(r#"{"id":"1","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#),
+            sse_event(r#"{"id":"2","choices":[{"delta":{"content":"!"},"finish_reason":null}]}"#),
+        );
+        let response = stream_response(&body, Some(body.len()));
+        let port = spawn_upstream_delayed(response.into_bytes(), Duration::from_secs(2)).await;
+        let gateway = test_gateway(
+            port,
+            &[
+                ("first_byte_timeout_seconds", "3"),
+                ("first_token_timeout_seconds", "1"),
+            ],
+        )
+        .await;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request(true), "openai_compatible", None)
+            .await;
+        // Drive the stream to completion: the generator runs its terminal
+        // telemetry (504, transport_timeout) once the deadline has expired.
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let _ = bytes;
+        let (_, outcome, attempts, status) =
+            wait_for_outcome(&gateway.db, "stream_interrupted", Duration::from_secs(10)).await;
+        assert_eq!(outcome, "stream_interrupted");
+        assert_eq!(attempts, 1);
+        assert_eq!(status, Some(504), "deadline runs from attempt start");
+        let error_kind: Option<String> = sqlx::query_scalar(
+            "SELECT error_kind FROM request_attempts ORDER BY attempt_no DESC LIMIT 1",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(error_kind.as_deref(), Some("transport_timeout"));
+        gateway.shutdown().await;
+    }
+
+    /// P1-1 (mapped): the prelude window is anchored at attempt start too.
+    /// The 200 + content arrives 2s in, the 1s budget already expired, so the
+    /// single candidate fails over into the 504 tail instead of succeeding.
+    #[tokio::test]
+    async fn first_token_deadline_counts_from_attempt_start_mapped() {
+        let body = format!(
+            "{}{}",
+            sse_event(r#"{"id":"1","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#),
+            sse_event(r#"{"id":"2","choices":[{"delta":{"content":"!"},"finish_reason":null}]}"#),
+        );
+        let response = stream_response(&body, Some(body.len()));
+        let port = spawn_upstream_delayed(response.into_bytes(), Duration::from_secs(2)).await;
+        let gateway = test_gateway_mapped(
+            port,
+            &[
+                ("first_byte_timeout_seconds", "3"),
+                ("first_token_timeout_seconds", "1"),
+            ],
+        )
+        .await;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request_mapped(true), "claude", None)
+            .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::GATEWAY_TIMEOUT,
+            "expired prelude deadline + single candidate -> 504"
+        );
+        let (_, outcome, attempts, status) =
+            wait_for_outcome(&gateway.db, "gateway_error", Duration::from_secs(10)).await;
+        assert_eq!(outcome, "gateway_error");
+        assert_eq!(attempts, 1);
+        assert_eq!(status, Some(504));
+        gateway.shutdown().await;
+    }
+
+    /// P1-2: a mapped stream whose 200 response head arrives but never
+    /// produces a first token is a *timeout*, so a single-candidate run ends
+    /// in 504 (pre-fix: the prelude timeout was not classified and the tail
+    /// wrongly produced 502).
+    #[tokio::test]
+    async fn mapped_prelude_timeout_classifies_as_504() {
+        let headers_only =
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 1000\r\n\r\n"
+                .as_bytes()
+                .to_vec();
+        let port = spawn_upstream(headers_only, true).await;
+        let gateway = test_gateway_mapped(port, &[("first_token_timeout_seconds", "1")]).await;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request_mapped(true), "claude", None)
+            .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::GATEWAY_TIMEOUT,
+            "prelude timeout must classify as 504, not 502"
+        );
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value.pointer("/error/type").and_then(Value::as_str),
+            Some("upstream_timeout")
+        );
+        let (_, outcome, attempts, status) =
+            wait_for_outcome(&gateway.db, "gateway_error", Duration::from_secs(10)).await;
+        assert_eq!(outcome, "gateway_error");
+        assert_eq!(attempts, 1);
+        assert_eq!(status, Some(504));
+        let error_kind: Option<String> = sqlx::query_scalar(
+            "SELECT error_kind FROM request_attempts ORDER BY attempt_no DESC LIMIT 1",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(error_kind.as_deref(), Some("timeout"));
+        gateway.shutdown().await;
+    }
+
+    /// P1-2: a non-streaming 200 whose body dies mid-read (content-length
+    /// promised, connection closed early) records its own attempt event and
+    /// finalizes as 502 — pre-fix it was lumped into the timeout branch
+    /// (504) with no attempt row.
+    #[tokio::test]
+    async fn non_stream_connection_reset_returns_502_with_attempt() {
+        let mut response_bytes =
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 1000\r\n\r\n"
+                .as_bytes()
+                .to_vec();
+        response_bytes.extend_from_slice(&[b'x'; 40]);
+        let port = spawn_upstream(response_bytes, false).await;
+        let gateway = test_gateway(port, &[]).await;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request(false), "openai_compatible", None)
+            .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_GATEWAY,
+            "connection reset mid-body is 502, not 504"
+        );
+        let (_, outcome, attempts, status) =
+            wait_for_outcome(&gateway.db, "gateway_error", Duration::from_secs(5)).await;
+        assert_eq!(outcome, "gateway_error");
+        assert_eq!(attempts, 1);
+        assert_eq!(status, Some(502));
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_attempts WHERE request_id=(SELECT id FROM request_logs ORDER BY started_at DESC LIMIT 1)",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "the reset must record its own attempt event");
+        let error_kind: Option<String> = sqlx::query_scalar(
+            "SELECT error_kind FROM request_attempts ORDER BY attempt_no DESC LIMIT 1",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(error_kind.as_deref(), Some("transport_error"));
+        gateway.shutdown().await;
+    }
+
+    /// P1-3: the mapped-stream prelude is decoded exactly once. A compressed
+    /// upstream body (all four encodings) must reach the client as converted
+    /// plaintext SSE carrying both content texts; re-feeding the decoder with
+    /// the prelude bytes would corrupt its state and produce an empty stream.
+    #[tokio::test]
+    async fn mapped_compressed_stream_decodes_prelude_once() {
+        use std::io::Write;
+        let plain = format!(
+            "{}{}{}",
+            sse_event(
+                r#"{"id":"1","choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}"#
+            ),
+            sse_event(
+                r#"{"id":"2","choices":[{"delta":{"content":"World"},"finish_reason":null}]}"#
+            ),
+            "data: [DONE]\n\n",
+        );
+        let gzip = {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(plain.as_bytes()).unwrap();
+            encoder.finish().unwrap()
+        };
+        let deflate = {
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(plain.as_bytes()).unwrap();
+            encoder.finish().unwrap()
+        };
+        let brotli = {
+            let mut encoder = brotli::CompressorWriter::new(Vec::new(), 4096, 5, 22);
+            encoder.write_all(plain.as_bytes()).unwrap();
+            encoder.flush().unwrap();
+            encoder.into_inner()
+        };
+        let zstd = zstd::stream::encode_all(plain.as_bytes(), 3).unwrap();
+        for (encoding, compressed) in [
+            ("gzip", gzip),
+            ("deflate", deflate),
+            ("br", brotli),
+            ("zstd", zstd),
+        ] {
+            let mut response_bytes = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-encoding: {encoding}\r\ncontent-length: {}\r\n\r\n",
+                compressed.len()
+            )
+            .into_bytes();
+            response_bytes.extend_from_slice(&compressed);
+            let port = spawn_upstream(response_bytes, false).await;
+            let gateway = test_gateway_mapped(port, &[]).await;
+            let response = gateway
+                .state
+                .proxy
+                .proxy(chat_request_mapped(true), "claude", None)
+                .await;
+            assert_eq!(
+                response.headers().get("content-encoding"),
+                None,
+                "{encoding}: the raw encoding header must not leak into the converted stream"
+            );
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                text.contains("Hello") && text.contains("World"),
+                "{encoding}: converted stream must carry both content texts, got {text:?}"
+            );
+            let (_, outcome, attempts, status) =
+                wait_for_outcome(&gateway.db, "success", Duration::from_secs(5)).await;
+            assert_eq!(outcome, "success", "{encoding}");
+            assert_eq!(attempts, 1, "{encoding}");
+            assert_eq!(status, Some(200), "{encoding}");
+            let first_token_ms: Option<i64> = sqlx::query_scalar(
+                "SELECT first_token_ms FROM request_attempts ORDER BY attempt_no DESC LIMIT 1",
+            )
+            .fetch_one(gateway.db.pool())
+            .await
+            .unwrap();
+            assert!(
+                first_token_ms.is_some(),
+                "{encoding}: first_token_ms must be recorded"
+            );
+            gateway.shutdown().await;
+        }
+    }
+
+    /// P1-8: a mapped non-streaming response that cannot be converted (the
+    /// upstream body is not valid JSON for the upstream protocol) must reach
+    /// the client as the fixed gateway error message — never the upstream's
+    /// raw text or the internal conversion error.
+    #[tokio::test]
+    async fn mapped_conversion_failure_does_not_leak_internal_text() {
+        let upstream_body = "not json at all, definitely not a chat completion";
+        let response_bytes = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{upstream_body}",
+            upstream_body.len()
+        )
+        .into_bytes();
+        let port = spawn_upstream(response_bytes, false).await;
+        let gateway = test_gateway_mapped(port, &[]).await;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request_mapped(false), "claude", None)
+            .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "conversion failure keeps the 200 protocol-compat status"
+        );
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("Response conversion failed"),
+            "client must see the fixed message, got: {text:?}"
+        );
+        assert!(
+            !text.contains(upstream_body),
+            "upstream body text must not leak into the converted response"
+        );
+        // P1-5: a conversion failure is a gateway error — never success —
+        // and the request/attempt/channel events must agree.
+        let (_, _outcome, attempts, status) =
+            wait_for_outcome(&gateway.db, "gateway_error", Duration::from_secs(5)).await;
+        assert_eq!(attempts, 1);
+        assert_eq!(status, Some(200), "protocol-compat 200 is preserved");
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_attempts WHERE request_id=(SELECT id FROM request_logs ORDER BY started_at DESC LIMIT 1)",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "the conversion attempt must be recorded");
+        let (attempt_outcome, error_kind): (String, Option<String>) = sqlx::query_as(
+            "SELECT outcome, error_kind FROM request_attempts ORDER BY attempt_no DESC LIMIT 1",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(attempt_outcome, "gateway_error");
+        assert_eq!(error_kind.as_deref(), Some("conversion_error"));
+        // No ChannelSuccess was emitted: the channel verdict must stay
+        // untouched (no success, no countable failure).
+        let (state, failures): (String, i64) = sqlx::query_as(
+            "SELECT state, consecutive_failures FROM channel_health WHERE channel_id='ch-1'",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(state, "active");
+        assert_eq!(failures, 0);
+        gateway.shutdown().await;
+    }
+
+    /// P1-1: a mapped non-stream response declaring a Content-Length above
+    /// the buffered-body cap is rejected up front — nothing is read.
+    #[tokio::test]
+    async fn mapped_non_stream_declared_oversized_body_returns_502() {
+        let response_bytes = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            2 * 1024 * 1024
+        )
+        .into_bytes();
+        let port = spawn_upstream(response_bytes, false).await;
+        let gateway = test_gateway_mapped(port, &[("max_buffered_upstream_body_mb", "1")]).await;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request_mapped(false), "claude", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        eprintln!("DEBUG BODY: {}", String::from_utf8_lossy(&body));
+        assert!(String::from_utf8_lossy(&body).contains("upstream_response_too_large"));
+        let (_, _, attempts, status) =
+            wait_for_outcome(&gateway.db, "gateway_error", Duration::from_secs(5)).await;
+        assert_eq!(attempts, 1);
+        assert_eq!(status, Some(502));
+        let error_kind: Option<String> = sqlx::query_scalar(
+            "SELECT error_kind FROM request_attempts ORDER BY attempt_no DESC LIMIT 1",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(error_kind.as_deref(), Some("upstream_response_too_large"));
+        gateway.shutdown().await;
+    }
+
+    /// P1-1: a mapped non-stream body without Content-Length that grows past
+    /// the cap mid-read (raw accumulation) is cut off with 502 — the buffer
+    /// never exceeds the cap.
+    #[tokio::test]
+    async fn mapped_non_stream_unbounded_raw_body_hits_cap() {
+        let mut response_bytes = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n"
+            .as_bytes()
+            .to_vec();
+        response_bytes.extend(std::iter::repeat_n(b'x', 2 * 1024 * 1024));
+        let port = spawn_upstream(response_bytes, false).await;
+        let gateway = test_gateway_mapped(port, &[("max_buffered_upstream_body_mb", "1")]).await;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request_mapped(false), "claude", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let (_, _, attempts, status) =
+            wait_for_outcome(&gateway.db, "gateway_error", Duration::from_secs(5)).await;
+        assert_eq!(attempts, 1);
+        assert_eq!(status, Some(502));
+        let error_kind: Option<String> = sqlx::query_scalar(
+            "SELECT error_kind FROM request_attempts ORDER BY attempt_no DESC LIMIT 1",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(error_kind.as_deref(), Some("upstream_response_too_large"));
+        gateway.shutdown().await;
+    }
+
+    /// P1-1 + P1-2: a compressed mapped body whose plaintext exceeds the cap
+    /// trips the RequiredDecoder's cumulative limit → stable 502, not a
+    /// truncated conversion.
+    #[tokio::test]
+    async fn mapped_non_stream_plaintext_over_cap_returns_502() {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&vec![b'x'; 2 * 1024 * 1024]).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let response_bytes = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-encoding: gzip\r\ncontent-length: {}\r\n\r\n",
+            compressed.len()
+        )
+        .into_bytes();
+        let mut body = response_bytes;
+        body.extend_from_slice(&compressed);
+        let port = spawn_upstream(body, false).await;
+        let gateway = test_gateway_mapped(port, &[("max_buffered_upstream_body_mb", "1")]).await;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request_mapped(false), "claude", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let (_, _, attempts, status) =
+            wait_for_outcome(&gateway.db, "gateway_error", Duration::from_secs(5)).await;
+        assert_eq!(attempts, 1);
+        assert_eq!(status, Some(502));
+        let error_kind: Option<String> = sqlx::query_scalar(
+            "SELECT error_kind FROM request_attempts ORDER BY attempt_no DESC LIMIT 1",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(error_kind.as_deref(), Some("upstream_decode_error"));
+        gateway.shutdown().await;
+    }
+
+    /// P1-2: a mapped non-stream gzip body truncated mid-frame decodes
+    /// partially but never finishes → 502, never a partial conversion.
+    #[tokio::test]
+    async fn mapped_non_stream_truncated_gzip_returns_502() {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(br#"{"id":"1","choices":[{"finish_reason":"stop"}]}"#)
+            .unwrap();
+        let mut compressed = encoder.finish().unwrap();
+        compressed.truncate(compressed.len() / 2);
+        let response_bytes = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-encoding: gzip\r\ncontent-length: {}\r\n\r\n",
+            compressed.len()
+        )
+        .into_bytes();
+        let mut body = response_bytes;
+        body.extend_from_slice(&compressed);
+        let port = spawn_upstream(body, false).await;
+        let gateway = test_gateway_mapped(port, &[("max_buffered_upstream_body_mb", "1")]).await;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request_mapped(false), "claude", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let (_, _, attempts, status) =
+            wait_for_outcome(&gateway.db, "gateway_error", Duration::from_secs(5)).await;
+        assert_eq!(attempts, 1);
+        assert_eq!(status, Some(502));
+        let error_kind: Option<String> = sqlx::query_scalar(
+            "SELECT error_kind FROM request_attempts ORDER BY attempt_no DESC LIMIT 1",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(error_kind.as_deref(), Some("upstream_decode_error"));
+        gateway.shutdown().await;
+    }
+
+    /// P1-2: a mapped stream whose cumulative plaintext exceeds the cap
+    /// mid-stream terminates with a fixed gateway error event and a
+    /// `gateway_error` outcome — the stream is never silently truncated.
+    /// The body is ONE gzip stream (a single-member decoder ignores any
+    /// trailing member), split across two TCP writes so the limit trips
+    /// after the response has started.
+    #[tokio::test]
+    async fn mapped_stream_cumulative_limit_fails_attempt() {
+        use std::io::Write;
+        let event1 =
+            sse_event(r#"{"id":"1","choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}"#);
+        let event2 = sse_event(&format!(
+            r#"{{"id":"2","choices":[{{"delta":{{"content":"{}"}},"finish_reason":null}}]}}"#,
+            "x".repeat(2 * 1024 * 1024)
+        ));
+        let mut plain = event1.into_bytes();
+        plain.extend_from_slice(event2.as_bytes());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&plain).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(compressed.len() < 16 * 1024, "test payload must stay small");
+        // Split at 512 bytes: the first part carries the header + event1
+        // (a few hundred bytes of plaintext), so the prelude decodes it
+        // without touching the cap; the rest trips it mid-stream.
+        let split = 512usize.min(compressed.len() / 2);
+        let mut part1 =
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-encoding: gzip\r\n\r\n"
+                .to_vec();
+        part1.extend_from_slice(&compressed[..split]);
+        let parts = vec![part1, compressed[split..].to_vec()];
+        let port = spawn_upstream_parts(parts, Duration::from_millis(30)).await;
+        let gateway = test_gateway_mapped(port, &[("max_buffered_upstream_body_mb", "1")]).await;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request_mapped(true), "claude", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("could not be decoded"),
+            "client must see the fixed gateway error event, got: {text:?}"
+        );
+        let (_, outcome, attempts, status) =
+            wait_for_outcome(&gateway.db, "gateway_error", Duration::from_secs(5)).await;
+        assert_eq!(outcome, "gateway_error");
+        assert_eq!(attempts, 1);
+        assert_eq!(status, Some(200));
+        let error_kind: Option<String> = sqlx::query_scalar(
+            "SELECT error_kind FROM request_attempts ORDER BY attempt_no DESC LIMIT 1",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(error_kind.as_deref(), Some("upstream_decode_error"));
+        gateway.shutdown().await;
+    }
+
+    /// P1-1: two concurrent oversized non-stream responses are both bounded
+    /// and both terminate with 502 — no unbounded growth, no deadlock.
+    #[tokio::test]
+    async fn concurrent_oversized_responses_stay_bounded() {
+        let mut response_bytes = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n"
+            .as_bytes()
+            .to_vec();
+        response_bytes.extend(std::iter::repeat_n(b'x', 2 * 1024 * 1024));
+        let port_a = spawn_upstream(response_bytes.clone(), false).await;
+        let port_b = spawn_upstream(response_bytes, false).await;
+        let gateway_a =
+            test_gateway_mapped(port_a, &[("max_buffered_upstream_body_mb", "1")]).await;
+        let gateway_b =
+            test_gateway_mapped(port_b, &[("max_buffered_upstream_body_mb", "1")]).await;
+        let (response_a, response_b) = tokio::join!(
+            gateway_a
+                .state
+                .proxy
+                .proxy(chat_request_mapped(false), "claude", None),
+            gateway_b
+                .state
+                .proxy
+                .proxy(chat_request_mapped(false), "claude", None),
+        );
+        assert_eq!(response_a.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(response_b.status(), StatusCode::BAD_GATEWAY);
+        for gateway in [gateway_a, gateway_b] {
+            let (_, _, attempts, status) =
+                wait_for_outcome(&gateway.db, "gateway_error", Duration::from_secs(5)).await;
+            assert_eq!(attempts, 1);
+            assert_eq!(status, Some(502));
+            gateway.shutdown().await;
+        }
+    }
 }

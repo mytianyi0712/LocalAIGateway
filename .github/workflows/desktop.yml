@@ -37,6 +37,10 @@ jobs:
         shell: bash
         run: ./scripts/version.sh check
 
+      - name: Verify dependency directions
+        shell: bash
+        run: ./scripts/check-layers.sh
+
       - name: Verify tag matches VERSION
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash

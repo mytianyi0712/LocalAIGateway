@@ -29,3 +29,6 @@ version-set:         ## Bump the project version everywhere: make version-set VE
 
 version-check:       ## Verify all first-party version declarations agree (CI-safe, exit 0/1)
 	./scripts/version.sh check
+
+check-layers:        ## Dependency-direction gate: application/domain must not import axum/sqlx/reqwest
+	./scripts/check-layers.sh

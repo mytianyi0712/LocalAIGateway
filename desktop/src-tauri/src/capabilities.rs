@@ -9,7 +9,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use sqlx::Row;
 
-use crate::server::AppState;
+use crate::application::Context;
 
 const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
@@ -414,16 +414,13 @@ pub fn aggregate_capabilities(items: &[Value]) -> Value {
 /// Recompute the capabilities of a route's model from its live candidates'
 /// discovery metadata — mirror of services/capabilities.py
 /// `detect_model_capabilities`. Never touches the network.
-pub async fn detect_model_capabilities(
-    state: &AppState,
-    requested_model_id: &str,
-) -> Result<Value> {
+pub async fn detect_model_capabilities(state: &Context, requested_model_id: &str) -> Result<Value> {
     let rows = sqlx::query(
         "SELECT cm.metadata_json, cmp.protocol FROM channel_models cm \
          JOIN route_candidates rc ON rc.channel_model_id = cm.id \
          JOIN model_routes mr ON mr.id = rc.route_id \
          JOIN channels c ON c.id = cm.channel_id \
-         LEFT JOIN channel_model_protocols cmp ON cmp.channel_model_id = cm.id \
+         JOIN channel_model_protocols cmp ON cmp.channel_model_id = cm.id AND cmp.protocol = mr.protocol \
          WHERE mr.requested_model_id = ? AND mr.enabled = 1 AND rc.enabled = 1 \
            AND cm.available = 1 AND c.manual_enabled = 1",
     )
@@ -440,10 +437,11 @@ pub async fn detect_model_capabilities(
         if !metadata.is_object() {
             continue;
         }
-        let protocol: Option<String> = row.try_get("protocol")?;
+        // INNER JOIN guarantees a protocol binding (P2-2); candidates without
+        // one are excluded instead of leaking whole-metadata fallbacks.
+        let protocol: String = row.try_get("protocol")?;
         let mut extracted: Vec<Value> = Vec::new();
-        if let Some(protocol) = protocol
-            && let Some(per_protocol) = metadata.get(&protocol)
+        if let Some(per_protocol) = metadata.get(&protocol)
             && per_protocol.is_object()
         {
             extracted.push(extract_capabilities(per_protocol));
@@ -484,7 +482,7 @@ pub fn has_capability_data(capabilities: &Value) -> bool {
 /// The full capability object served by the admin API and embedded in the
 /// model catalog — mirror of services/capabilities.py `get_model_caps` +
 /// `caps_json`. `source = "auto"` (or a missing row) re-detects on read.
-pub async fn get_model_caps(state: &AppState, model_id: &str) -> Result<Value> {
+pub async fn get_model_caps(state: &Context, model_id: &str) -> Result<Value> {
     let row = sqlx::query(
         "SELECT source, profile_id, context_window, max_tokens, supports_image_input, \
                 reasoning, thinking_level_map, cost_input, cost_output, cost_cache_read, \
@@ -519,7 +517,7 @@ pub async fn get_model_caps(state: &AppState, model_id: &str) -> Result<Value> {
     ))
 }
 
-async fn profile_name(state: &AppState, profile_id: Option<&str>) -> Result<Option<String>> {
+async fn profile_name(state: &Context, profile_id: Option<&str>) -> Result<Option<String>> {
     let Some(profile_id) = profile_id else {
         return Ok(None);
     };
@@ -674,4 +672,170 @@ pub fn gateway_metadata(item: &Value) -> Value {
         metadata["pi_model_config"] = pi_model_config(&capabilities);
     }
     metadata
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{application::Context, config::AppConfig, db::Database};
+    use std::sync::Arc;
+
+    async fn test_state() -> (Context, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("lagw-caps-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Database::open(&dir.join("test.db")).await.unwrap();
+        let secrets = crate::crypto::SecretStore::load(&dir.join("master.key"))
+            .await
+            .unwrap();
+        let (telemetry, _rx) = crate::telemetry::Telemetry::new(1000);
+        let http: Arc<dyn crate::ports::UpstreamClient> =
+            Arc::new(crate::infrastructure::HttpClientPool::default());
+        let routes: Arc<dyn crate::ports::RouteRepository> =
+            crate::infrastructure::SqliteRouteRepository::new(db.clone());
+        let channels: Arc<dyn crate::ports::ChannelRepository> =
+            crate::infrastructure::SqliteChannelRepository::new(db.clone());
+        let clock: Arc<dyn crate::ports::Clock> = Arc::new(crate::infrastructure::SystemClock);
+        let background = crate::infrastructure::RuntimeSupervisor::new(
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let limits = Arc::new(crate::runtime::RuntimeLimits::default());
+        let discovery = crate::discovery::DiscoveryService::new(
+            db.clone(),
+            secrets.clone(),
+            Arc::clone(&http),
+            Arc::clone(&channels),
+            Arc::clone(&clock),
+            Arc::clone(&background),
+            Arc::clone(&limits),
+        );
+        let proxy = crate::proxy::ProxyService::new(
+            db.clone(),
+            secrets.clone(),
+            Arc::clone(&http),
+            routes.clone(),
+            telemetry.clone(),
+            Arc::clone(&clock),
+            Arc::clone(&limits),
+        );
+        let state = crate::application::Context {
+            config: Arc::new(AppConfig::default()),
+            db: db.clone(),
+            secrets: secrets.clone(),
+            http,
+            routes,
+            channels,
+            clock,
+            discovery,
+            proxy,
+            telemetry,
+            background,
+            limits,
+            admin: crate::admin::AdminService::new(db.clone(), secrets.clone()),
+            recovery: crate::auth::RecoverySession::new(),
+        };
+        (state, dir)
+    }
+
+    /// P2-5: capability detection must only aggregate metadata of the route's
+    /// own protocol. The claude metadata carries a *smaller* context window so
+    /// the pre-fix min-aggregation across protocols would pick it up.
+    #[tokio::test]
+    async fn detection_uses_route_protocol_metadata_only() {
+        let (state, _dir) = test_state().await;
+        let time = "2026-08-04T01:00:00+00:00";
+        sqlx::query("INSERT INTO providers(id,name,base_url,created_at,updated_at) VALUES('prov-1','mock','http://127.0.0.1:1',?,?)")
+            .bind(time)
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channels(id,provider_id,name,protocol,api_key_encrypted,api_key_hint,manual_enabled,created_at,updated_at) VALUES('ch-1','prov-1','chan','openai_compatible',x'00','',1,?,?)")
+            .bind(time)
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channel_models(id,channel_id,model_id,display_name,source,available,metadata_json,first_seen_at,created_at,updated_at) VALUES('cm-1','ch-1','test-model','Test','discovered',1,?,?,?,?)")
+            .bind(r#"{"openai_compatible":{"context_window":128000},"claude":{"context_window":32000}}"#)
+            .bind(time)
+            .bind(time)
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channel_model_protocols(channel_model_id,protocol) VALUES('cm-1','openai_compatible'),('cm-1','claude')")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO model_routes(id,protocol,requested_model_id,enabled,created_at,updated_at) VALUES('route-1','openai_compatible','test-model',1,?,?)")
+            .bind(time)
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO route_candidates(id,route_id,channel_model_id,priority,enabled,created_at,updated_at) VALUES('rc-1','route-1','cm-1',1,1,?,?)")
+            .bind(time)
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        let caps = detect_model_capabilities(&state, "test-model")
+            .await
+            .unwrap();
+        assert_eq!(
+            caps.get("context_window").and_then(Value::as_i64),
+            Some(128000),
+            "only the route protocol's metadata must be aggregated"
+        );
+    }
+
+    /// P2-2: a candidate without a `channel_model_protocols` binding is
+    /// excluded from capability detection entirely — pre-fix the LEFT JOIN
+    /// produced a NULL protocol that fell back to the whole metadata dict.
+    #[tokio::test]
+    async fn candidate_without_protocol_binding_is_excluded() {
+        let (state, _dir) = test_state().await;
+        let time = "2026-08-04T01:00:00+00:00";
+        sqlx::query("INSERT INTO providers(id,name,base_url,created_at,updated_at) VALUES('prov-1','mock','http://127.0.0.1:1',?,?)")
+            .bind(time)
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channels(id,provider_id,name,protocol,api_key_encrypted,api_key_hint,manual_enabled,created_at,updated_at) VALUES('ch-1','prov-1','chan','openai_compatible',x'00','',1,?,?)")
+            .bind(time)
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        // No channel_model_protocols row at all.
+        sqlx::query("INSERT INTO channel_models(id,channel_id,model_id,display_name,source,available,metadata_json,first_seen_at,created_at,updated_at) VALUES('cm-1','ch-1','test-model','Test','discovered',1,?,?,?,?)")
+            .bind(r#"{"openai_compatible":{"context_window":128000}}"#)
+            .bind(time)
+            .bind(time)
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO model_routes(id,protocol,requested_model_id,enabled,created_at,updated_at) VALUES('route-1','openai_compatible','test-model',1,?,?)")
+            .bind(time)
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO route_candidates(id,route_id,channel_model_id,priority,enabled,created_at,updated_at) VALUES('rc-1','route-1','cm-1',1,1,?,?)")
+            .bind(time)
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        let caps = detect_model_capabilities(&state, "test-model")
+            .await
+            .unwrap();
+        assert_eq!(
+            caps,
+            json!({}),
+            "a candidate without a protocol binding must not contribute metadata"
+        );
+    }
 }

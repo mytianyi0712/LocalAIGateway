@@ -15,9 +15,10 @@ use std::sync::Arc;
 
 use sqlx::Row;
 use tokio::sync::Mutex;
-use tokio::time::{Duration, Instant};
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
-use crate::server::AppState;
+use crate::application::Context;
 use crate::settings;
 
 /// Final attempt bookkeeping read back from `request_attempts` for repair:
@@ -26,7 +27,7 @@ type FinalAttempt = (String, Option<i64>, Option<i64>, bool, Option<i64>);
 
 /// Repair legacy cancellations that already captured a completed stream's
 /// usage (Python `reconcile_completed_stream_cancellations`).
-pub async fn reconcile_completed_stream_cancellations(state: &AppState) -> anyhow::Result<i64> {
+pub async fn reconcile_completed_stream_cancellations(state: &Context) -> anyhow::Result<i64> {
     let rows: Vec<(String, String)> = sqlx::query(
         "SELECT rl.id, rl.response_bytes FROM request_logs rl \
          WHERE rl.outcome = 'cancelled' AND rl.final_status_code = 200 AND rl.response_bytes > 0",
@@ -91,37 +92,47 @@ pub async fn reconcile_completed_stream_cancellations(state: &AppState) -> anyho
     Ok(repaired)
 }
 
-/// Background supervisor (Python `MaintenanceSupervisor`, 60s cadence).
-pub fn spawn_supervisor(state: AppState) {
-    tokio::spawn(async move {
-        let _ = reconcile_completed_stream_cancellations(&state).await;
-        let discovering: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
-        let mut last_cleanup: Option<Instant> = None;
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            if let Err(error) = schedule_discovery(&state, &discovering).await {
-                tracing::warn!(%error, "scheduled discovery failed");
-            }
-            if let Err(error) = finalize_stale_pending_requests(&state).await {
-                tracing::warn!(%error, "stale request finalization failed");
-            }
-            let due = last_cleanup.is_none_or(|last| last.elapsed() >= Duration::from_secs(3600));
-            if due {
-                if let Err(error) = cleanup_logs(&state).await {
-                    tracing::warn!(%error, "log cleanup failed");
+/// Background supervisor loop (Python `MaintenanceSupervisor`, 60s cadence).
+/// This is the task body itself: the [`RuntimeSupervisor`] registers it
+/// directly, so no `tokio::spawn` boundary can detach it (P1-1). Scheduled
+/// discoveries are queued on the same supervisor via
+/// [`DiscoveryService::queue_scheduled`], so shutdown drains them with the
+/// rest of the runtime.
+pub async fn run_supervisor(state: Context, cancel: CancellationToken) {
+    // P2-8: a startup reconciliation failure must not end silently.
+    if let Err(error) = reconcile_completed_stream_cancellations(&state).await {
+        tracing::warn!(%error, "startup stream reconciliation failed");
+    }
+    let discovering: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let mut last_cleanup: Option<Instant> = None;
+    let mut interval = tokio::time::interval(state.limits.maintenance_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = interval.tick() => {
+                if let Err(error) = schedule_discovery(&state, &discovering).await {
+                    tracing::warn!(%error, "scheduled discovery failed");
                 }
-                last_cleanup = Some(Instant::now());
+                if let Err(error) = finalize_stale_pending_requests(&state).await {
+                    tracing::warn!(%error, "stale request finalization failed");
+                }
+                let due = last_cleanup.is_none_or(|last| last.elapsed() >= state.limits.cleanup_interval);
+                if due {
+                    if let Err(error) = cleanup_logs(&state).await {
+                        tracing::warn!(%error, "log cleanup failed");
+                    }
+                    last_cleanup = Some(Instant::now());
+                }
             }
         }
-    });
+    }
 }
 
 /// Create `scheduled` discovery runs for enabled channels whose last run is
 /// older than `model_discovery_interval_hours` and spawn the background work.
 async fn schedule_discovery(
-    state: &AppState,
+    state: &Context,
     discovering: &Arc<Mutex<HashMap<String, String>>>,
 ) -> anyhow::Result<()> {
     let runtime = settings::runtime_settings(state).await?;
@@ -166,14 +177,17 @@ async fn schedule_discovery(
         if discovering.contains_key(&channel_id) {
             continue;
         }
-        let run_id =
-            match crate::discovery::queue_scheduled(state.clone(), channel_id.clone()).await {
-                Ok(run_id) => run_id,
-                Err(error) => {
-                    tracing::warn!(%error, "failed to queue scheduled discovery");
-                    continue;
-                }
-            };
+        let run_id = match state
+            .discovery
+            .queue_scheduled(state, channel_id.clone())
+            .await
+        {
+            Ok(run_id) => run_id,
+            Err(error) => {
+                tracing::warn!(%error, "failed to queue scheduled discovery");
+                continue;
+            }
+        };
         discovering.insert(channel_id, run_id);
     }
     Ok(())
@@ -181,7 +195,7 @@ async fn schedule_discovery(
 
 /// Mark request logs stuck in `pending` as cancelled (Python
 /// `_finalize_stale_pending_requests`).
-async fn finalize_stale_pending_requests(state: &AppState) -> anyhow::Result<()> {
+async fn finalize_stale_pending_requests(state: &Context) -> anyhow::Result<()> {
     let runtime = settings::runtime_settings(state).await?;
     let stale_seconds = runtime
         .stream_idle_timeout_seconds
@@ -228,7 +242,7 @@ async fn finalize_stale_pending_requests(state: &AppState) -> anyhow::Result<()>
 
 /// Delete requests, attempts, probes and discovery runs older than
 /// `log_retention_days` (Python `_cleanup_logs`, at most once per hour).
-async fn cleanup_logs(state: &AppState) -> anyhow::Result<()> {
+async fn cleanup_logs(state: &Context) -> anyhow::Result<()> {
     let runtime = settings::runtime_settings(state).await?;
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(runtime.log_retention_days.max(1)))
         .to_rfc3339();

@@ -1,7 +1,7 @@
 # 总体架构
 
-状态：设计基线  
-更新日期：2026-07-22
+状态：当前实现基线（Rust 重写版）
+更新日期：2026-08-11
 
 ## 1. 架构目标
 
@@ -13,296 +13,152 @@
 
 ## 2. 技术选型
 
-### 2.1 后端
+### 2.1 后端（当前实现）
 
-| 领域 | 选型 | 用途 |
+| 领域 | 选型 | 说明 |
 | --- | --- | --- |
-| 运行时 | Python 3.12+ | 后端运行环境 |
-| Web 框架 | FastAPI + Starlette | 管理 API、代理路由、流式响应 |
-| ASGI 服务器 | Uvicorn | 本地单进程服务 |
-| HTTP 客户端 | HTTPX AsyncClient | 连接池、异步流式上游请求 |
-| ORM 与迁移 | SQLAlchemy 2.x + Alembic | SQLite 数据访问与版本迁移 |
-| SQLite 驱动 | aiosqlite | 异步持久化 |
-| 配置 | pydantic-settings | 环境变量和本地配置 |
-| 密钥保护 | cryptography | API Key 静态加密 |
-| 测试 | pytest、pytest-asyncio、respx | 单元与代理集成测试 |
+| 运行时 | Rust（stable toolchain） | 单一 crate `desktop/src-tauri` |
+| Web 框架 | Axum | 管理 API、代理路由、流式响应、ConnectInfo |
+| HTTP 客户端 | reqwest | 按连接超时分组的客户端池（`HttpClients`） |
+| 数据访问 | SQLx（SQLite，WAL） | 运行时迁移 + 显式事务 |
+| 密钥保护 | Fernet（`crypto.rs`） | 主密钥文件 + 加密 API Key |
+| 桌面外壳 | Tauri（`lib.rs`/`controller.rs`） | 托盘常驻、端口切换 |
+| 无头运行 | `bin/gateway-headless.rs` | 服务/打包场景 |
+| 测试 | `cargo test` + 本地 TCP mock 上游 | 端到端代理路径回归 |
 
-首版不引入 Redis、Celery 或外部消息队列。后台任务由进程内异步任务管理器执行，因此生产运行固定为一个 Uvicorn worker。
+前端仍为零构建的原生 HTML/CSS/JS（`frontend/public`），由网关自身托管（`assets.rs`）。
 
-### 2.2 前端
+### 2.2 运行时所有权（P1-1/P1-3）
 
-| 领域 | 选型 |
-| --- | --- |
-| 页面结构 | 原生 HTML |
-| 样式 | 原生 CSS 自定义令牌与响应式布局 |
-| 交互 | 浏览器原生 ES Module JavaScript |
-| 路由 | History API 与 FastAPI 静态回退 |
-| 表单与对话框 | 原生表单、`dialog` 和可访问性属性 |
-| 静态托管 | FastAPI `StaticFiles` 挂载 `frontend/public` |
-| 构建依赖 | 无，不需要 Node.js、包管理器或打包步骤 |
+所有后台任务——HTTP serve、健康探测 supervisor、维护 supervisor、遥测 writer、一次性探测/发现任务——都由 `RuntimeSupervisor`（`infrastructure.rs`）统一持有，且 supervisor 的 `JoinSet` 持有的是**任务本体**：
 
-管理界面定位为本地运维工具，采用紧凑的信息布局，不建设营销页面。静态文件直接由 FastAPI 托管，形成一个 Python 进程和一个访问地址。
+- health/maintenance/telemetry 以 `run_supervisor`/`run_writer` 任务体形式直接注册（`server::spawn_background`），不存在「外层 await 内层 handle」的双层 `tokio::spawn`——deadline abort 不会把内层任务 detach 掉。
+- 健康 supervisor 内部的 probe `JoinSet` 由健康任务局部持有；正常取消时 `shutdown()` join，abort 时 `Drop` 同步 `abort_all()`，probe 永远不会比健康任务活得更久。
+- 注册是「加锁后立即入 JoinSet」的同步操作，取消开始后拒绝新注册（`spawn -> Result<(), ShuttingDown>`），不存在未登记窗口或孤儿任务。
+- `shutdown(deadline)` 是唯一关闭入口：置位 → cancel → 限时 join → 超时 `abort_all` 再 join。controller / headless / Tauri 托盘退出共用同一入口，不再有 10s/30s 双套期限。`active_task_count()` 在 shutdown 返回后恒为 0（活动计数守卫在任务完成或被 abort 时递减），测试用 drop guard 验证 abort 后资源释放。
+- 一次性任务通过 `spawn_tracked` 返回 `TaskOutcome`，失败由 supervisor 记录并计数（P2-8），后台边界不再静默丢错误。
 
-## 3. 系统上下文
+### 2.2.1 异常 serve 退出（P1-2）
 
-```mermaid
-flowchart LR
-    Client["AI 客户端"] -->|"原生协议请求"| Gateway["本地 AI 网关"]
-    Browser["原生管理界面"] -->|"管理 API"| Gateway
-    Gateway -->|"同协议透明转发"| A["供应商渠道 A"]
-    Gateway -->|"失败后按优先级切换"| B["供应商渠道 B"]
-    Gateway --> DB[("SQLite")]
-    Gateway --> Tasks["探测与清理任务"]
-    Tasks --> A
-    Tasks --> B
-```
+`ServerController` 每次 `start()` 递增 runtime generation；serve 任务（supervisor JoinSet 内）只做状态簿记并经 completion channel 上报结果。controller 持有的 monitor（JoinSet 外、由 `RunningServer` 显式持有）在异常退出时核对 generation 后取走 slot、先更新状态再统一 shutdown；`start()` 只把「slot 存在且 serve 未结束」视为已运行，陈旧 slot 先 drain 再重建。并发 start/stop/set_port 由 slot 锁串行化，不会产生第二个 generation。
 
-## 4. 后端分层
+### 2.3 运行常量（P2-10）
 
-```mermaid
-flowchart TB
-    API["API 层"] --> Auth["局域网信任与可选认证"]
-    Auth --> Proxy["透明代理编排器"]
-    Auth --> Admin["管理服务"]
-    Proxy --> Resolver["模型与候选解析"]
-    Proxy --> Circuit["熔断服务"]
-    Proxy --> Adapters["协议适配器"]
-    Proxy --> Observer["旁路统计观察器"]
-    Adapters --> Upstream["上游供应商"]
-    Resolver --> Repo["Repository 层"]
-    Circuit --> Repo
-    Admin --> Repo
-    Observer --> Queue["异步日志队列"]
-    Queue --> Repo
-    Scheduler["后台任务管理器"] --> Circuit
-    Scheduler --> Adapters
-    Scheduler --> Repo
-    Repo --> SQLite[("SQLite WAL")]
-```
+调度间隔与内部安全上限集中在 `runtime::RuntimeLimits`（reaper 500ms、probe 20s/5s、discovery 120s/50 页、maintenance 60s/3600s、错误体 1 MiB、关闭期限 30s），构建一次、不可变、全 supervisor 共享；测试注入短配置。用户可配的上游期限仍在 `settings::RuntimeSettings`（含新增 `max_buffered_upstream_body_mb`，默认 64，范围 1–1024）。
 
-### 4.1 API 层
-
-- 按 URL 明确识别协议，不根据请求正文猜测协议。
-- 按运行时设置决定直接信任访问，或校验管理/代理访问密钥。
-- 将请求交给透明代理编排器或管理服务。
-- 统一处理只由网关自身产生的 `400/401/404/409/502/504`。
-
-### 4.2 透明代理编排器
-
-- 保存可重放的原始请求体。
-- 只读提取模型 ID 和流式标志。
-- 获取同协议候选快照并按优先级顺序尝试。
-- 在首个下游字节发出前决定是否故障转移。
-- 管理上游请求取消和资源释放。
-- 把传输事件发送给熔断服务和统计观察器。
-
-### 4.3 协议适配器
-
-四种适配器实现同一接口，但不负责协议互转：
+## 3. 模块结构（当前）
 
 ```text
-ProtocolAdapter
-  build_upstream_url(base_url, inbound_path, query)
-  inject_credentials(headers, query, api_key)
-  extract_model(raw_body, path)
-  detect_streaming(raw_body, query)
-  discover_models(base_url, api_key)
-  build_health_probe(model_id)
-  observe_stream_chunk(chunk, observer_state)
-  normalize_usage(raw_usage)
+desktop/src-tauri/src/
+├── main.rs / lib.rs          # Tauri 入口（托盘、命令）
+├── bin/gateway-headless.rs   # 无头服务入口
+├── controller.rs             # 桌面端 ServerController（start/stop/set_port）
+├── server.rs                 # 组装根：build()、RuntimeSupervisor、HttpClients
+├── application.rs            # 共享请求上下文 Context（P2-2）
+├── runtime.rs                # RuntimeLimits
+├── auth.rs                   # AdminAuth / RecoveryAuth / RecoverySession
+├── api_error.rs              # 稳定错误信封 + request-id 中间件
+├── admin/                    # 管理 handler 域拆分（P2-4）
+│   ├── mod.rs                # router、AdminService（db+secrets 窄服务）、共享 helpers、测试
+│   ├── providers.rs          # 供应商 CRUD（薄 handler，全部委托 AdminService）
+│   ├── channels.rs           # 渠道 CRUD/密钥/健康重置（薄 handler + AdminService impl）
+│   ├── models.rs             # 渠道模型清单
+│   ├── routes.rs             # 路由与候选（协议支持校验 P2-6）
+│   ├── profiles.rs           # 能力画像（写入校验 P2-4、删除事务化）
+│   ├── mappings.rs           # Claude/Codex 映射与预设
+│   ├── settings.rs           # 设置/密钥/系统状态（含恢复 nonce 流程）
+│   ├── logs.rs / stats.rs / discovery.rs
+├── proxy.rs                  # 代理热路径（ProxyService：prepare/attempt/stream 策略/终态）
+├── routing.rs                # 候选解析
+├── convert/                  # 协议互转域拆分（P2-4）
+│   ├── mod.rs                # 共享转换 helpers、pub use 重导出
+│   ├── request.rs            # 请求方向（claude/responses/gemini → 上游）
+│   ├── response.rs           # 非流式响应 + DSML 解析
+│   ├── stream.rs             # MappedStreamConverter 增量流式转换
+│   ├── error.rs / scan.rs
+├── protocol.rs               # ProtocolId 枚举与协议边界函数
+├── compression.rs            # 有界解码（Observable/Required）
+├── health.rs                 # 探测与熔断恢复
+├── discovery.rs              # 模型发现（快照 + 单事务应用）
+├── maintenance.rs            # 周期维护
+├── telemetry.rs              # 事件队列与 writer
+├── capabilities.rs           # 能力档案
+├── settings.rs               # 运行时设置
+├── crypto.rs / db.rs / config.rs / assets.rs
 ```
 
-适配器可以解析一份请求或响应副本来获取路由和统计信息，但发送给上游或客户端的仍是原始字节。解析异常只会使对应统计字段为 `null`，不会中断成功响应。
+分层方向（当前已落地）：
 
-### 4.4 路由服务
+- `ports.rs` 定义五个应用端口：`UpstreamClient`（上游 HTTP）、`RouteRepository`（候选/目录/映射查询）、`ChannelRepository`（渠道行加载）、`EventSink`（遥测）、`Clock`（时间）。
+- `infrastructure.rs` 提供全部端口实现与运行时所有权：`HttpClientPool`（reqwest 池）、`SqliteRouteRepository`/`SqliteChannelRepository`、`SystemClock`、`RuntimeSupervisor`。
+- `application::Context` 只持有端口与组合好的服务：`http`/`routes`/`channels`/`clock`/`discovery`。业务模块（proxy/health/discovery/routing）经端口访问基础设施——proxy 不再直接 import `reqwest`/`sqlx`；`server.rs` 退化为纯组装根（build/serve/spawn_background），业务模块不再反向引用它（P2-1/P2-2）。
+- `DiscoveryService`（discovery.rs）与 `ProxyService`（proxy.rs，纯端口依赖：db/secrets/http/routes/telemetry/clock/limits）按端口/窄依赖组织；`AdminService`（admin/mod.rs，db+secrets 窄服务）承载 provider/channel 域 SQL（P2-1）。`AttemptFinalizer` 经 `EventSink` 端口发遥测。
+- 协议身份收敛为 `protocol::ProtocolId` 枚举 + `ProtocolAdapter` registry（认证、入口解析、发现、健康探测/判定、usage 观察、公开错误外形）；转换矩阵收敛为 `convert::ConversionStrategy` registry（`(entry, upstream) -> strategy`，覆盖请求/响应/流式转换的调度）；前端协议列表来自 `/system/protocols`（P2-3）。
+- `scripts/check-layers.sh`（CI 门禁）：`application`/`domain`/`ports` 层禁止直接 import `axum`/`sqlx`/`reqwest`；已迁移的 admin 域文件（providers.rs、channels.rs）额外受 handler 范围检查——handler 函数体内禁止出现 `sqlx::`（SQL 只允许在 `impl AdminService` 或存储 helper 中），其余子域迁移完成后加入该检查列表。
+- P2-1 已落地：`AdminService`/`ProxyService` 结构形式化；provider 域双实现已删除（router 只绑定服务用例）；`proxy()` 函数级拆分（bounded_non_stream/final_gateway_response）完成。
+- 迁移状态（进行中，按报告附录逐子域推进）：models/routes/profiles/mappings/settings/logs/stats 仍以直写 SQL 的 handler 为主，尚未全部迁入 `AdminService`；`Context` 仍是宽 service locator。这些是已知的进行中事项，不作为已完成边界描述。
 
-路由键为：
+## 4. 代理热路径（proxy.rs）
 
-```text
-(protocol, requested_model_id)
-```
+`proxy()` 由四个阶段组成（P2-4 已拆分）：
 
-候选选择条件：
+1. `prepare_request`：设置读取、请求体有界读取、网关鉴权、模型识别、映射解析、候选路由；失败直接返回网关错误。
+2. 候选尝试循环：逐渠道尝试，全部失败按最后状态分类收尾（502/504）。
+3. 响应策略：
+   - `transparent_stream`：非映射流式 2xx 原样转发，明文观察有界（P1-1）。
+   - `mapped_stream`：映射流式（prelude 缓冲 + 增量转换），prelude 失败可故障转移。
+   - 非流式（映射与非映射统一）：有界缓冲 + RequiredDecoder + 转换（P1-1/P1-2）。
+4. 终态：所有路径共用 `AttemptFinalizer::finalize`（P1-5）——channel/attempt/request 三类事件由单一 `AttemptOutcome` 驱动，不再可能互相矛盾。
 
-```text
-channel.manual_enabled = true
-AND channel.health_state = active
-AND candidate.enabled = true
-AND channel_model.available = true
-```
+### 4.1 上游响应内存边界（P1-1）
 
-候选列表在请求开始时一次性读取并排序。请求过程中配置变化不改变当前快照，避免顺序不稳定。数据库通过唯一约束保证同一路由中不存在相同优先级。
+- 非映射流式：全程流式转发，无整体缓冲。
+- 映射非流式：`Content-Length` 预检 + chunk 累计硬上限 `max_buffered_upstream_body_mb`；超限返回稳定 `502 upstream_response_too_large`，绝不把部分 JSON 交给转换器。
+- 非 2xx 错误体：只保留 `RuntimeLimits::error_body_max`（1 MiB），截断记录 `body_truncated=true`。
 
-### 4.5 熔断服务
+### 4.2 解码器（P1-2）
 
-渠道健康状态机：
+- `ObservableDecoder`：仅用于透明转发的 usage 观察；超限/失败后静默停喂，转发不受影响。
+- `RequiredDecoder`：用于映射转换；保留未消费输入余量（无损续传）、累计明文硬上限、`finished()` 截断检测；任何失败都是终态错误，绝不静默截断。
 
-```mermaid
-stateDiagram-v2
-    [*] --> Active
-    Active --> Active: "成功 / 清零连续失败"
-    Active --> Active: "不可计数错误"
-    Active --> Open: "连续可计数错误达到阈值"
-    Open --> Probing: "disabled_until 到期"
-    Probing --> Active: "探测成功"
-    Probing --> Open: "探测失败 / 再冷却 15 分钟"
-    Active --> ManualDisabled: "手动禁用"
-    Open --> ManualDisabled: "手动禁用"
-    ManualDisabled --> Active: "手动启用并清零状态"
-```
+### 4.3 转换失败终态（P1-5）
 
-实现要求：
+转换失败保持协议兼容的 HTTP 200 + 固定错误体，但遥测记录 `outcome="gateway_error"`、`error_kind="conversion_error"`、无成功 usage、无 `ChannelSuccess`——统计不再把失败请求计为成功。
 
-- 更新连续失败计数时使用数据库事务，防止并发请求丢失更新。
-- `open -> probing` 使用条件更新抢占探测权，只允许一个任务成功。
-- 探测使用协议适配器构造最小请求，提示模型仅回复 `OK`，并限制最大输出 Token。
-- 探测成功的判定为 HTTP `2xx` 且适配器能解析到非空输出；`OK` 文本用于降低成本，不强制模型逐字完全匹配。
-- 手动禁用是独立字段，后台任务不得自动覆盖。
+## 5. 事务边界
 
-### 4.6 模型发现服务
+- 模型发现（`discovery.rs`，P2-5）：网络阶段只构造不可变 `DiscoverySnapshot`；模型 upsert、协议绑定、陈旧绑定删除、`available` 重算与成功 run 终态在**一个事务**内提交；失败 run 单独短事务写失败原因，不回滚旧目录。
+- 健康探测（`health.rs`，P2-6）：网络探测收集 `ProbeResult[]`，全部日志与 `channel_health` 聚合在**一个事务**内提交。
+- 供应商 PATCH（P1-4）：name/base_url 全部输入先校验，再以**单条动态 UPDATE** 原子提交——非法 URL 或语句失败不会留下半更新行；删除路径保持显式事务。
+- 能力画像更新（P1-4）：`capability_profiles` 行与全部引用它的 `model_caps` 传播在**一个事务**内提交，事务内无网络调用；故障注入测试（SQLite trigger）锁定回滚行为。
+- 渠道 PATCH（P2-3）：名称、协议、健康模型与可选的新 API key 在同一事务内提交；「仅轮换密钥」的独立端点保留给明确操作。
+- 其余管理写路径使用显式 `begin/commit`，事务内无 HTTP 调用。
 
-- 使用渠道自己的 API Key 请求模型列表。
-- 协议适配器负责 URL、认证和分页差异。
-- 将返回结果标准化为 `model_id`、`display_name`、`metadata_json`。
-- 同步时只更新目录状态，不自动创建或重新排序路由候选。
-- 手动模型记录设置 `source=manual`，自动探测不得删除。
+## 6. 访问控制与密钥恢复
 
-### 4.7 统计观察器
+- 局域网信任模式默认开启；关闭后代理入口与管理 API 分别校验密钥（`settings.rs`），密钥加密存储。
+- 运行时设置读取是 **fail-closed**（P1-3）：按键白名单查询，任一已存在的运行时行 JSON 损坏或类型错误即返回带键名的 `ConfigCorrupted`——鉴权与代理路径拒绝请求，绝不回退默认值（损坏的 `trust_local_network` 不可能变成 `true`）；范围校验由写路径 `validate_updates` 负责，格式合法但越界的旧值仍可读（消费端按 `max(1)` 等防御性夹取）。
+- 设置页读取走 `runtime_settings_ui`：损坏行跳过并返回 `config_corrupted_keys` 列表，页面显示修复提示，重新填写保存即修复。
+- 密钥损坏时进入恢复模式（P1-4）：`RecoveryAuth` 校验 loopback peer + Host；生成端点额外校验同源 `Origin` 与一次性 256-bit nonce（`x-recovery-nonce` 头，60s TTL，一次有效）。跨站表单、DNS rebinding、重放、过期 nonce 全部拒绝；同源 UI 流程：status 发 nonce → generate 消费 nonce → 立即恢复正常鉴权。
 
-统计观察器通过 tee 方式接收已转发字节的副本：
+## 7. 可观测性
 
-```mermaid
-flowchart LR
-    U["上游字节流"] --> F["转发生成器"]
-    F --> C["客户端"]
-    F -. "非阻塞副本" .-> O["协议观察器"]
-    O --> Q["有界日志队列"]
-    Q --> D[("SQLite")]
-```
+- 管理 API：`RequestId` 中间件注入/回写 `x-request-id`，handler 内部事件通过 tracing span 继承 request_id（P2-7），客户端 ID 可精确定位底层错误日志。
+- 代理路径：`request_logs` + `request_attempts` + `token_usage`（writer 单事务写，attempt 幂等）。
+- 后台失败计数：`RuntimeSupervisor::failed_task_count()`；discovery 持久化失败转为可查询的 `persistence_error`（P2-8）。
 
-- 转发生成器优先把字节交给客户端。
-- 观察器只维护增量解析状态，不保存完整成功响应；若响应带有 `Content-Encoding`，独立解码旁路副本后再解析 usage，原始响应流不变。
-- 旁路解码支持 `gzip`、`deflate`、Brotli 和 Zstandard，解码或解析失败只会让统计字段保持 `null`。
-- 日志队列有固定容量；队列满时记录内部丢弃计数，不阻塞代理。
-- 请求结束后提交归一化指标和上游原始 usage JSON。
-- SSE 或 JSON 解析失败时保留传输耗时和状态码，Token 字段写 `null`。
+## 8. 前端（frontend/public）
 
-## 5. 代理请求生命周期
+- 原生 SPA：History API + 网关静态回退；`app.js` 单一入口。
+- 导航竞态（P2-9）：mutation 开始时捕获 `{path, renderVersion}`，数据写入照常完成，但 reload/render 只在页面仍匹配时执行；`loadX` 内部校验目标 path；纯查询可被导航丢弃。
+- 预设刷新（P1-5）：按钮触发后端真实 discovery 排队（Claude→`claude` 协议渠道；Codex→`openai_responses`/`openai_compatible` 渠道），前端轮询各 run 终态，完成后重新 GET presets 并刷新下拉；无渠道/部分失败/导航离开/重复点击均有确定状态。预设列表由 `channel_models + channel_model_protocols` 实时聚合，无第二份缓存。
+- 设置表单（P1-7）：数字字段由单一 schema（`SETTINGS_SECTIONS`）驱动渲染、提交载荷与前端范围校验；`max_buffered_upstream_body_mb` 随 schema 一并提交；设置损坏时页面显示 `config_corrupted_keys` 提示并可重新保存修复。
+- 渠道保存（P2-3）：API key 并入单个原子 PATCH，不再拆成两个请求。
+- 协议列表数据驱动自 `/system/protocols`（常量仅作离线兜底）。
+- 密钥恢复 UI：损坏时渲染恢复页，携带 nonce 完成一次生成。
 
-### 5.1 请求准备
+## 9. 部署形态
 
-1. API 层应用局域网信任策略并确定协议；默认信任模式不要求凭据。
-2. 请求体写入 `SpooledTemporaryFile`；小请求保存在内存，超过阈值后自动落临时文件。
-3. 适配器从同一份原始字节只读提取模型 ID，不重编码请求。
-4. 路由服务生成候选快照，限制到本次最大尝试次数。
-5. 没有可用路由时返回网关生成的 `404`；存在路由但渠道全部熔断时返回 `503` 并携带最早恢复时间。
-
-请求体最大尺寸作为可配置安全上限，默认 256 MiB。超过上限时返回网关生成的 `413`。临时文件在请求结束或取消时立即关闭。
-
-### 5.2 单渠道尝试
-
-1. 将请求体游标复位到开头。
-2. 复制端到端请求头，移除逐跳头和本地认证。
-3. 注入渠道 API Key，构造上游 URL。
-4. 使用共享的 HTTPX 连接池发起请求，禁用自动重定向。
-5. 收到 `2xx` 后立即准备向客户端转发状态、端到端响应头和原始响应流。
-6. 收到非 `2xx` 时，在决定切换前完整读取错误响应到可重放临时存储。
-7. 把本次结果提交给熔断服务并写入尝试日志。
-
-### 5.3 最终响应
-
-- 成功响应：原始流直接输出。输出开始后上游中断只终止当前流，不再尝试其他渠道。
-- 最终 HTTP 错误：返回保留的原始状态、端到端响应头和原始响应体。
-- 最终传输错误：如果之前保存过上游 HTTP 错误，返回最近一次上游 HTTP 错误；否则按超时类型生成 `502` 或 `504`。
-- 客户端取消：取消当前 HTTPX 请求并结束，不发起后续尝试。
-
-## 6. 访问控制设计
-
-### 6.1 局域网信任与本地代理认证
-
-默认开启“信任局域网访问”，代理入口和管理 API 都不要求凭据。此时客户端不传 API Key 或传入任意值都不会被本地网关拦截；协议适配器仍会在转发上游前替换为所选渠道的上游 API Key。
-
-关闭信任后，代理入口启用独立的网关访问密钥。为兼容现有 SDK，代理入口从各协议原生认证位置读取本地密钥：
-
-| 协议 | 客户端提供位置 | 转发上游时 |
-| --- | --- | --- |
-| OpenAI Compatible / Responses | `Authorization: Bearer ...` | 替换为渠道 API Key |
-| Claude | `x-api-key` | 替换为渠道 API Key |
-| Gemini | `x-goog-api-key` 或 `key` 查询参数 | 删除本地值并注入渠道凭据 |
-
-也支持统一的 `X-Local-Gateway-Key`，便于调试。关闭信任后，管理 API 使用独立的 `Authorization: Bearer <admin_token>`。两类密钥可以手动设置或随机生成，加密保存且只在生成时返回一次。
-
-### 6.2 上游密钥存储
-
-- 首次启动生成随机主密钥文件，权限设置为 `0600`。
-- SQLite 只保存加密后的 API Key 密文。
-- 管理 API 的读取响应只返回 `has_api_key` 和末尾掩码，不返回密文或明文。
-- 更新渠道时，未提供新的 API Key 表示保留原值；显式清除需要单独动作。
-- 日志和异常格式化器统一对认证头、`key` 参数和已知密钥值脱敏。
-
-## 7. 并发与一致性
-
-- HTTPX 按供应商源站复用连接，限制每源站最大连接数和 keep-alive 连接数。
-- SQLite 开启 WAL、外键和 busy timeout。
-- 配置变更采用短事务；日志采用单独写入队列批量提交。
-- 优先级列表通过“整体替换候选顺序”接口在一个事务内更新，避免逐项交换产生唯一约束冲突。
-- 渠道失败计数和探测抢占采用原子条件更新。
-- 首版只运行一个后端进程。未来多进程化时必须先把后台任务锁和日志队列替换为跨进程实现。
-
-## 8. 超时与取消
-
-- 连接超时、首字节超时、首 Token 超时、流式空闲超时、非流式总超时分别配置。
-- 流式请求没有固定总时长限制，但受到空闲超时限制。
-- 客户端断开由 ASGI 取消信号传递给上游。
-- 后端关闭时停止接受新请求，等待进行中的请求到达优雅关闭上限，然后取消剩余请求。
-- 后台探测有独立的短超时，不复用用户请求的长超时。
-
-## 9. 建议目录结构
-
-```text
-.
-├── backend/
-│   ├── alembic/
-│   ├── app/
-│   │   ├── adapters/
-│   │   │   ├── base.py
-│   │   │   ├── claude.py
-│   │   │   ├── gemini.py
-│   │   │   ├── openai_compatible.py
-│   │   │   └── openai_responses.py
-│   │   ├── api/
-│   │   │   ├── admin/
-│   │   │   └── proxy/
-│   │   ├── core/
-│   │   ├── db/
-│   │   ├── repositories/
-│   │   ├── services/
-│   │   │   ├── circuit_breaker.py
-│   │   │   ├── discovery.py
-│   │   │   ├── proxy.py
-│   │   │   ├── routing.py
-│   │   │   └── telemetry.py
-│   │   ├── tasks/
-│   │   └── main.py
-│   ├── tests/
-│   └── pyproject.toml
-├── frontend/
-│   └── public/
-│       ├── index.html
-│       └── assets/
-│           ├── app.css
-│           └── app.js
-├── docs/
-└── README.md
-```
-
-## 10. 部署形态
-
-开发和生产均只启动 FastAPI。部署流程如下：
-
-1. 原生静态文件直接从 `frontend/public` 由 FastAPI 提供。
-2. Alembic 在启动前执行数据库迁移。
-3. Uvicorn 以单进程监听 `0.0.0.0:3000`。
-4. FastAPI 同时提供管理页面、管理 API 和四种代理入口。
-
-首版提供本地启动脚本；Docker 可作为后续可选交付方式，不作为开发依赖。
+- 桌面：Tauri 托盘常驻；退出时 `controller.stop()` 走统一 supervisor shutdown，保证遥测尾部落盘。
+- 无头：`gateway-headless`（Ctrl-C → 统一 shutdown）。
+- 单进程固定（后台任务持有进程内所有权，未来多进程化需先替换任务锁与日志队列）。

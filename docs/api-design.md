@@ -384,9 +384,20 @@ DELETE /api/admin/v1/logs?before=2026-07-01T00:00:00Z&confirm=true
 | --- | --- | --- |
 | `GET` | `/settings` | 查询可运行时修改的设置 |
 | `PATCH` | `/settings` | 原子更新设置 |
-| `POST` | `/settings/access-keys/generate` | 随机生成并加密保存管理与代理密钥；明文只返回一次 |
+| `GET` | `/settings/access-keys/status` | 密钥损坏时返回恢复状态并签发一次性 nonce（P1-4） |
+| `POST` | `/settings/access-keys/generate` | 随机生成并加密保存管理与代理密钥；明文只返回一次（损坏时需携带 nonce） |
 | `GET` | `/system/status` | 数据库、日志队列和后台任务状态 |
 | `GET` | `/system/protocols` | 返回协议枚举和支持的入口 |
+
+### 9.1 密钥损坏恢复流程（P1-4）
+
+访问密钥损坏（无法解密）时，管理 API 除恢复端点外全部锁定。恢复流程：
+
+1. `GET /settings/access-keys/status`（仅 loopback 且 `Host` 为 loopback 名可访问）在检测到损坏时签发 **60 秒有效、一次性** 的 256-bit nonce，随响应返回 `recovery_nonce`。同源 UI 才能读到它（跨站读取被 CORS 阻止）。
+2. `POST /settings/access-keys/generate` 必须通过全部校验：loopback peer + loopback `Host` + 同源 `Origin`（`http://127.0.0.1:port` / `http://localhost:port` / `http://[::1]:port`）+ 请求头 `x-recovery-nonce` 匹配且未过期。任何失败都会**消费**当前 nonce（重放、过期、猜测均失效）。
+3. 成功轮换后 nonce 立即失效，管理端恢复正常鉴权。
+
+跨站 HTML 表单无法设置自定义请求头、无法读取 nonce，DNS rebinding 的 `Host`/`Origin` 不是 loopback 名——三类攻击都被拒绝。脚本/curl 调用需先 GET status 取 nonce，再带 `x-recovery-nonce` 头 POST。
 
 设置更新示例：
 

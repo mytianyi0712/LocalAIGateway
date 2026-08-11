@@ -1,6 +1,16 @@
 # Rust 网关 vs Python 后端：功能差异审计报告
 
-- 审计日期：2026-08-04
+> **历史快照（2026-08-04）**：本文是 Rust 重写初期的差异审计。此后
+> `backend/`（Python 参考实现）已从交付物中移除，Rust 网关成为唯一实现，
+> 报告中的 **Critical 项（C1–C6）与大部分 Major 项已在此后各轮整改中
+> 关闭**（详见 `code-review-report.md` 的复核记录与当前 `architecture.md`）：
+> 映射入口 404、映射流式增量转换、熔断自动半开恢复、定时发现/日志保留/
+> 陈旧请求回收/启动修复、能力检测、转换层工具/图片/thinking/DSML 语义等
+> 均已落地。本文不再作为当前行为基线，仅保留历史审计结论供追溯。
+>
+> 当前架构与行为基线请以 `docs/architecture.md` 与源码为准。
+
+- 审计日期：2026-08-04（历史快照）
 - 审计对象：
   - Python 参考实现：`backend/`（FastAPI，`app/main.py` 入口，v0.2.1）
   - Rust 网关：`desktop/src-tauri/`（axum + Tauri，`server.rs` 建路由）

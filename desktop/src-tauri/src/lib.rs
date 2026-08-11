@@ -1,8 +1,10 @@
 pub mod admin;
 pub mod api_error;
+pub mod application;
 pub mod assets;
 pub mod auth;
 pub mod capabilities;
+pub mod compression;
 pub mod config;
 pub mod controller;
 pub mod convert;
@@ -10,10 +12,13 @@ pub mod crypto;
 pub mod db;
 pub mod discovery;
 pub mod health;
+pub mod infrastructure;
 pub mod maintenance;
+pub mod ports;
 pub mod protocol;
 pub mod proxy;
 pub mod routing;
+pub mod runtime;
 pub mod server;
 pub mod settings;
 pub mod telemetry;
@@ -178,9 +183,19 @@ fn build_tray(app: &tauri::AppHandle) -> anyhow::Result<()> {
             TRAY_MENU_SHOW_ID => show_main_window(app),
             TRAY_MENU_QUIT_ID => {
                 if let Some(controller) = app.try_state::<Arc<ServerController>>() {
-                    controller.request_stop();
+                    // `stop` is internally bounded by the runtime's absolute
+                    // shutdown deadline (P1-3): it drains in-flight requests
+                    // and the telemetry tail, then aborts and joins anything
+                    // stuck — so awaiting it can never hang the exit.
+                    let controller = Arc::clone(&controller);
+                    let handle = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        controller.stop().await;
+                        handle.exit(0);
+                    });
+                } else {
+                    app.exit(0);
                 }
-                app.exit(0);
             }
             _ => {}
         })

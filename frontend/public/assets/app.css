@@ -280,6 +280,7 @@ button:disabled { cursor: not-allowed; }
 .switch-control:checked { background: var(--accent); }
 .switch-control:checked::after { transform: translateX(18px); }
 .notice { padding: 12px 13px; border: 1px solid #ead6ab; border-radius: var(--radius-small); background: var(--warning-soft); color: #825413; font-size: 12px; line-height: 1.5; }
+.notice.is-error { border-color: #e0b4b4; background: var(--danger-soft); color: #a12525; }
 .generated-keys { display: grid; gap: 8px; padding: 13px; border: 1px solid #c5e3d6; border-radius: var(--radius-small); background: var(--accent-faint); }
 .generated-key { display: grid; grid-template-columns: 88px minmax(0, 1fr) 32px; align-items: center; gap: 8px; }
 .generated-key span { color: var(--muted); font-size: 12px; }

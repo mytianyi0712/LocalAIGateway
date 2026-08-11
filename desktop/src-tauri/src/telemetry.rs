@@ -6,8 +6,9 @@ use std::sync::{
 use serde_json::Value;
 use sqlx::Row;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
-use crate::db::Database;
+use crate::{db::Database, ports::EventSink};
 
 #[derive(Clone)]
 pub struct Telemetry {
@@ -88,19 +89,88 @@ pub struct Usage {
     pub raw: Option<Value>,
 }
 
-impl Telemetry {
-    pub fn start(db: Database, capacity: usize) -> Self {
-        let (sender, mut receiver) = mpsc::channel(capacity);
-        let dropped = Arc::new(AtomicU64::new(0));
-        let dropped_worker = Arc::clone(&dropped);
-        tokio::spawn(async move {
-            while let Some(event) = receiver.recv().await {
-                if write_event(&db, event).await.is_err() {
-                    dropped_worker.fetch_add(1, Ordering::Relaxed);
-                }
+impl Usage {
+    /// Merge a newer usage snapshot into this one, per-field
+    /// latest-non-None-wins: a streaming upstream reports usage across
+    /// several chunks and a later chunk often omits fields the earlier one
+    /// carried (e.g. `prompt_tokens_details.cached_tokens`), so a full
+    /// overwrite would silently drop input/cache data. `cache_miss` is
+    /// recomputed from the merged input/cache values; `raw` keeps the newest
+    /// snapshot.
+    pub fn merge(&mut self, other: &Usage) {
+        if other.input_tokens.is_some() {
+            self.input_tokens = other.input_tokens;
+        }
+        if other.cache_read_tokens.is_some() {
+            self.cache_read_tokens = other.cache_read_tokens;
+        }
+        if other.cache_write_tokens.is_some() {
+            self.cache_write_tokens = other.cache_write_tokens;
+        }
+        if other.output_tokens.is_some() {
+            self.output_tokens = other.output_tokens;
+        }
+        // All four protocol adapters derive the miss as
+        // total_input - cache_read - cache_write.
+        self.cache_miss_input_tokens = match (self.input_tokens, self.cache_read_tokens) {
+            (Some(total), Some(read)) => {
+                Some((total - read - self.cache_write_tokens.unwrap_or(0)).max(0))
             }
-        });
-        Self { sender, dropped }
+            _ => None,
+        };
+        if other.raw.is_some() {
+            self.raw = other.raw.clone();
+        }
+    }
+}
+
+impl Telemetry {
+    /// Pure assembly: builds the telemetry handle and its event channel
+    /// without spawning any task. The writer task is owned by the caller via
+    /// [`Self::run_writer`], so background-task lifetime is explicit.
+    pub fn new(capacity: usize) -> (Self, mpsc::Receiver<Event>) {
+        let (sender, receiver) = mpsc::channel(capacity);
+        let dropped = Arc::new(AtomicU64::new(0));
+        (Self { sender, dropped }, receiver)
+    }
+
+    pub fn dropped_handle(&self) -> Arc<AtomicU64> {
+        self.dropped.clone()
+    }
+
+    /// Runs the telemetry writer task body in the caller's task — the
+    /// [`RuntimeSupervisor`] registers it directly, so no `tokio::spawn`
+    /// boundary can detach it mid-shutdown. On cancel it keeps draining
+    /// events with a blocking receive — handlers may still emit during
+    /// graceful shutdown — and only exits once every sender is released
+    /// (channel closed), so the tail of the request log is never lost
+    /// (P1-5).
+    pub async fn run_writer(
+        db: Database,
+        mut rx: mpsc::Receiver<Event>,
+        cancel: CancellationToken,
+        dropped: Arc<AtomicU64>,
+    ) {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    while let Some(event) = rx.recv().await {
+                        if write_event(&db, event).await.is_err() {
+                            dropped.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    break;
+                }
+                maybe = rx.recv() => match maybe {
+                    Some(event) => {
+                        if write_event(&db, event).await.is_err() {
+                            dropped.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    None => break,
+                },
+            }
+        }
     }
 
     pub fn emit(&self, event: Event) {
@@ -114,6 +184,12 @@ impl Telemetry {
     }
     pub fn queue_size(&self) -> usize {
         self.sender.max_capacity() - self.sender.capacity()
+    }
+}
+
+impl EventSink for Telemetry {
+    fn emit(&self, event: Event) {
+        Telemetry::emit(self, event);
     }
 }
 
@@ -242,6 +318,7 @@ async fn write_event(db: &Database, event: Event) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::db::Database;
+    use std::time::Duration;
 
     fn attempt_event(response_started: bool) -> Event {
         Event::Attempt(Box::new(AttemptData {
@@ -377,6 +454,53 @@ mod tests {
             logged, 1,
             "log row must roll back together with the snapshot"
         );
+    }
+
+    /// P1-5: cancelling the writer must flush every queued event before exit,
+    /// and the task must be joinable promptly.
+    #[tokio::test]
+    async fn writer_drains_remaining_events_on_cancel() {
+        let db = temp_db().await;
+        seed_request(&db).await;
+        let (telemetry, rx) = Telemetry::new(1000);
+        let cancel = CancellationToken::new();
+        let writer = tokio::spawn(Telemetry::run_writer(
+            db.clone(),
+            rx,
+            cancel.clone(),
+            telemetry.dropped_handle(),
+        ));
+        telemetry.emit(Event::RequestStart {
+            id: "req-2".into(),
+            protocol: "openai_compatible".into(),
+            model_id: None,
+            endpoint: "/v1/chat/completions".into(),
+            stream: false,
+            started_at: "2026-08-04T02:00:00+00:00".into(),
+            request_bytes: 10,
+        });
+        telemetry.emit(attempt_event(false));
+        cancel.cancel();
+        // The writer only exits once every sender is released (blocking
+        // drain), so the test must drop its own sender first.
+        let dropped_before = telemetry.dropped();
+        drop(telemetry);
+        tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("writer must exit after cancel and sender release")
+            .unwrap();
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_logs WHERE id='req-2'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "queued RequestStart must be flushed on cancel");
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_attempts WHERE id='attempt-1'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(attempts, 1, "queued Attempt must be flushed on cancel");
+        assert_eq!(dropped_before, 0);
     }
 
     #[tokio::test]
