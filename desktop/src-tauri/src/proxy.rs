@@ -3551,6 +3551,139 @@ mod tests {
         gateway.shutdown().await;
     }
 
+    /// Review finding: a mapped stream whose UPSTREAM is the Responses API
+    /// must record input tokens AND the cache-hit count. The Responses
+    /// usage shape nests cache hits in `input_tokens_details.cached_tokens`
+    /// (there is no Claude-style top-level `cache_read_input_tokens`), so
+    /// the converter's usage merge must look there.
+    #[tokio::test]
+    async fn mapped_responses_upstream_records_cache_read() {
+        let body = format!(
+            "{}{}",
+            sse_event(r#"{"type":"response.output_text.delta","delta":"hi"}"#),
+            sse_event(r#"{"type":"response.completed","response":{"id":"r-1","usage":{"input_tokens":100,"output_tokens":50,"input_tokens_details":{"cached_tokens":30}}}}"#),
+        );
+        let response = stream_response(&body, Some(body.len()));
+        let port = spawn_upstream(response.into_bytes(), false).await;
+        let gateway = test_gateway_mapped(port, &[]).await;
+        // Rewire the scaffold: the mapped channel speaks openai_responses.
+        sqlx::query("UPDATE channels SET protocol='openai_responses' WHERE id='ch-1'")
+            .execute(gateway.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channel_model_protocols(channel_model_id,protocol) VALUES('cm-1','openai_responses')")
+            .execute(gateway.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE model_routes SET protocol='openai_responses' WHERE id='route-1'")
+            .execute(gateway.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE claude_model_mappings SET upstream_protocol='openai_responses' WHERE id='map-1'")
+            .execute(gateway.db.pool())
+            .await
+            .unwrap();
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request_mapped(true), "claude", None)
+            .await;
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(!bytes.is_empty());
+        let (_, outcome, attempts, _) =
+            wait_for_outcome(&gateway.db, "success", Duration::from_secs(5)).await;
+        assert_eq!(outcome, "success");
+        assert_eq!(attempts, 1);
+        let (input, cache_read, miss, output): (
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        ) = sqlx::query_as(
+            "SELECT input_tokens, cache_read_tokens, cache_miss_input_tokens, output_tokens \
+             FROM request_attempts LIMIT 1",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(input, Some(100), "input tokens must be recorded");
+        assert_eq!(
+            cache_read, Some(30),
+            "responses cache hits (input_tokens_details.cached_tokens) must be recorded"
+        );
+        assert_eq!(miss, Some(70), "cache miss = total - hit");
+        assert_eq!(output, Some(50));
+        gateway.shutdown().await;
+    }
+
+    /// Review finding: a same-protocol MAPPED stream (model-renaming
+    /// mapping on a claude channel) forwards raw bytes, but must still
+    /// record usage — previously the passthrough converter never merged
+    /// usage, so input/output/cache were all NULL in the logs.
+    #[tokio::test]
+    async fn mapped_passthrough_stream_records_usage() {
+        let body = format!(
+            "{}{}{}{}{}{}",
+            sse_event(r#"{"type":"message_start","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":4,"cache_creation_input_tokens":2}}}"#),
+            sse_event(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#),
+            sse_event(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#),
+            sse_event(r#"{"type":"content_block_stop","index":0}"#),
+            sse_event(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":4,"cache_creation_input_tokens":2}}"#),
+            sse_event(r#"{"type":"message_stop"}"#),
+        );
+        let response = stream_response(&body, Some(body.len()));
+        let port = spawn_upstream(response.into_bytes(), false).await;
+        let gateway = test_gateway_mapped(port, &[]).await;
+        // Rewire the scaffold: a same-protocol mapping (claude -> claude).
+        sqlx::query("UPDATE channels SET protocol='claude' WHERE id='ch-1'")
+            .execute(gateway.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channel_model_protocols(channel_model_id,protocol) VALUES('cm-1','claude')")
+            .execute(gateway.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE model_routes SET protocol='claude' WHERE id='route-1'")
+            .execute(gateway.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE claude_model_mappings SET upstream_protocol='claude' WHERE id='map-1'")
+            .execute(gateway.db.pool())
+            .await
+            .unwrap();
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request_mapped(true), "claude", None)
+            .await;
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(!bytes.is_empty());
+        let (_, outcome, attempts, _) =
+            wait_for_outcome(&gateway.db, "success", Duration::from_secs(5)).await;
+        assert_eq!(outcome, "success");
+        assert_eq!(attempts, 1);
+        let (input, cache_read, cache_write, output): (
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        ) = sqlx::query_as(
+            "SELECT input_tokens, cache_read_tokens, cache_write_tokens, output_tokens \
+             FROM request_attempts LIMIT 1",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(input, Some(10), "passthrough input tokens must be recorded");
+        assert_eq!(
+            cache_read, Some(4),
+            "passthrough cache hits must be recorded"
+        );
+        assert_eq!(cache_write, Some(2));
+        assert_eq!(output, Some(5));
+        gateway.shutdown().await;
+    }
+
     /// Regression guard: a clean stream records a single success.
     #[tokio::test]
     async fn normal_stream_completes_with_single_success() {

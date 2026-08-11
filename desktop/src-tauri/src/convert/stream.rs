@@ -143,15 +143,43 @@ impl UsageAcc {
     }
 
     fn merge_responses(&mut self, usage: &Value) {
-        for (key, slot) in [
-            ("input_tokens", &mut self.input_tokens),
-            ("output_tokens", &mut self.output_tokens),
-            ("cache_read_input_tokens", &mut self.cache_read),
-            ("reasoning_tokens", &mut self.reasoning),
-        ] {
-            if let Some(value) = usage.get(key).and_then(Value::as_i64) {
-                *slot = Some(value);
+        if let Some(value) = usage.get("input_tokens").and_then(Value::as_i64) {
+            self.input_tokens = Some(value);
+        }
+        if let Some(value) = usage.get("output_tokens").and_then(Value::as_i64) {
+            self.output_tokens = Some(value);
+        }
+        // The Responses API nests cache hits in
+        // `input_tokens_details.cached_tokens` (there is no Claude-style
+        // top-level `cache_read_input_tokens`); some compatible providers
+        // use `prompt_tokens_details` instead.
+        if let Some(details) = usage
+            .get("input_tokens_details")
+            .or_else(|| usage.get("prompt_tokens_details"))
+            .filter(|value| value.is_object())
+        {
+            if let Some(value) = details.get("cached_tokens").and_then(Value::as_i64)
+                && value > 0
+            {
+                self.cache_read = Some(value);
             }
+            if let Some(value) = details
+                .get("cache_write_tokens")
+                .or_else(|| details.get("cached_write_tokens"))
+                .or_else(|| details.get("cache_creation_input_tokens"))
+                .and_then(Value::as_i64)
+                && value > 0
+            {
+                self.cache_write = Some(value);
+            }
+        }
+        if let Some(value) = usage
+            .get("output_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens"))
+            .or_else(|| usage.get("reasoning_tokens"))
+            .and_then(Value::as_i64)
+        {
+            self.reasoning = Some(value);
         }
     }
 
@@ -318,9 +346,39 @@ impl MappedStreamConverter {
             ConverterKind::ClaudePassthrough | ConverterKind::ResponsesPassthrough
         );
         if passthrough {
+            // Same-protocol mapped streams forward the raw bytes untouched,
+            // but usage must still be observed: a model-renaming mapping on
+            // a claude/responses channel would otherwise record zero tokens
+            // in the logs.
+            self.observe_passthrough_usage(chunk);
             return chunk.to_vec();
         }
         self.feed_impl(chunk)
+    }
+
+    /// Parse the raw chunk for usage events (the same shapes the transparent
+    /// path scans) without altering the forwarded bytes.
+    fn observe_passthrough_usage(&mut self, chunk: &[u8]) {
+        self.buffer.extend_from_slice(&normalize_crlf(chunk));
+        for block in split_sse_blocks(&mut self.buffer) {
+            if let Some(ParsedEvent::Json(value)) = sse_block_events(&block) {
+                let usage = match self.kind {
+                    ConverterKind::ClaudePassthrough => value
+                        .get("message")
+                        .and_then(|message| message.get("usage"))
+                        .or_else(|| value.get("usage")),
+                    _ => value
+                        .get("usage")
+                        .or_else(|| value.get("response").and_then(|item| item.get("usage"))),
+                };
+                if let Some(usage) = usage.filter(|item| item.is_object()) {
+                    match self.kind {
+                        ConverterKind::ClaudePassthrough => self.usage.merge_claude(usage),
+                        _ => self.usage.merge_responses(usage),
+                    }
+                }
+            }
+        }
     }
 
     fn feed_impl(&mut self, chunk: &[u8]) -> Vec<u8> {
