@@ -457,6 +457,8 @@ mod tests {
             Arc::clone(&background),
             Arc::clone(&limits),
         );
+        let notifier: std::sync::Arc<dyn crate::ports::Notifier> =
+            crate::notification::DesktopNotifier::new(std::time::Duration::from_millis(50));
         let proxy = crate::proxy::ProxyService::new(
             db.clone(),
             secrets.clone(),
@@ -465,6 +467,7 @@ mod tests {
             telemetry.clone(),
             Arc::clone(&clock),
             Arc::clone(&limits),
+            crate::notification::DesktopNotifier::new(std::time::Duration::from_millis(50)),
         );
         let state = crate::application::Context {
             config: Arc::new(AppConfig::default()),
@@ -474,6 +477,7 @@ mod tests {
             routes,
             channels,
             clock,
+            notifier,
             discovery,
             proxy,
             telemetry,

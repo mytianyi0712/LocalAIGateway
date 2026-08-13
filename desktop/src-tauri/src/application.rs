@@ -42,6 +42,8 @@ pub struct Context {
     pub channels: Arc<dyn ChannelRepository>,
     /// Time port (P2-1).
     pub clock: Arc<dyn Clock>,
+    /// Desktop-notification port (P2-1): coalesced failover alerts.
+    pub notifier: Arc<dyn crate::ports::Notifier>,
     /// Discovery service (P2-1).
     pub discovery: Arc<crate::discovery::DiscoveryService>,
     /// Proxy service (P2-1): request orchestration entry for the proxy

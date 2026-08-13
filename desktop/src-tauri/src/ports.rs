@@ -168,3 +168,23 @@ pub struct ChannelRow {
 pub trait ChannelRepository: Send + Sync {
     fn load_channel(&self, channel_id: &str) -> BoxFuture<'static, Result<Option<ChannelRow>>>;
 }
+
+/// One failover event: a request attempt on `failed_channel_name` was handed
+/// over to `next_channel_name`. `error_kind` is a short stable label
+/// ("connect_timeout", "transport_error", "HTTP 500", ...) or None when the
+/// failure carried no classification.
+#[derive(Debug, Clone)]
+pub struct FailoverNotice {
+    pub model_id: String,
+    pub failed_channel_name: String,
+    pub next_channel_name: String,
+    pub error_kind: Option<String>,
+}
+
+/// Desktop-notification port (P2-1): fire-and-forget user-facing alerts.
+/// Implementations must never block the caller: delivery is asynchronous
+/// (queued to a background worker), and environments without a notification
+/// daemon degrade silently.
+pub trait Notifier: Send + Sync {
+    fn notify_failover(&self, notice: FailoverNotice);
+}

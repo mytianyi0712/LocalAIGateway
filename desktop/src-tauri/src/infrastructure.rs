@@ -159,7 +159,13 @@ impl RouteRepository for SqliteRouteRepository {
         let protocol = protocol.map(str::to_owned);
         Box::pin(async move {
             let rows = sqlx::query_as::<_, RoutableModel>(
-            "SELECT mr.requested_model_id AS id, mr.requested_model_id AS display_name, MIN(mr.created_at) AS created_at \
+            "SELECT mr.requested_model_id AS id, \
+                    COALESCE((SELECT MAX(cm.display_name) FROM channel_models cm \
+                      JOIN route_candidates rc ON rc.channel_model_id = cm.id \
+                      JOIN model_routes r2 ON r2.id = rc.route_id \
+                      WHERE r2.requested_model_id = mr.requested_model_id AND r2.enabled = 1), \
+                     mr.requested_model_id) AS display_name, \
+                    MIN(mr.created_at) AS created_at \
              FROM model_routes mr \
              WHERE mr.enabled = 1 AND (? IS NULL OR mr.protocol = ?) \
                AND EXISTS (SELECT 1 FROM route_candidates rc \

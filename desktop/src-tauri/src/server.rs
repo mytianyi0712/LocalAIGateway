@@ -58,8 +58,14 @@ pub async fn build(config: AppConfig) -> Result<GatewayRuntime> {
         telemetry.clone(),
         Arc::clone(&clock),
         Arc::clone(&limits),
+        crate::notification::DesktopNotifier::new(
+            crate::notification::DEFAULT_FLUSH_WINDOW,
+        ),
     );
     let admin = crate::admin::AdminService::new(db.clone(), secrets.clone());
+    let notifier = crate::notification::DesktopNotifier::new(
+        crate::notification::DEFAULT_FLUSH_WINDOW,
+    );
     let state = Context {
         config: Arc::new(config),
         db,
@@ -68,6 +74,7 @@ pub async fn build(config: AppConfig) -> Result<GatewayRuntime> {
         routes,
         channels,
         clock,
+        notifier,
         discovery,
         proxy,
         admin,

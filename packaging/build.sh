@@ -126,7 +126,7 @@ clean_stale_releases
 # 2. 代理检测:AppImage 打包首次需要从 GitHub 下载 type2-runtime(缓存在本机
 #    后才离线可用);直连不通时自动使用本机常见代理端口(7897/7890/10809/1080),
 #    不覆盖用户已显式设置的代理。
-export NO_STRIP=true
+export NO_STRIP=1
 
 if [[ -z "${HTTPS_PROXY:-}" && -z "${https_proxy:-}" ]]; then
   for port in 7897 7890 10809 1080; do

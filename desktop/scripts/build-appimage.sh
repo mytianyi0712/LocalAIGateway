@@ -68,7 +68,7 @@ PY
 # rolling distributions, so it cannot parse .relr.dyn sections. NO_STRIP is
 # supported by linuxdeploy and leaves symbols intact for a larger but valid
 # AppImage.
-export NO_STRIP="${NO_STRIP:-true}"
+export NO_STRIP="${NO_STRIP:-1}"
 
 # Tauri CLI treats CI as a strict boolean; some harnesses export CI=1.
 export CI=true

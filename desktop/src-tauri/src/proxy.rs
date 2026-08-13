@@ -25,7 +25,7 @@ use crate::{
     crypto::SecretStore,
     db::Database,
     protocol,
-    routing::{self, Candidate},
+    routing::{self, Candidate, RoutableModel},
     runtime::RuntimeLimits,
     settings,
     telemetry::{AttemptData, Event, Telemetry, Usage},
@@ -189,6 +189,17 @@ impl TransportFailure {
                 | Self::FirstTokenTimeout
                 | Self::BodyTimeout
         )
+    }
+
+    /// Short stable label for telemetry and user-facing failover alerts.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ConnectTimeout => "connect_timeout",
+            Self::FirstByteTimeout => "first_byte_timeout",
+            Self::FirstTokenTimeout => "first_token_timeout",
+            Self::BodyTimeout => "body_timeout",
+            Self::ConnectionReset => "connection_reset",
+        }
     }
 }
 
@@ -2300,6 +2311,7 @@ pub struct ProxyService {
     telemetry: Telemetry,
     clock: Arc<dyn crate::ports::Clock>,
     limits: Arc<RuntimeLimits>,
+    notifier: Arc<dyn crate::ports::Notifier>,
 }
 
 impl ProxyService {
@@ -2311,6 +2323,7 @@ impl ProxyService {
         telemetry: Telemetry,
         clock: Arc<dyn crate::ports::Clock>,
         limits: Arc<RuntimeLimits>,
+        notifier: Arc<dyn crate::ports::Notifier>,
     ) -> Arc<Self> {
         Arc::new(Self {
             db,
@@ -2320,6 +2333,7 @@ impl ProxyService {
             telemetry,
             clock,
             limits,
+            notifier,
         })
     }
 
@@ -2373,6 +2387,27 @@ impl ProxyService {
         let mut attempts = 0i64;
         for (index, candidate) in candidates.iter().enumerate() {
             attempts = index as i64 + 1;
+            // Entering a backup candidate means the previous one failed:
+            // alert the user. The notifier queues and coalesces the notice
+            // (1s window, P2-1) — this path never blocks. `last_transport_kind`
+            // and `last_error` are mutually exclusive by construction (each
+            // failure path clears the other), so the surviving one describes
+            // the previous candidate's failure.
+            if index > 0 {
+                let error_kind = last_transport_kind
+                    .map(|kind| kind.as_str().to_owned())
+                    .or_else(|| {
+                        last_error
+                            .as_ref()
+                            .map(|(status, _, _, _)| format!("HTTP {}", status.as_u16()))
+                    });
+                self.notifier.notify_failover(crate::ports::FailoverNotice {
+                    model_id: entry_model.clone(),
+                    failed_channel_name: candidates[index - 1].channel_name.clone(),
+                    next_channel_name: candidate.channel_name.clone(),
+                    error_kind,
+                });
+            }
             let attempt_started = self.clock.now_utc();
             // Absolute anchor for first-token accounting: the deadline covers the
             // whole attempt, so a slow response head cannot extend the window.
@@ -2433,6 +2468,7 @@ impl ProxyService {
             let outbound = match protocol::outbound_headers(&headers, upstream_protocol, &api_key) {
                 Ok(value) => value,
                 Err(error) => {
+                    last_error = None;
                     last_transport_kind = Some(TransportFailure::ConnectionReset);
                     let _ = error;
                     continue;
@@ -2456,6 +2492,7 @@ impl ProxyService {
                 Ok(response) => response,
                 Err(crate::ports::UpstreamError::ConnectTimeout) => {
                     let finished = self.clock.now_utc();
+                    last_error = None;
                     last_transport_kind = Some(TransportFailure::ConnectTimeout);
                     AttemptFinalizer::new(
                         Arc::new(self.telemetry.clone()),
@@ -2486,6 +2523,7 @@ impl ProxyService {
                 }
                 Err(crate::ports::UpstreamError::Transport(error)) => {
                     let finished = self.clock.now_utc();
+                    last_error = None;
                     last_transport_kind = Some(TransportFailure::ConnectionReset);
                     AttemptFinalizer::new(
                         Arc::new(self.telemetry.clone()),
@@ -2516,6 +2554,7 @@ impl ProxyService {
                 }
                 Err(crate::ports::UpstreamError::Deadline) => {
                     let finished = self.clock.now_utc();
+                    last_error = None;
                     last_transport_kind = Some(TransportFailure::FirstByteTimeout);
                     AttemptFinalizer::new(
                         Arc::new(self.telemetry.clone()),
@@ -2600,6 +2639,7 @@ impl ProxyService {
                         MappedStreamResult::Respond(result) => return result,
                         MappedStreamResult::FailOver(transport) => {
                             last_transport_kind = transport;
+                            last_error = None;
                             continue;
                         }
                     }
@@ -2625,6 +2665,7 @@ impl ProxyService {
                     NonStreamResult::Respond(result) => return result,
                     NonStreamResult::FailOver(transport) => {
                         last_transport_kind = transport;
+                        last_error = None;
                         continue;
                     }
                 }
@@ -2658,6 +2699,9 @@ impl ProxyService {
                     "upstream error body truncated at the error-body cap"
                 );
             }
+            // The upstream answered with an error status: this failure is
+            // described by `last_error`, not by any earlier transport kind.
+            last_transport_kind = None;
             let (kind, countable) = status_kind(status);
             let finished = self.clock.now_utc();
             AttemptFinalizer::new(
@@ -2732,12 +2776,99 @@ pub async fn codex(State(state): State<AppContext>, request: Request) -> Respons
     normal(State(state), request, "openai_responses").await
 }
 
+/// Builds the `x_local_gateway` metadata for one catalog item: the union of
+/// every endpoint the model is currently routable through (ordered by
+/// `PROTOCOL_ORDER`), plus capability data (context window, max tokens,
+/// reasoning, image input, costs) and the pi model config so catalog consumers
+/// such as the omp extension can use real values instead of their built-in
+/// defaults. Capabilities are detected on the fly for `auto` rows (C5); models
+/// without any capability data omit the field entirely.
+async fn gateway_metadata(
+    state: &AppContext,
+    item: &RoutableModel,
+) -> Result<Option<Value>, Response<Body>> {
+    let mut gateway = json!({});
+    match state.routes.routable_endpoints_for_model(&item.id).await {
+        Ok(endpoints) => {
+            if !endpoints.is_empty() {
+                gateway["supported_endpoints"] = json!(endpoints);
+            }
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "model endpoints query failed");
+            return Err(gateway_error(
+                "catalog",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "database_error",
+                "Database error",
+                "catalog",
+            ));
+        }
+    }
+    match capabilities::get_model_caps(state, &item.id).await {
+        Ok(caps) => {
+            if capabilities::has_capability_data(&caps) {
+                let pi_config = capabilities::pi_model_config(&caps);
+                gateway["capabilities"] = caps;
+                gateway["pi_model_config"] = pi_config;
+            }
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "model caps query failed");
+            return Err(gateway_error(
+                "catalog",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "database_error",
+                "Database error",
+                "catalog",
+            ));
+        }
+    }
+    Ok(if gateway
+        .as_object()
+        .is_some_and(|object| !object.is_empty())
+    {
+        Some(gateway)
+    } else {
+        None
+    })
+}
+
+/// OpenAI list-form catalog entries (id/object/owned_by/created) with the
+/// shared `x_local_gateway` metadata; used by the per-protocol catalogs and
+/// the `/v1/models` aggregate alike.
+async fn openai_catalog_items(
+    state: &AppContext,
+    items: &[RoutableModel],
+) -> Result<Vec<Value>, Response<Body>> {
+    let mut data = Vec::new();
+    for item in items {
+        let mut value = json!({
+            "id": item.id,
+            "object": "model",
+            "owned_by": "local-gateway",
+            "created": item.created_at,
+        });
+        match gateway_metadata(state, item).await {
+            Ok(Some(metadata)) => value["x_local_gateway"] = metadata,
+            Ok(None) => {}
+            Err(response) => return Err(response),
+        }
+        data.push(value);
+    }
+    Ok(data)
+}
+
+/// Per-protocol model catalog. Each protocol answers with its native list
+/// shape: OpenAI list form (`/v1/responses/models`, protocol-selected
+/// `/v1/models`), Claude list form (`/v1/messages/models`, `anthropic-version`
+/// selection), or Gemini (`/v1beta/models`).
 pub async fn models(
     State(state): State<AppContext>,
     request: Request,
-    protocol: &'static str,
+    protocol: &str,
 ) -> Response<Body> {
-    if !settings::authorize_gateway(&state, request.headers(), request.uri().query(), "catalog")
+    if !settings::authorize_gateway(&state, request.headers(), request.uri().query(), protocol)
         .await
         .unwrap_or(false)
     {
@@ -2762,64 +2893,79 @@ pub async fn models(
             );
         }
     };
-    if protocol == "gemini" {
-        json_response(
+    match protocol {
+        "gemini" => json_response(
             StatusCode::OK,
             json!({"models":items.iter().map(|item|json!({"name":format!("models/{}",item.id),"displayName":item.display_name,"supportedGenerationMethods":["generateContent"]})).collect::<Vec<_>>() }),
-        )
-    } else {
-        // Attach capability metadata (context window, max tokens, reasoning,
-        // image input, costs) under x_local_gateway.capabilities so catalog
-        // consumers such as the omp extension can use real values instead of
-        // their built-in defaults. Capabilities are detected on the fly for
-        // `auto` rows (C5); models without any capability data omit the field.
-        let mut data = Vec::new();
-        for item in &items {
-            let mut value = json!({
-                "id": item.id,
-                "object": "model",
-                "owned_by": "local-gateway",
-                "created": item.created_at,
-            });
-            match state.routes.routable_endpoints_for_model(&item.id).await {
-                Ok(endpoints) => {
-                    if !endpoints.is_empty() {
-                        value["x_local_gateway"]["supported_endpoints"] = json!(endpoints);
-                    }
+        ),
+        "claude" => {
+            let mut data = Vec::new();
+            for item in &items {
+                let mut value = json!({
+                    "type": "model",
+                    "id": item.id,
+                    "display_name": item.display_name,
+                    "created_at": item.created_at,
+                });
+                match gateway_metadata(&state, item).await {
+                    Ok(Some(metadata)) => value["x_local_gateway"] = metadata,
+                    Ok(None) => {}
+                    Err(response) => return response,
                 }
-                Err(error) => {
-                    tracing::error!(error = %error, "model endpoints query failed");
-                    return gateway_error(
-                        protocol,
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "database_error",
-                        "Database error",
-                        "catalog",
-                    );
-                }
+                data.push(value);
             }
-            match capabilities::get_model_caps(&state, &item.id).await {
-                Ok(caps) => {
-                    if capabilities::has_capability_data(&caps) {
-                        let pi_config = capabilities::pi_model_config(&caps);
-                        value["x_local_gateway"]["capabilities"] = caps;
-                        value["x_local_gateway"]["pi_model_config"] = pi_config;
-                    }
-                }
-                Err(error) => {
-                    tracing::error!(error = %error, "model caps query failed");
-                    return gateway_error(
-                        protocol,
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "database_error",
-                        "Database error",
-                        "catalog",
-                    );
-                }
-            }
-            data.push(value);
+            json_response(
+                StatusCode::OK,
+                json!({
+                    "data": data,
+                    "has_more": false,
+                    "first_id": data.first().map(|value| value["id"].clone()).unwrap_or(Value::Null),
+                    "last_id": data.last().map(|value| value["id"].clone()).unwrap_or(Value::Null),
+                }),
+            )
         }
-        json_response(StatusCode::OK, json!({ "object": "list", "data": data }))
+        _ => match openai_catalog_items(&state, &items).await {
+            Ok(data) => json_response(StatusCode::OK, json!({ "object": "list", "data": data })),
+            Err(response) => response,
+        },
+    }
+}
+
+/// Aggregated catalog for `GET /v1/models` without an explicit protocol
+/// selector: every enabled, routable model across all protocols, deduplicated
+/// by model id (requirements.md:126-131).
+pub async fn aggregate_models(
+    State(state): State<AppContext>,
+    request: Request,
+) -> Response<Body> {
+    if !settings::authorize_gateway(&state, request.headers(), request.uri().query(), "catalog")
+        .await
+        .unwrap_or(false)
+    {
+        return gateway_error(
+            "catalog",
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Gateway access denied.",
+            "catalog",
+        );
+    }
+    let items = match state.routes.list_routable_models(None).await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(error = %error, "model catalog query failed");
+            return gateway_error(
+                "catalog",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "database_error",
+                "Database error",
+                "catalog",
+            );
+        }
+    };
+    match openai_catalog_items(&state, &items).await {
+        Ok(data) => json_response(StatusCode::OK, json!({ "object": "list", "data": data })),
+        Err(response) => response,
     }
 }
 
@@ -2903,8 +3049,41 @@ pub async fn codex_info(State(state): State<AppContext>, request: Request) -> Re
     }
 }
 
+/// `GET /v1/models`. Protocol selection, in order: the `protocol` query
+/// parameter, the `X-Local-Gateway-Protocol` header, or the
+/// `anthropic-version` header (Claude SDKs) — each returns that protocol's
+/// native catalog. Without any selector the catalog aggregates every enabled
+/// routable model across all protocols (api-design.md:447).
 pub async fn openai_models(State(state): State<AppContext>, request: Request) -> Response<Body> {
-    models(State(state), request, "openai_compatible").await
+    let selected = request
+        .uri()
+        .query()
+        .and_then(|query| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .find(|(key, _)| key == "protocol")
+                .map(|(_, value)| value.into_owned())
+        })
+        .or_else(|| {
+            request
+                .headers()
+                .get("x-local-gateway-protocol")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        });
+    if let Some(protocol) = selected.as_deref() {
+        if matches!(protocol, "openai_compatible" | "openai_responses" | "claude") {
+            return models(State(state), request, protocol).await;
+        }
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({"error":{"message":"Unsupported model catalog protocol."}}),
+        );
+    }
+    if request.headers().contains_key("anthropic-version") {
+        models(State(state), request, "claude").await
+    } else {
+        aggregate_models(State(state), request).await
+    }
 }
 pub async fn responses_models(State(state): State<AppContext>, request: Request) -> Response<Body> {
     models(State(state), request, "openai_responses").await
@@ -2928,16 +3107,38 @@ pub async fn codex_models(State(state): State<AppContext>, request: Request) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ports::FailoverNotice;
     use crate::{config::AppConfig, db::Database, telemetry::Telemetry};
     use futures_util::stream;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::sync::CancellationToken;
+
+    /// In-memory Notifier recording every failover notice for assertions.
+    #[derive(Clone, Default)]
+    struct FakeNotifier(Arc<parking_lot::Mutex<Vec<FailoverNotice>>>);
+
+    impl FakeNotifier {
+        fn new() -> Self {
+            Self::default()
+        }
+        fn notices(&self) -> Vec<FailoverNotice> {
+            self.0.lock().clone()
+        }
+    }
+
+    impl crate::ports::Notifier for FakeNotifier {
+        fn notify_failover(&self, notice: FailoverNotice) {
+            self.0.lock().push(notice);
+        }
+    }
 
     /// In-memory-free test scaffold: temp dir, real migrations, a seeded
     /// openai_compatible route pointing at a raw TCP upstream we control.
     struct TestGateway {
         db: Database,
         state: AppContext,
+        secrets: SecretStore,
+        notifier: FakeNotifier,
         writer_cancel: CancellationToken,
         writer: tokio::task::JoinHandle<()>,
         _dir: std::path::PathBuf,
@@ -2960,7 +3161,7 @@ mod tests {
     }
 
     async fn test_gateway(upstream_port: u16, extra_settings: &[(&str, &str)]) -> TestGateway {
-        test_gateway_inner(upstream_port, extra_settings, false).await
+        test_gateway_inner(upstream_port, extra_settings, false, false).await
     }
 
     /// Same scaffold plus a claude model mapping (`mapped-model` ->
@@ -2970,13 +3171,24 @@ mod tests {
         upstream_port: u16,
         extra_settings: &[(&str, &str)],
     ) -> TestGateway {
-        test_gateway_inner(upstream_port, extra_settings, true).await
+        test_gateway_inner(upstream_port, extra_settings, true, false).await
+    }
+
+    /// Same scaffold plus a second, claude-protocol route (`claude-model`
+    /// through the same channel model) so catalog aggregation covers more
+    /// than the openai family.
+    async fn test_gateway_claude(
+        upstream_port: u16,
+        extra_settings: &[(&str, &str)],
+    ) -> TestGateway {
+        test_gateway_inner(upstream_port, extra_settings, false, true).await
     }
 
     async fn test_gateway_inner(
         upstream_port: u16,
         extra_settings: &[(&str, &str)],
         mapped: bool,
+        claude_route: bool,
     ) -> TestGateway {
         let dir = temp_dir().await;
         let db = Database::open(&dir.join("test.db")).await.unwrap();
@@ -3035,6 +3247,24 @@ mod tests {
                 .await
                 .unwrap();
         }
+        if claude_route {
+            sqlx::query("INSERT INTO channel_model_protocols(channel_model_id,protocol) VALUES('cm-1','claude')")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO model_routes(id,protocol,requested_model_id,enabled,created_at,updated_at) VALUES('route-2','claude','claude-model',1,?,?)")
+                .bind(time)
+                .bind(time)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO route_candidates(id,route_id,channel_model_id,priority,enabled,created_at,updated_at) VALUES('rc-2','route-2','cm-1',1,1,?,?)")
+                .bind(time)
+                .bind(time)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
         for (key, raw) in extra_settings {
             sqlx::query("INSERT INTO settings(key,value_json,updated_at) VALUES(?,?,?)")
                 .bind(key)
@@ -3072,6 +3302,8 @@ mod tests {
             Arc::clone(&background),
             Arc::clone(&limits),
         );
+        let recorder = FakeNotifier::new();
+        let notifier: Arc<dyn crate::ports::Notifier> = Arc::new(recorder.clone());
         let proxy = crate::proxy::ProxyService::new(
             db.clone(),
             secrets.clone(),
@@ -3080,6 +3312,7 @@ mod tests {
             telemetry.clone(),
             Arc::clone(&clock),
             Arc::clone(&limits),
+            notifier.clone(),
         );
         let state = crate::application::Context {
             config: Arc::new(AppConfig::default()),
@@ -3089,6 +3322,7 @@ mod tests {
             routes,
             channels,
             clock,
+            notifier,
             discovery,
             proxy,
             telemetry,
@@ -3100,6 +3334,8 @@ mod tests {
         TestGateway {
             db,
             state,
+            secrets,
+            notifier: recorder,
             writer_cancel: cancel,
             writer,
             _dir: dir,
@@ -3117,6 +3353,40 @@ mod tests {
             .header("content-type", "application/json")
             .body(axum::body::Body::from(body))
             .unwrap()
+    }
+
+    /// Upstream that serves `response` to every accepted connection, so a
+    /// backup channel stays reachable across consecutive requests.
+    async fn spawn_upstream_reusable(response: Vec<u8>) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let response = Arc::new(response);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let response = Arc::clone(&response);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let mut total = 0usize;
+                    loop {
+                        match stream.read(&mut buf[total..]).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                total += n;
+                                if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let _ = stream.write_all(&response).await;
+                });
+            }
+        });
+        port
     }
 
     /// Raw HTTP/1.1 upstream: reads the request headers, writes `response`,
@@ -4677,5 +4947,330 @@ mod tests {
             assert_eq!(status, Some(502));
             gateway.shutdown().await;
         }
+    }
+
+    async fn catalog_ids(response: Response<Body>) -> (StatusCode, Value) {
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        (status, value)
+    }
+
+    fn catalog_entry<'a>(value: &'a Value, id: &str) -> &'a Value {
+        value["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == id)
+            .unwrap()
+    }
+
+    fn catalog_model_ids(value: &Value) -> Vec<String> {
+        value["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// `/v1/models` without a protocol selector aggregates every protocol
+    /// pool (openai_compatible + claude here), deduplicated by model id, and
+    /// each entry carries the endpoints of every protocol it routes through.
+    #[tokio::test]
+    async fn v1_models_aggregates_all_protocols() {
+        let port = spawn_upstream(Vec::new(), false).await;
+        let gateway = test_gateway_claude(port, &[]).await;
+        let request = axum::extract::Request::builder()
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+        let (status, value) =
+            catalog_ids(openai_models(State(gateway.state.clone()), request).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["object"], "list");
+        assert_eq!(
+            catalog_model_ids(&value),
+            vec!["claude-model", "test-model"],
+            "aggregate must list every protocol pool ordered by id"
+        );
+        assert_eq!(
+            catalog_entry(&value, "test-model")["x_local_gateway"]["supported_endpoints"],
+            json!(["/v1/chat/completions"])
+        );
+        assert_eq!(
+            catalog_entry(&value, "claude-model")["x_local_gateway"]["supported_endpoints"],
+            json!(["/v1/messages"])
+        );
+        gateway.shutdown().await;
+    }
+
+    /// `/v1/models?protocol=…` returns exactly that protocol's pool.
+    #[tokio::test]
+    async fn v1_models_protocol_query_selects_protocol() {
+        let port = spawn_upstream(Vec::new(), false).await;
+        let gateway = test_gateway_claude(port, &[]).await;
+        for (query, expected) in [
+            ("?protocol=claude", vec!["claude-model".to_owned()]),
+            ("?protocol=openai_compatible", vec!["test-model".to_owned()]),
+            ("?protocol=openai_responses", Vec::<String>::new()),
+        ] {
+            let request = axum::extract::Request::builder()
+                .uri(format!("/v1/models{query}"))
+                .body(Body::empty())
+                .unwrap();
+            let (status, value) =
+                catalog_ids(openai_models(State(gateway.state.clone()), request).await).await;
+            assert_eq!(status, StatusCode::OK);
+            if query == "?protocol=claude" {
+                assert_eq!(value["data"][0]["type"], "model");
+            } else {
+                assert_eq!(value["object"], "list");
+            }
+            assert_eq!(
+                catalog_model_ids(&value),
+                expected,
+                "query {query} must select exactly its protocol"
+            );
+        }
+        gateway.shutdown().await;
+    }
+
+    /// `X-Local-Gateway-Protocol` and `anthropic-version` both select the
+    /// Claude catalog on `/v1/models`; an unknown protocol is rejected.
+    #[tokio::test]
+    async fn v1_models_headers_select_or_reject_protocol() {
+        let port = spawn_upstream(Vec::new(), false).await;
+        let gateway = test_gateway_claude(port, &[]).await;
+        let request = axum::extract::Request::builder()
+            .uri("/v1/models")
+            .header("x-local-gateway-protocol", "claude")
+            .body(Body::empty())
+            .unwrap();
+        let (status, value) =
+            catalog_ids(openai_models(State(gateway.state.clone()), request).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(catalog_model_ids(&value), vec!["claude-model"]);
+
+        let request = axum::extract::Request::builder()
+            .uri("/v1/models")
+            .header("anthropic-version", "2023-06-01")
+            .body(Body::empty())
+            .unwrap();
+        let (status, value) =
+            catalog_ids(openai_models(State(gateway.state.clone()), request).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(catalog_model_ids(&value), vec!["claude-model"]);
+
+        let request = axum::extract::Request::builder()
+            .uri("/v1/models?protocol=gemini")
+            .body(Body::empty())
+            .unwrap();
+        let (status, value) =
+            catalog_ids(openai_models(State(gateway.state.clone()), request).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            value.pointer("/error/message").and_then(Value::as_str),
+            Some("Unsupported model catalog protocol.")
+        );
+        gateway.shutdown().await;
+    }
+
+    /// `/v1/messages/models` answers the Claude native list shape with the
+    /// channel's real display name and `x_local_gateway` metadata.
+    #[tokio::test]
+    async fn claude_catalog_uses_native_shape() {
+        let port = spawn_upstream(Vec::new(), false).await;
+        let gateway = test_gateway_claude(port, &[]).await;
+        let request = axum::extract::Request::builder()
+            .uri("/v1/messages/models")
+            .body(Body::empty())
+            .unwrap();
+        let (status, value) =
+            catalog_ids(claude_models(State(gateway.state.clone()), request).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(catalog_model_ids(&value), vec!["claude-model"]);
+        assert_eq!(value["has_more"], false);
+        assert_eq!(value["first_id"], "claude-model");
+        assert_eq!(value["last_id"], "claude-model");
+        let entry = &value["data"][0];
+        assert_eq!(entry["type"], "model");
+        assert_eq!(entry["id"], "claude-model");
+        assert_eq!(entry["display_name"], "Test Model");
+        assert_eq!(entry["created_at"], "2026-08-04T01:00:00+00:00");
+        assert_eq!(
+            entry["x_local_gateway"]["supported_endpoints"],
+            json!(["/v1/messages"])
+        );
+        gateway.shutdown().await;
+    }
+
+    /// Seeds a second openai_compatible candidate (priority 2) for the same
+    /// model, pointing at `port_b` — the failover target for `test-model`.
+    async fn seed_backup_candidate(db: &Database, secrets: &SecretStore, port_b: u16) {
+        let time = "2026-08-04T01:00:00+00:00";
+        sqlx::query("INSERT INTO providers(id,name,base_url,created_at,updated_at) VALUES('prov-2','mock-b',?,?,?)")
+            .bind(format!("http://127.0.0.1:{port_b}"))
+            .bind(time)
+            .bind(time)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channels(id,provider_id,name,protocol,api_key_encrypted,api_key_hint,manual_enabled,created_at,updated_at) VALUES('ch-2','prov-2','chan-b','openai_compatible',?,?,1,?,?)")
+            .bind(secrets.encrypt("test-key"))
+            .bind("...key")
+            .bind(time)
+            .bind(time)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channel_models(id,channel_id,model_id,display_name,source,available,first_seen_at,created_at,updated_at) VALUES('cm-2','ch-2','test-model','Test Model B','discovered',1,?,?,?)")
+            .bind(time)
+            .bind(time)
+            .bind(time)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channel_model_protocols(channel_model_id,protocol) VALUES('cm-2','openai_compatible')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO route_candidates(id,route_id,channel_model_id,priority,enabled,created_at,updated_at) VALUES('rc-2','route-1','cm-2',2,1,?,?)")
+            .bind(time)
+            .bind(time)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channel_health(channel_id,state,consecutive_failures,updated_at) VALUES('ch-2','active',0,?)")
+            .bind(time)
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+
+    fn http_error_upstream(status: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .into_bytes()
+    }
+
+    fn json_ok_upstream(body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .into_bytes()
+    }
+
+    /// A request that fails on the primary candidate and succeeds on the
+    /// backup emits exactly one failover notice describing the handover.
+    #[tokio::test]
+    async fn failover_emits_notification_with_http_error() {
+        let port_a = spawn_upstream(
+            http_error_upstream("500 Internal Server Error", r#"{"error":"boom"}"#),
+            false,
+        )
+        .await;
+        let port_b = spawn_upstream(
+            json_ok_upstream(r#"{"choices":[{"finish_reason":"stop","message":{"content":"OK"}}]}"#),
+            false,
+        )
+        .await;
+        let gateway = test_gateway(port_a, &[]).await;
+        seed_backup_candidate(&gateway.db, &gateway.secrets, port_b).await;
+
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request(false), "openai_compatible", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let notices = gateway.notifier.notices();
+        assert_eq!(notices.len(), 1, "one failover -> one notice");
+        assert_eq!(notices[0].model_id, "test-model");
+        assert_eq!(notices[0].failed_channel_name, "chan");
+        assert_eq!(notices[0].next_channel_name, "chan-b");
+        assert_eq!(notices[0].error_kind.as_deref(), Some("HTTP 500"));
+        gateway.shutdown().await;
+    }
+
+    /// Every failover is reported: two requests with a broken primary emit
+    /// two notices — the notifier batches, it never throttles.
+    #[tokio::test]
+    async fn consecutive_failovers_each_emit_notice() {
+        let port_a = spawn_upstream(
+            http_error_upstream("500 Internal Server Error", r#"{"error":"boom"}"#),
+            false,
+        )
+        .await;
+        let port_b = spawn_upstream_reusable(
+            json_ok_upstream(r#"{"choices":[{"finish_reason":"stop","message":{"content":"OK"}}]}"#),
+        )
+        .await;
+        let gateway = test_gateway(port_a, &[]).await;
+        seed_backup_candidate(&gateway.db, &gateway.secrets, port_b).await;
+
+        for _ in 0..2 {
+            let response = gateway
+                .state
+                .proxy
+                .proxy(chat_request(false), "openai_compatible", None)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert_eq!(gateway.notifier.notices().len(), 2);
+        gateway.shutdown().await;
+    }
+
+    /// A transport failure (connection reset) on the primary is labelled
+    /// with the transport kind in the notice.
+    #[tokio::test]
+    async fn failover_transport_reset_labels_error_kind() {
+        // Empty response then close: the HTTP parse sees EOF -> transport error.
+        let port_a = spawn_upstream(Vec::new(), false).await;
+        let port_b = spawn_upstream(
+            json_ok_upstream(r#"{"choices":[{"finish_reason":"stop","message":{"content":"OK"}}]}"#),
+            false,
+        )
+        .await;
+        let gateway = test_gateway(port_a, &[]).await;
+        seed_backup_candidate(&gateway.db, &gateway.secrets, port_b).await;
+
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request(false), "openai_compatible", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let notices = gateway.notifier.notices();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].error_kind.as_deref(), Some("connection_reset"));
+        gateway.shutdown().await;
+    }
+
+    /// With no backup candidate there is no failover: a failing single
+    /// candidate answers 502 and emits no notice.
+    #[tokio::test]
+    async fn single_candidate_failure_emits_no_notice() {
+        let port_a = spawn_upstream(
+            http_error_upstream("500 Internal Server Error", r#"{"error":"boom"}"#),
+            false,
+        )
+        .await;
+        let gateway = test_gateway(port_a, &[]).await;
+
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request(false), "openai_compatible", None)
+            .await;
+        // No failover: the upstream's 500 error response is passed through.
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(gateway.notifier.notices().is_empty());
+        gateway.shutdown().await;
     }
 }

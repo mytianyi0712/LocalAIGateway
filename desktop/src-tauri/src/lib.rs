@@ -14,6 +14,7 @@ pub mod discovery;
 pub mod health;
 pub mod infrastructure;
 pub mod maintenance;
+pub mod notification;
 pub mod ports;
 pub mod protocol;
 pub mod proxy;
