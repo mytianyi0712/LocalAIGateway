@@ -721,8 +721,19 @@ fn sync_converter_usage(
     *stats.usage.lock() = usage_from_parts(stream_protocol, input, output, cache_read, cache_write);
 }
 
-/// observation (P1-1). Never buffers the body; mid-stream failures surface
-/// as `stream_interrupted` terminal events.
+/// Cumulative decode cap for the transparent streaming forward path. The
+/// stream is never buffered — this only keeps the decoder's arithmetic sane;
+/// per-feed output is bounded by `compression::FEED_LIMIT`, so memory stays
+/// bounded regardless of this value.
+const STREAM_FORWARD_DECODE_MAX_TOTAL: usize = 8 * 1024 * 1024 * 1024;
+
+/// Decodes the upstream stream and forwards the plaintext to the client
+/// (P1-9 revised): a compressed upstream response is decoded incrementally
+/// so a truncated upstream stream surfaces downstream as a cleanly
+/// interrupted plaintext stream — never as a corrupt compressed body that
+/// fails client-side inflate (e.g. omp's `ZlibError`). Never buffers the
+/// body; mid-stream failures surface as `stream_interrupted` terminal
+/// events.
 fn transparent_stream(
     env: AttemptEnv<'_>,
     response: crate::ports::UpstreamResponse,
@@ -745,9 +756,17 @@ fn transparent_stream(
     let upstream_stream = response.body.into_stream();
     let mut response_headers_for_client = response_headers.clone();
     response_headers_for_client.remove("content-length");
-    let decoder = compression::ObservableDecoder::new(compression::ContentDecoder::from_encoding(
-        response_headers.get("content-encoding"),
-    ));
+    // The relayed body is plaintext; the upstream transfer encoding must not
+    // leak through (the client would try to inflate it and fail on any
+    // truncation).
+    response_headers_for_client.remove("content-encoding");
+    // Lossless incremental decoder: the decoded plaintext is BOTH forwarded
+    // and scanned. The cumulative cap is effectively unbounded — the
+    // streaming path never buffers the body; only per-feed output is capped.
+    let decoder = compression::RequiredDecoder::new(
+        compression::ContentDecoder::from_encoding(response_headers.get("content-encoding")),
+        STREAM_FORWARD_DECODE_MAX_TOTAL,
+    );
     let telemetry = telemetry.clone();
     let request_id_stream = request_id.to_owned();
     let candidate_stream = candidate.clone();
@@ -846,8 +865,6 @@ fn transparent_stream(
             };
             match next {
                 Ok(Some(Ok(chunk))) => {
-                    response_bytes += chunk.len() as i64;
-                    stats.bytes.store(response_bytes, Ordering::SeqCst);
                     let now = clock.now_utc();
                     if first_byte_ms.is_none() {
                         first_byte_ms = Some(
@@ -855,66 +872,136 @@ fn transparent_stream(
                         );
                         *stats.first_byte_ms.lock() = first_byte_ms;
                     }
-                    // Observability runs on the decoded plaintext; the client
-                    // still receives the raw compressed bytes with the
-                    // original content-encoding.
-                    let decoded = decoder.feed_observable(&chunk);
-                    pending.extend_from_slice(&decoded);
-                    let terminal = scan_observable_lines(
-                        &mut pending,
-                        false,
-                        &stream_protocol,
-                        &mut usage,
-                        &mut first_token_ms,
-                        &mut first_token_seen,
-                        &stats,
-                        now,
-                        attempt_started,
-                    );
-                    if terminal {
-                        // The terminal marker (e.g. `data: [DONE]`) is in
-                        // this chunk: the response is complete. Record the
-                        // terminal telemetry BEFORE handing the final bytes
-                        // to the client — a client that hangs up right after
-                        // the last event must not turn a completed stream
-                        // into a spurious `cancelled` with zeroed data.
-                        cancel_completed_flag.store(true, Ordering::SeqCst);
-                        let finished = clock.now_utc();
-                        finalize_stream_attempt(
-                            &telemetry,
-                            &request_id_stream,
-                            started,
-                            failure_threshold,
-                            circuit_open_seconds,
-                            &candidate_stream,
-                            attempts,
-                            attempt_started,
-                            finished,
-                            AttemptOutcome::Success,
-                            status.as_u16() as i64,
-                            None,
-                            false,
-                            first_byte_ms,
-                            first_token_ms,
-                            usage,
-                            response_bytes,
-                            upstream_protocol_stream.clone(),
-                            upstream_model_stream.clone(),
-                        );
-                        yield Ok::<Bytes, Infallible>(chunk);
-                        return;
+                    // Lossless decode: the plaintext is BOTH forwarded and
+                    // scanned. A corrupt/truncated frame is terminal for the
+                    // relay — the client must never receive compressed bytes
+                    // it cannot finish inflating (a truncated body would
+                    // crash client-side decompression, e.g. omp's ZlibError).
+                    // Each feed is capped by compression::FEED_LIMIT, so the
+                    // drain below streams retained input out piece by piece
+                    // without ever buffering more than one piece.
+                    let mut piece = match decoder.feed_required(&chunk) {
+                        Ok(decoded) => decoded,
+                        Err(error) => {
+                            tracing::warn!(
+                                request_id = %request_id_stream,
+                                error = ?error,
+                                "transparent stream decode failed; interrupting downstream"
+                            );
+                            ok = false;
+                            break;
+                        }
+                    };
+                    loop {
+                        if !piece.is_empty() {
+                            response_bytes += piece.len() as i64;
+                            stats.bytes.store(response_bytes, Ordering::SeqCst);
+                            pending.extend_from_slice(&piece);
+                            let terminal = scan_observable_lines(
+                                &mut pending,
+                                false,
+                                &stream_protocol,
+                                &mut usage,
+                                &mut first_token_ms,
+                                &mut first_token_seen,
+                                &stats,
+                                now,
+                                attempt_started,
+                            );
+                            if terminal {
+                                // The terminal marker (e.g. `data: [DONE]`)
+                                // is in this piece: the response is complete.
+                                // Record the terminal telemetry BEFORE
+                                // handing the final bytes to the client — a
+                                // client that hangs up right after the last
+                                // event must not turn a completed stream
+                                // into a spurious `cancelled` with zeroed
+                                // data.
+                                cancel_completed_flag.store(true, Ordering::SeqCst);
+                                let finished = clock.now_utc();
+                                finalize_stream_attempt(
+                                    &telemetry,
+                                    &request_id_stream,
+                                    started,
+                                    failure_threshold,
+                                    circuit_open_seconds,
+                                    &candidate_stream,
+                                    attempts,
+                                    attempt_started,
+                                    finished,
+                                    AttemptOutcome::Success,
+                                    status.as_u16() as i64,
+                                    None,
+                                    false,
+                                    first_byte_ms,
+                                    first_token_ms,
+                                    usage,
+                                    response_bytes,
+                                    upstream_protocol_stream.clone(),
+                                    upstream_model_stream.clone(),
+                                );
+                                yield Ok::<Bytes, Infallible>(piece.into());
+                                return;
+                            }
+                            yield Ok::<Bytes, Infallible>(piece.into());
+                        }
+                        // The first feed may leave input retained (per-feed
+                        // output cap); drain it before the next upstream
+                        // chunk. `feed_required` re-processes retained input
+                        // even when given an empty slice.
+                        match decoder.feed_required(&[]) {
+                            Ok(more) => piece = more,
+                            Err(error) => {
+                                tracing::warn!(
+                                    request_id = %request_id_stream,
+                                    error = ?error,
+                                    "transparent stream decode failed while draining; interrupting downstream"
+                                );
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if piece.is_empty() {
+                            break;
+                        }
                     }
-                    yield Ok::<Bytes, Infallible>(chunk);
+                    if !ok {
+                        break;
+                    }
                 }
                 Ok(Some(Err(_))) => {
                     ok = false;
                     break;
                 }
                 Ok(None) => {
+                    // Drain any input retained by the decoder (per-feed
+                    // output caps) so the final scan sees the whole body.
+                    let now = clock.now_utc();
+                    loop {
+                        match decoder.feed_required(&[]) {
+                            Ok(more) if !more.is_empty() => {
+                                response_bytes += more.len() as i64;
+                                stats.bytes.store(response_bytes, Ordering::SeqCst);
+                                pending.extend_from_slice(&more);
+                            }
+                            Ok(_) => break,
+                            Err(error) => {
+                                tracing::warn!(
+                                    request_id = %request_id_stream,
+                                    error = ?error,
+                                    "transparent stream decode failed at EOF; interrupting downstream"
+                                );
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !ok {
+                        break;
+                    }
                     // Parse any final unterminated line: usage (and
                     // occasionally a terminal marker) may live in the last
                     // line when the upstream ends without a trailing newline.
-                    let now = clock.now_utc();
                     let terminal = scan_observable_lines(
                         &mut pending,
                         true,
@@ -951,6 +1038,18 @@ fn transparent_stream(
                             upstream_model_stream.clone(),
                         );
                         return;
+                    }
+                    if !decoder.finished() {
+                        // The compressed stream ended mid-frame: the
+                        // plaintext is incomplete (e.g. the gzip trailer is
+                        // missing). The plaintext prefix already forwarded is
+                        // clean; count the attempt as interrupted so the
+                        // channel verdict matches what the client observed.
+                        tracing::warn!(
+                            request_id = %request_id_stream,
+                            "transparent stream ended before the compressed stream finished"
+                        );
+                        ok = false;
                     }
                     break;
                 }
@@ -4327,11 +4426,14 @@ mod tests {
         gateway.shutdown().await;
     }
 
-    /// P1-9: a gzip-encoded SSE response is forwarded to the client byte-for-
-    /// byte (raw bytes + content-encoding header) while usage observability
-    /// runs on the decoded plaintext.
+    /// P1-9: a gzip-encoded SSE response is decoded before forwarding: the
+    /// client receives the plaintext with no `content-encoding` header while
+    /// usage observability runs on the same decoded stream. Raw compressed
+    /// forwarding was retired because a truncated upstream stream would
+    /// surface as a corrupt compressed body (client-side inflate failure,
+    /// e.g. omp's `ZlibError`).
     #[tokio::test]
-    async fn gzip_stream_is_forwarded_raw_and_usage_still_observed() {
+    async fn gzip_stream_is_decoded_and_forwarded_with_usage_observed() {
         use std::io::Write;
         let plain = format!(
             "{}{}",
@@ -4362,14 +4464,14 @@ mod tests {
                 .headers()
                 .get("content-encoding")
                 .and_then(|v| v.to_str().ok()),
-            Some("gzip"),
-            "the encoding header must be forwarded untouched"
+            None,
+            "the encoding header must not leak into the decoded stream"
         );
         let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         assert_eq!(
             bytes.as_ref(),
-            compressed.as_slice(),
-            "the client must receive the raw compressed bytes"
+            plain.as_bytes(),
+            "the client must receive the decoded plaintext"
         );
         wait_for_outcome(&gateway.db, "success", Duration::from_secs(5)).await;
         let raw_usage: Option<String> = sqlx::query_scalar(
@@ -4382,6 +4484,67 @@ mod tests {
             raw_usage.is_some(),
             "usage must be extracted from the decoded stream"
         );
+        gateway.shutdown().await;
+    }
+
+    /// A truncated gzip stream is decoded up to the truncation point and
+    /// forwarded as clean plaintext with no `content-encoding` header; the
+    /// attempt is recorded as `stream_interrupted` so the channel verdict
+    /// matches what the client observed (a body that ends without its
+    /// terminal marker). Before the fix the truncated compressed bytes were
+    /// forwarded verbatim and crashed client-side inflate (ZlibError) while
+    /// the attempt was logged as success.
+    #[tokio::test]
+    async fn truncated_gzip_stream_ends_cleanly_downstream_and_counts_as_interrupted() {
+        use std::io::Write;
+        let plain = format!(
+            "{}{}",
+            sse_event(r#"{"id":"1","choices":[{"delta":{"content":"Hel"},"finish_reason":null}]}"#),
+            sse_event(r#"{"id":"2","choices":[{"delta":{"content":"lo"},"finish_reason":null}]}"#)
+        );
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(plain.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+        // Cut the trailer (and part of the final block) so the compressed
+        // stream cannot reach its end marker.
+        let truncated = &compressed[..compressed.len() - 12];
+        let mut response_bytes =
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-encoding: gzip\r\n"
+                .as_bytes()
+                .to_vec();
+        response_bytes
+            .extend_from_slice(format!("content-length: {}\r\n\r\n", truncated.len()).as_bytes());
+        response_bytes.extend_from_slice(truncated);
+        let port = spawn_upstream(response_bytes, false).await;
+        let gateway = test_gateway(port, &[]).await;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request(true), "openai_compatible", None)
+            .await;
+        assert_eq!(
+            response
+                .headers()
+                .get("content-encoding")
+                .and_then(|v| v.to_str().ok()),
+            None,
+            "no content-encoding header on a decoded relay"
+        );
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(
+            plain.as_bytes().starts_with(&bytes),
+            "the client receives a clean prefix of the plaintext, never compressed bytes"
+        );
+        let (_, outcome, _, _) =
+            wait_for_outcome(&gateway.db, "stream_interrupted", Duration::from_secs(10)).await;
+        assert_eq!(outcome, "stream_interrupted");
+        let error_kind: Option<String> = sqlx::query_scalar(
+            "SELECT error_kind FROM request_attempts ORDER BY attempt_no DESC LIMIT 1",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(error_kind.as_deref(), Some("stream_interrupted"));
         gateway.shutdown().await;
     }
 

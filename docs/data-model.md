@@ -275,7 +275,7 @@ erDiagram
 | `output_tokens` | INTEGER NULL | 输出 Token |
 | `tps` | REAL NULL | 输出 TPS |
 | `raw_usage_json` | JSON/TEXT NULL | 脱敏后的上游原始 usage |
-| `response_bytes` | INTEGER NULL | 上游响应字节数 |
+| `response_bytes` | INTEGER NULL | 转发给客户端的响应字节数（流式透传为解码后明文，其余为上游原始字节数） |
 | `created_at` | DATETIME | 记录时间 |
 
 唯一约束：`UNIQUE(request_id, attempt_no)`。

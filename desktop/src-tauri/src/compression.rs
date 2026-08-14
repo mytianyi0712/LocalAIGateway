@@ -1,14 +1,19 @@
-//! Bypass decoding of upstream `Content-Encoding` for observability.
+//! Incremental decoding of upstream `Content-Encoding` (gzip / deflate /
+//! brotli / zstd).
 //!
-//! The proxy forwards upstream bytes to the client verbatim (keeping the
-//! `Content-Encoding` header), but usage/scanning needs the plaintext. This
-//! module decodes gzip / deflate / brotli / zstd incrementally so a streamed
-//! response can be observed chunk by chunk without buffering the whole body.
-//!
-//! Decoding is best-effort: when a body is not decodable (truncated,
-//! multi-member gzip, unknown framing), [`ObservableDecoder`] stops feeding
-//! the observer and the raw bytes are forwarded unchanged — parsing failure
-//! never affects forwarding (requirements.md:153).
+//! Two consumers:
+//! - [`RequiredDecoder`]: lossless decode whose output is BOTH forwarded to
+//!   the client and scanned. Transparent streaming relays decode the
+//!   upstream stream and send plaintext downstream (the `Content-Encoding`
+//!   header is stripped), so a truncated upstream stream surfaces as a
+//!   cleanly interrupted plaintext stream — never as a corrupt compressed
+//!   body that fails client-side inflate (omp's `ZlibError`).
+//! - [`ObservableDecoder`]: best-effort decode of a body that is forwarded
+//!   verbatim (bounded non-stream responses are complete before forwarding,
+//!   so the compressed bytes are safe to relay). When a body is not
+//!   decodable (truncated, multi-member gzip, unknown framing) it stops
+//!   feeding the observer and forwarding is unaffected — parsing failure
+//!   never affects the relay (requirements.md:155).
 
 use std::io;
 
