@@ -23,7 +23,7 @@ define wsl_build
 endef
 
 desktop-icons:
-	cd desktop/src-tauri && cargo tauri icon icons/icon.png
+	cd desktop/src-tauri && cargo tauri icon icons/icon.svg
 
 ## Linux 产物（AppImage + deb）在 Arch WSL 内构建。
 desktop-build-linux:

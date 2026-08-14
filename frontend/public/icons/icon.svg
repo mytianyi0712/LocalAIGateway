@@ -15,20 +15,14 @@
       <stop offset="1" stop-color="#76bd91" stop-opacity="0"/>
     </radialGradient>
   </defs>
-
-  <!-- Deep green tile shared with the launcher UI, inset for OS icon masks. -->
   <rect x="32" y="32" width="960" height="960" rx="232" fill="url(#tile)"/>
   <rect x="32" y="32" width="960" height="960" rx="232" fill="url(#glow)"/>
-
-  <!-- A single route splits cleanly into three providers: local AI gateway. -->
   <g fill="none" stroke="url(#route)" stroke-width="76" stroke-linecap="round" stroke-linejoin="round">
     <path d="M276 512H456"/>
     <path d="M456 512C548 512 550 312 664 312H748"/>
     <path d="M456 512H748"/>
     <path d="M456 512C548 512 550 712 664 712H748"/>
   </g>
-
-  <!-- Endpoint cuts keep the mark readable at tray-icon sizes. -->
   <g fill="#bce8ca">
     <circle cx="276" cy="512" r="54"/>
     <circle cx="748" cy="312" r="54"/>

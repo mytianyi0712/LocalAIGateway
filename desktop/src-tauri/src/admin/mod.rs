@@ -328,7 +328,7 @@ impl AdminService {
 mod tests {
     use super::*;
     use super::{
-        channels::{ChannelInput, ChannelPatch},
+        channels::{ChannelFilter, ChannelInput, ChannelPatch},
         profiles::ProfileInput,
         routes::{CandidateInput, CandidateList},
         stats::{SummaryQuery, format_utc_millis, parse_utc_rfc3339, resolve_token_window},
@@ -340,7 +340,7 @@ mod tests {
         db::Database,
         settings as core_settings,
     };
-    use axum::extract::{FromRequestParts, Path, State};
+    use axum::extract::{FromRequestParts, Path, Query, State};
 
     use std::sync::Arc;
 
@@ -1478,6 +1478,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stored.as_deref(), Some("A"));
+    }
+
+    /// The providers page renders accounts grouped by provider; the channel
+    /// list must therefore be ordered by provider name (then channel name),
+    /// never by channel name alone. The channel names here order one way
+    /// while their providers order the other, so the assertion fails on a
+    /// name-based sort.
+    #[tokio::test]
+    async fn channels_list_is_ordered_by_provider_name() {
+        let (state, _dir) = test_state().await;
+        let time = "2026-08-04T01:00:00+00:00";
+        sqlx::query("INSERT INTO providers(id,name,base_url,created_at,updated_at) VALUES('prov-z','zebra-provider','http://127.0.0.1:1',?,?),('prov-a','alpha-provider','http://127.0.0.1:2',?,?)")
+            .bind(time)
+            .bind(time)
+            .bind(time)
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channels(id,provider_id,name,protocol,api_key_encrypted,api_key_hint,manual_enabled,health_check_model_id,created_at,updated_at) VALUES('ch-1','prov-z','aaa-channel','openai_compatible',X'00','',1,NULL,?,?),('ch-2','prov-a','zzz-channel','openai_compatible',X'00','',1,NULL,?,?)")
+            .bind(time)
+            .bind(time)
+            .bind(time)
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        let response = list_channels(
+            AdminAuth,
+            State(state.clone()),
+            Query(ChannelFilter::default()),
+        )
+        .await
+        .expect("channel list must load");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        let providers: Vec<&str> = value["items"]
+            .as_array()
+            .expect("items must be an array")
+            .iter()
+            .map(|item| item["provider_name"].as_str().expect("provider_name missing"))
+            .collect();
+        assert_eq!(
+            providers,
+            vec!["alpha-provider", "zebra-provider"],
+            "channels must be ordered by provider name, not channel name"
+        );
     }
 
     /// P1-6: `health_check_model_id: null` clears the stored model back to

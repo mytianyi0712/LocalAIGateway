@@ -3,7 +3,7 @@ pkgname=local-ai-gateway
 # 项目版本唯一来源是仓库根目录 VERSION；本行由 scripts/version.sh set 自动同步。
 # Arch pkgver 不允许连字符，预发布段映射为下划线（如 0.3.0-rc.1 -> 0.3.0_rc.1）；
 # packaging/build-arch.sh 构建时还会从 Cargo.toml 覆盖此值，两者由 version.sh check 保证一致。
-pkgver=0.2.1_fix3
+pkgver=0.2.2
 pkgrel=1
 pkgdesc='Cross-platform local AI gateway and routing manager'
 arch=('x86_64')

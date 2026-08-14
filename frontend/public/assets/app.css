@@ -209,25 +209,27 @@ button:disabled { cursor: not-allowed; }
 .data-table tbody tr:last-child td { border-bottom: 0; }
 .data-table .align-right { text-align: right; }
 .data-table .action-cell { width: 1%; white-space: nowrap; }
-.logs-table { min-width: 900px; table-layout: fixed; }
+.logs-table { min-width: 1012px; table-layout: fixed; }
 .logs-table th { height: 38px; padding: 0 10px; font-size: 10.5px; }
 .logs-table td { height: 42px; padding: 6px 10px; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.logs-table th:nth-child(1) { width: 128px; }
-.logs-table th:nth-child(2) { width: 166px; }
-.logs-table th:nth-child(3) { width: 176px; }
-.logs-table th:nth-child(4) { width: 132px; }
-.logs-table th:nth-child(5) { width: 76px; }
-.logs-table th:nth-child(6) { width: 56px; }
-.logs-table th:nth-child(7) { width: 58px; }
-.logs-table th:nth-child(8) { width: 90px; }
+.logs-table th:nth-child(1) { width: 116px; }
+.logs-table th:nth-child(2) { width: 150px; }
+.logs-table th:nth-child(3) { width: 150px; }
+.logs-table th:nth-child(4) { width: 180px; }
+.logs-table th:nth-child(5) { width: 132px; }
+.logs-table th:nth-child(6) { width: 80px; }
+.logs-table th:nth-child(7) { width: 56px; }
+.logs-table th:nth-child(8) { width: 56px; }
+.logs-table th:nth-child(9) { width: 92px; }
 .logs-table .mono { font-size: 11.5px; }
 .logs-table .logs-cell-time { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
-.logs-table .logs-model { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.logs-table .logs-model { display: block; white-space: normal; overflow-wrap: anywhere; }
+.logs-table .logs-cell-upstream { white-space: normal; overflow-wrap: anywhere; }
 .logs-table .logs-cell-route { overflow: visible; text-overflow: clip; white-space: normal; }
-.logs-table .log-route-list { gap: 3px; max-height: 38px; overflow: hidden; }
+.logs-table .log-route-list { gap: 3px; }
 .logs-table .log-route-tag { color: #51675d; font-weight: 650; }
 .logs-table .log-route-empty { color: var(--muted); }
-.logs-table .protocol-list { flex-wrap: nowrap; overflow: hidden; }
+.logs-table .protocol-list { flex-wrap: wrap; }
 .logs-table .protocol { min-height: 21px; padding: 0 6px; font-size: 9.5px; }
 .logs-table .status-dot { gap: 5px; font-size: 11px; }
 .logs-table .status-dot i { width: 6px; height: 6px; }

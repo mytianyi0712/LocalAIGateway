@@ -185,7 +185,7 @@ pub(super) async fn delete_channel(
 
 impl AdminService {
     pub async fn list_channels(&self, filter: ChannelFilter) -> ApiResult {
-        let ids: Vec<String> = sqlx::query_scalar("SELECT DISTINCT c.id FROM channels c LEFT JOIN channel_protocols cp ON cp.channel_id=c.id LEFT JOIN channel_health h ON h.channel_id=c.id WHERE (? IS NULL OR c.provider_id=?) AND (? IS NULL OR cp.protocol=?) AND (? IS NULL OR h.state=?) ORDER BY c.name")
+        let ids: Vec<String> = sqlx::query_scalar("SELECT DISTINCT c.id FROM channels c LEFT JOIN channel_protocols cp ON cp.channel_id=c.id LEFT JOIN channel_health h ON h.channel_id=c.id LEFT JOIN providers p ON p.id=c.provider_id WHERE (? IS NULL OR c.provider_id=?) AND (? IS NULL OR cp.protocol=?) AND (? IS NULL OR h.state=?) ORDER BY p.name,c.name")
             .bind(&filter.provider_id).bind(&filter.provider_id).bind(&filter.protocol).bind(&filter.protocol).bind(&filter.state).bind(&filter.state).fetch_all(self.db.pool()).await?;
         let mut items = Vec::new();
         for row_id in ids {

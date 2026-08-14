@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Local AI Gateway",
-  "version": "0.2.1-fix3",
+  "version": "0.2.2",
   "identifier": "io.github.mytianyi.local-ai-gateway",
   "build": {
     "frontendDist": "../ui",
@@ -39,6 +39,12 @@
       "icons/128x128@2x.png",
       "icons/icon.ico"
     ],
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico"
+      }
+    },
     "shortDescription": "多供应商本地 AI 网关",
     "longDescription": "跨平台的本地 AI 协议网关与路由管理工具。",
     "resources": []
