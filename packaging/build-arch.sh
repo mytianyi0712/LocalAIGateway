@@ -34,7 +34,7 @@ chmod -R u+rwX "${BUILD_DIR}" 2>/dev/null || true
 rm -rf "${BUILD_DIR}"
 mkdir -p "${BUILD_DIR}"
 sed "s/^pkgver=.*/pkgver=${VERSION}/" \
-  "${ROOT_DIR}/packaging/arch/PKGBUILD" > "${BUILD_DIR}/PKGBUILD"
+  "${ROOT_DIR}/packaging/arch/PKGBUILD" | tr -d '\r' > "${BUILD_DIR}/PKGBUILD"
 ln -s "${ROOT_DIR}" "${BUILD_DIR}/repo"
 
 read -r -a MAKEPKG_FLAGS <<< "${MAKEPKG_FLAGS:---clean --force --syncdeps}"

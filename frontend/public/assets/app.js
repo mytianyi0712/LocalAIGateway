@@ -5,7 +5,7 @@ import {
   responseChannelTags, healthInfo, outcomeInfo, statusDot, button, iconButton,
   toolbar, panel, emptyState, skeleton, toast, openModal, closeModal,
   openDrawer, closeDrawer, confirmAction, resolveConfirmation, metric,
-  tokenMetric, settingNumberField, pageError,
+  tokenMetric, settingNumberField, pageError, getModalMode,
 } from './ui.js';
 import { getToken, setToken, api, get, post, put, patch, remove, setUnauthorizedHandler } from './api.js';
 
@@ -103,8 +103,6 @@ const state = {
   generatedKeys: null,
   recovery: null,
   drawerRoute: null,
-  confirmResolve: null,
-  modalMode: '',
 };
 
 

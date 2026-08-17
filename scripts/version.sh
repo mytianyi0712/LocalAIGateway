@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
 # Local AI Gateway 版本管理（单一权威源：仓库根目录 VERSION）
 #
+# 日常：编辑 VERSION，然后 `make version-sync` 或直接 `make package-all`。
+#
 # 用法：
 #   ./scripts/version.sh show              # 显示当前版本
-#   ./scripts/version.sh set 0.3.0-rc.1    # 设置新版本并同步所有第一方版本声明
+#   ./scripts/version.sh sync              # 以 VERSION 为准同步所有第一方声明
+#   ./scripts/version.sh set 0.3.0-rc.1    # 写入 VERSION 并同步
 #   ./scripts/version.sh check             # 校验全部声明一致（供 CI/本地检查，退出码 0/1）
 #
 # 同步范围（只更新第一方项目版本；依赖版本与 releases/ 历史产物绝不被改动）：
-#   VERSION                         权威源
+#   VERSION                         权威源（只改这一个文件）
 #   desktop/src-tauri/Cargo.toml    [package] version
 #   desktop/src-tauri/tauri.conf.json 顶层 version（见下方取舍说明）
 #   desktop/src-tauri/Cargo.lock    由 cargo metadata 重新解析，不手工替换
 #   packaging/arch/PKGBUILD         pkgver 字面量（Arch 映射：连字符转下划线）；构建时
 #                                   packaging/build-arch.sh 还会从 Cargo.toml 覆盖该值，
-#                                   模板本身也由 set/check 保持与 VERSION 一致
+#                                   模板本身也由 sync/check 保持与 VERSION 一致
 #
 # 取舍说明：Tauri CLI 在 tauri.conf.json 缺省 version 时会回退到 Cargo.toml，
 # 但 tauri-build 的 Windows 可执行文件版本资源（FileVersion/ProductVersion）
@@ -44,7 +47,8 @@ usage() {
   cat >&2 <<'EOF'
 用法：
   ./scripts/version.sh show              # 显示当前版本
-  ./scripts/version.sh set 0.3.0-rc.1    # 设置新版本并同步所有第一方版本声明
+  ./scripts/version.sh sync              # 以 VERSION 为准同步所有第一方声明
+  ./scripts/version.sh set 0.3.0-rc.1    # 写入 VERSION 并同步
   ./scripts/version.sh check             # 校验全部声明一致（供 CI/本地检查，退出码 0/1）
 EOF
   exit "$code"
@@ -52,7 +56,34 @@ EOF
 
 is_semver() { [[ "$1" =~ $SEMVER_RE ]]; }
 
-read_version() { cat "${VERSION_FILE}"; }
+# 接受 Windows 编辑器的 CRLF / UTF-8 BOM；只取第一行。
+read_version() {
+  "$PYTHON_BIN" - "$VERSION_FILE" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8-sig")
+line = text.splitlines()[0].strip() if text.strip() else ""
+print(line)
+PY
+}
+# 把 VERSION 写成单一 LF 行。内容未变则不写，返回 1。
+write_version_file() {
+  local new="$1"
+  "$PYTHON_BIN" - "$VERSION_FILE" "$new" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+desired = (sys.argv[2] + "\n").encode("utf-8")
+current = path.read_bytes() if path.exists() else None
+if current == desired:
+    raise SystemExit(1)
+path.write_bytes(desired)
+raise SystemExit(0)
+PY
+}
 
 # 逐个文件把各自当前版本替换为 new。任一文件缺失、版本非法或字面量出现多次时，
 # 在写入任何文件之前整体失败（保证"无效输入在任何写入前失败"且不留半成品）；
@@ -201,11 +232,31 @@ print(f"check 通过：全部第一方版本声明与 VERSION ({expected}) 一�
 PY
 }
 
+sync_from_version() {
+  local version
+  version="$(read_version)"
+  is_semver "${version}" || die "VERSION 内容不是合法 SemVer: ${version}"
+  command -v cargo >/dev/null || die "需要 cargo（用于重新解析 Cargo.lock）"
+  if write_version_file "$version"; then
+    echo "  ${VERSION_FILE}: 已规范化为 ${version}"
+  fi
+  update_manifests "$version"
+  update_lockfiles
+  cmd_check
+}
+
+cmd_sync() {
+  [[ -f "${VERSION_FILE}" ]] || die "缺少 ${VERSION_FILE}，请先编辑该文件或执行 set"
+  local version
+  version="$(read_version)"
+  echo "version.sh: 以 VERSION (${version}) 为权威源同步第一方声明"
+  sync_from_version
+}
+
 cmd_set() {
   local new="${1:-}"
   [[ -n "$new" ]] || die "set 需要一个版本参数，如 ./scripts/version.sh set 0.3.0-rc.1"
   is_semver "$new" || die "非法 SemVer（示例：0.2.1、0.3.0-rc.1）: ${new}"
-  command -v cargo >/dev/null || die "需要 cargo（用于重新解析 Cargo.lock）"
 
   local old=""
   if [[ -f "${VERSION_FILE}" ]]; then
@@ -216,26 +267,16 @@ cmd_set() {
   if [[ "$old" == "$new" ]]; then
     echo "version.sh: 已处于 ${new}，同步并校验一致性"
   else
-    echo "version.sh: 更新第一方版本声明至 ${new}"
-  fi
-  # 始终收敛各声明（内容未变的文件不会写入），幂等且能修复手工漂移
-  update_manifests "$new"
-  if [[ "$old" != "$new" ]]; then
-    if [[ -n "$old" ]]; then
-      local tmp="${VERSION_FILE}.tmp"
-      printf '%s\n' "$new" > "$tmp"
-      mv -- "$tmp" "${VERSION_FILE}"
-    else
-      printf '%s\n' "$new" > "${VERSION_FILE}"
-    fi
+    echo "version.sh: 更新 VERSION 至 ${new}"
+    write_version_file "$new" || true
     echo "  ${VERSION_FILE}: ${old:-（无）} -> ${new}"
   fi
-  update_lockfiles
-  cmd_check
+  sync_from_version
 }
 
 case "${1:-}" in
   show) cmd_show ;;
+  sync) cmd_sync ;;
   set) cmd_set "${2:-}" ;;
   check) cmd_check ;;
   -h|--help|help) usage 0 ;;

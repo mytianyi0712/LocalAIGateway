@@ -123,40 +123,46 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 
 ## 桌面打包
 
-桌面端基于 Tauri 2。先安装 Rust 与 Tauri CLI：
+桌面端基于 Tauri 2。Windows 本机需要 Rust（`x86_64-pc-windows-gnu`）与 Tauri CLI；Linux 包通过 Arch WSL 构建。
 
 ```bash
 cargo install --locked tauri-cli --version '^2'
+make wsl-setup              # 首次：配置 Arch WSL 工具链与 builder 用户
 ```
 
-在 Arch Linux 上可按目标单独打包，也可一次完成全部目标：
+发布流程：只改仓库根目录 `VERSION`，再一条命令出齐当前宿主能产出的全部安装包。
 
 ```bash
-make package-appimage       # 本机 .deb + AppImage
-make package-arch           # Arch .pkg.tar.zst
-make package-windows-wine   # MinGW 交叉编译 + Wine 生成 NSIS 安装包
-make package-all            # 依次执行以上全部流程
+make package-all            # 先同步版本，再构建全部 release 到 releases/
+make package-windows        # 本机 NSIS exe
+make package-appimage       # Arch WSL：.deb + AppImage
+make package-arch           # Arch WSL：.pkg.tar.zst
+make package-windows-wine   # 可选：WSL/Linux 上 Wine 交叉编译 NSIS
+make doctor                 # 打印宿主 / WSL 路径与工具，不编译
 ```
 
-Arch 包需要 `makepkg`、GTK/WebKitGTK 与 Ayatana AppIndicator 开发环境；Windows 交叉构建需要 Wine、MinGW-w64、Rustup 和 `unzip`，脚本会自动安装 Rust Windows GNU target 并缓存便携版 NSIS。所有目标的产物会自动复制到仓库根目录的 `releases/` 文件夹（原始构建输出仍在各自的 target 目录）。发布标签也会通过 `.github/workflows/desktop.yml` 构建相同平台矩阵。
+Windows 上 `package-all` 产出 NSIS exe + AppImage + deb + Arch pkg。Linux 宿主则本机构建 Linux 三件套，Windows 安装包改走 Wine。产物收集到仓库根目录 `releases/`（按当前 `VERSION` 过滤，并清掉旧版本残留）。发布标签也会通过 `.github/workflows/desktop.yml` 构建相同平台矩阵。
 
 桌面启动器常驻系统托盘：关闭主窗口仅隐藏到托盘，托盘菜单可重新显示或彻底退出（同时停止网关）。启动器使用内建标题栏（无系统装饰，标题栏可拖动，自带最小化与关闭按钮——Linux Wayland 下系统标题栏按钮在隐藏/恢复后会失效，故弃用），窗口内可切换**开机自启动**（Windows 注册表 Run 键 / Linux autostart desktop 项 / macOS LaunchAgent）与**启动时最小化到托盘**（下次启动不显示主窗口，仅保留托盘图标）；自启动偏好保存在数据目录的 `launcher.json`，自启动状态以操作系统实际注册为准。
 
 ## 版本管理
 
-项目版本遵循 SemVer，唯一权威源是仓库根目录的 `VERSION` 文件。所有第一方版本声明都从它同步或派生：`desktop/src-tauri/Cargo.toml`、`tauri.conf.json`、`Cargo.lock`，以及 `packaging/arch/PKGBUILD` 的 `pkgver`（Arch 规则不允许连字符，预发布段映射为下划线，如 `0.3.0-rc.1 -> 0.3.0_rc.1`）。依赖版本、第三方锁文件条目与 `releases/` 历史产物绝不被改动。
-
-发布新版本只需一个命令：
+项目版本遵循 SemVer，**只改仓库根目录的 `VERSION` 文件**。Cargo.toml、`tauri.conf.json`、`Cargo.lock`、`packaging/arch/PKGBUILD` 都从它同步（Arch `pkgver` 会把连字符映射成下划线，如 `0.3.0-rc.1 -> 0.3.0_rc.1`）。依赖版本、第三方锁文件条目与 `releases/` 历史产物绝不被改动。
 
 ```bash
-make version-set VERSION=0.3.0-rc.1   # 或 ./scripts/version.sh set 0.3.0-rc.1
-make version-check                     # 本地或 CI 校验各声明一致（退出码 0/1）
-make version                           # 查看当前版本
+# 1. 编辑 VERSION（一行 SemVer，例如 0.3.0 或 0.3.0-rc.1）
+# 2. 同步到全部第一方声明（package-all 会自动做这一步）
+make version-sync
+make version-check          # 本地或 CI 校验各声明一致（退出码 0/1）
+make version                # 查看当前版本
+
+# 可选：一条命令同时写入 VERSION 并同步
+make version-set VERSION=0.3.0-rc.1
 ```
 
-- `set` 只接受严格 SemVer（如 `0.2.1`、`0.3.0-rc.1`），非法输入在任何写入前即失败；重复设置同一版本是幂等空操作。锁文件由 `cargo metadata` 重新解析更新，不做手工全文替换。
-- 取舍说明：Tauri CLI 在 `tauri.conf.json` 缺省 `version` 时会回退到 Cargo.toml，但 `tauri-build` 的 Windows 可执行文件版本资源（FileVersion/ProductVersion）只读取 `tauri.conf.json`，因此保留并同步该字段，避免 Windows 构建丢失版本元数据。`PKGBUILD` 模板中的 `pkgver` 由本工具保持可读一致，构建时 `packaging/build-arch.sh` 还会从 Cargo.toml 覆盖，两条路径由 `check` 保证结果相同。
-- 自校验：`./scripts/test-version.sh`（沙箱内验证 set/check、非法输入零写入、幂等、预发布支持、锁文件解析与打包文件名版本解析，无需构建安装包）。CI 的 `desktop.yml` 在打包前也会执行 `version.sh check`，并在 tag 推送时对账 `v$(cat VERSION)`。
+- `sync` / `set` 只接受严格 SemVer；非法输入在任何写入前即失败。重复同步同一版本是幂等空操作。`VERSION` 允许 Windows 编辑器的 CRLF / UTF-8 BOM，同步时会规范成单一 LF 行。锁文件由 `cargo metadata` 重新解析更新，不做手工全文替换。
+- 取舍说明：Tauri CLI 在 `tauri.conf.json` 缺省 `version` 时会回退到 Cargo.toml，但 `tauri-build` 的 Windows 可执行文件版本资源（FileVersion/ProductVersion）只读取 `tauri.conf.json`，因此保留并同步该字段，避免 Windows 构建产物丢失版本元数据。`PKGBUILD` 模板中的 `pkgver` 由本工具保持可读一致，构建时 `packaging/build-arch.sh` 还会从 Cargo.toml 覆盖，两条路径由 `check` 保证结果相同。
+- 自校验：`./scripts/test-version.sh`（沙箱内验证 set/sync/check、非法输入零写入、幂等、预发布、CRLF、锁文件解析与打包文件名版本解析，无需构建安装包）。CI 的 `desktop.yml` 在打包前也会执行 `version.sh check`，并在 tag 推送时对账 `v$(cat VERSION)`。
 
 ## 开发与验证
 

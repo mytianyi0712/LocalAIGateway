@@ -120,7 +120,7 @@ fn content_text(value: &Value) -> String {
 
 /// Plain text from chat-completions `message.content` / stream `delta.content`
 /// (string or a list of content parts, e.g. GPT-5.x style).
-fn chat_message_text(value: &Value) -> String {
+pub(super) fn chat_message_text(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
         Value::String(value) => value.clone(),
@@ -130,6 +130,7 @@ fn chat_message_text(value: &Value) -> String {
                 Value::String(part) => Some(part.clone()),
                 Value::Object(part) => part
                     .get("text")
+                    .or_else(|| part.get("output_text"))
                     .and_then(Value::as_str)
                     .filter(|text| !text.is_empty())
                     .map(str::to_owned),

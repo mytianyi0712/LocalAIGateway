@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # 版本管理自校验（只保护可观察合同，不修改真实仓库）：
-#   - set/check 全流程与幂等性
+#   - set/check/sync 全流程与幂等性
 #   - 非法 SemVer 在任何写入前被拒绝（文件内容不变）
 #   - 预发布版本（0.3.0-rc.1）支持
+#   - 只改 VERSION 再 sync 能灌进全部第一方声明
+#   - Windows CRLF / BOM 的 VERSION 仍可解析
 #   - Cargo.lock 由 cargo 重新解析后与清单一致
 #   - 打包产物文件名中的版本可解析（Arch / NSIS / deb / AppImage 命名约定）
 #   - 历史 releases/ 产物列表在测试前后不变（未被改动）
 # 用法：./scripts/test-version.sh
-set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 SANDBOX="$(mktemp -d)"
@@ -15,7 +16,7 @@ trap 'rm -rf "${SANDBOX}"' EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok() { echo "ok: $*"; }
-
+PYTHON_BIN="$(command -v python3 || command -v python || fail '需要 python3 或 python')"
 # ---- 沙箱：复制受管文件，构造最小仓库 ----
 mkdir -p "${SANDBOX}/scripts" \
   "${SANDBOX}/desktop/src-tauri" \
@@ -61,7 +62,7 @@ expect_reject ""
 ./scripts/version.sh check >/dev/null || fail "0.3.0-rc.1 set 后 check 失败"
 ok "set 0.3.0-rc.1 并 check 通过"
 
-python3 - <<'PY'
+"$PYTHON_BIN" - <<'PY'
 import json
 import pathlib
 import re
@@ -123,9 +124,17 @@ ok "NSIS / deb / AppImage 文件名包含 0.2.1"
 
 # ---- 6. 真实仓库：历史 releases/ 列表在测试前后不变（工具绝不改写历史产物）----
 # releases/ 是 gitignore 的历史产物目录，全新检出可能不存在，允许为空/缺失；
-# 只精确比较执行前后的文件清单（按行比较，不做空白拆分，避免含空格文件名被破坏）。
 releases_snapshot() {
-  (cd "${ROOT_DIR}" && find releases -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort)
+  "$PYTHON_BIN" - "${ROOT_DIR}/releases" <<'PY'
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+if not root.is_dir():
+    raise SystemExit(0)
+for path in sorted(root.iterdir()):
+    if path.is_file():
+        print(path.name)
+PY
 }
 before_releases="$(releases_snapshot)"
 # 沙箱测试本身不触碰 releases/；此处验证确实如此
@@ -134,12 +143,40 @@ releases_count="$(printf '%s' "$before_releases" | grep -c . || true)"
 ok "releases/ 历史产物列表未变（共 ${releases_count} 个文件）"
 
 # ---- 7. 真实仓库：cargo metadata 解析版本与 VERSION 一致 ----
-real_version="$(cat "${ROOT_DIR}/VERSION")"
+real_version="$(tr -d '\r' < "${ROOT_DIR}/VERSION" | sed -n '1s/^[[:space:]]*//;s/[[:space:]]*$//;p;q')"
 cargo_version="$(
   cargo metadata --manifest-path "${ROOT_DIR}/desktop/src-tauri/Cargo.toml" --format-version 1 \
-  | python3 -c 'import json, sys; pkgs = json.load(sys.stdin)["packages"]; print(next(p["version"] for p in pkgs if p["name"] == "local-ai-gateway"))'
+  | "$PYTHON_BIN" -c 'import json, sys; pkgs = json.load(sys.stdin)["packages"]; print(next(p["version"] for p in pkgs if p["name"] == "local-ai-gateway"))'
 )"
 [[ "$cargo_version" == "$real_version" ]] || fail "cargo metadata 解析版本为 $cargo_version，VERSION 为 $real_version"
 ok "cargo metadata 解析版本 $cargo_version == VERSION"
+
+# ---- 8. 只改 VERSION，再 sync 灌进全部声明 ----
+printf '%s\n' "0.4.0-rc.2" > VERSION
+./scripts/version.sh sync >/dev/null
+./scripts/version.sh check >/dev/null || fail "只改 VERSION 后 sync/check 失败"
+shown="$(./scripts/version.sh show)"
+[[ "$shown" == "0.4.0-rc.2" ]] || fail "show 应为 0.4.0-rc.2，实际 $shown"
+"$PYTHON_BIN" - <<'PY'
+import json, pathlib, re
+v = "0.4.0-rc.2"
+assert pathlib.Path("VERSION").read_bytes() == (v + "\n").encode(), "VERSION 应规范化为 LF"
+assert re.search(r'^version\s*=\s*"' + re.escape(v) + r'"', pathlib.Path("desktop/src-tauri/Cargo.toml").read_text(), re.M)
+assert json.loads(pathlib.Path("desktop/src-tauri/tauri.conf.json").read_text())["version"] == v
+assert re.search(r'^pkgver=0\.4\.0_rc\.2$', pathlib.Path("packaging/arch/PKGBUILD").read_text(), re.M)
+PY
+ok "只改 VERSION 再 sync 灌进全部第一方声明"
+
+# ---- 9. Windows CRLF VERSION 仍可 sync ----
+printf '%s\r\n' "0.4.1" > VERSION
+./scripts/version.sh sync >/dev/null
+[[ "$(./scripts/version.sh show)" == "0.4.1" ]] || fail "CRLF VERSION 未能解析为 0.4.1"
+./scripts/version.sh check >/dev/null || fail "CRLF VERSION sync 后 check 失败"
+[[ "$(./scripts/version.sh show)" == "0.4.1" ]] || fail "规范化后 show 应为 0.4.1"
+"$PYTHON_BIN" - <<'PY'
+import pathlib
+assert pathlib.Path("VERSION").read_bytes() == b"0.4.1\n", "CRLF VERSION 应规范化为 LF"
+PY
+ok "CRLF VERSION 可解析并规范化为 LF"
 
 echo "全部自校验通过"

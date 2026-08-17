@@ -4,11 +4,21 @@ set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 RELEASES_DIR="${ROOT_DIR}/releases"
 
+read_project_version() {
+  tr -d '\r' < "${ROOT_DIR}/VERSION" | sed -n '1s/^[[:space:]]*//;s/[[:space:]]*$//;p;q'
+}
+
+cargo_target_dir() {
+  cargo metadata --manifest-path "${ROOT_DIR}/desktop/src-tauri/Cargo.toml" \
+    --no-deps --format-version 1 \
+    | python -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
+}
 usage() {
   cat <<'USAGE'
 Usage: packaging/build.sh <target>
 
 Targets:
+  windows        Build a native Windows NSIS installer (Windows host)
   appimage       Build Linux AppImage and Debian package on the host
   arch           Build an Arch Linux .pkg.tar.zst package
   windows-wine   Cross-build a Windows NSIS installer through Wine
@@ -22,6 +32,24 @@ run_target() {
   local target="$1"
   shift
   case "$target" in
+    windows)
+      case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) ;;
+        *)
+          if [[ "${OS:-}" != Windows_NT ]]; then
+            echo "windows target requires a Windows host; use windows-wine on Linux" >&2
+            exit 1
+          fi
+          ;;
+      esac
+      (
+        cd "${ROOT_DIR}/desktop/src-tauri"
+        # Tauri leaves stale NSIS bundles; drop them so releases/ only sees
+        # the current VERSION.
+        rm -rf target/release/bundle/nsis
+        cargo tauri build --bundles nsis
+      )
+      ;;
     appimage) "${ROOT_DIR}/desktop/scripts/build-appimage.sh" "$@" ;;
     arch) "${ROOT_DIR}/packaging/build-arch.sh" "$@" ;;
     windows-wine) "${ROOT_DIR}/packaging/build-windows-wine.sh" "$@" ;;
@@ -37,14 +65,21 @@ collect_artifacts() {
   local target="$1"
   local files=()
   case "$target" in
-    appimage)
+    windows)
       files=(
-        "${ROOT_DIR}/desktop/src-tauri/target/release/bundle/deb/"*.deb
-        "${ROOT_DIR}/desktop/src-tauri/target/release/bundle/appimage/"*.AppImage
+        "${ROOT_DIR}/desktop/src-tauri/target/release/bundle/nsis/"*.exe
+      )
+      ;;
+    appimage)
+      local linux_target
+      linux_target="$(cargo_target_dir)"
+      files=(
+        "${linux_target}/release/bundle/deb/"*.deb
+        "${linux_target}/release/bundle/appimage/"*.AppImage
       )
       ;;
     arch)
-      files=("${ROOT_DIR}/desktop/src-tauri/target/packages/arch/"*.pkg.tar.*)
+      files=("$(cargo_target_dir)/packages/arch/"*.pkg.tar.*)
       ;;
     windows-wine)
       files=("${ROOT_DIR}/target/packages/windows-wine/"*.exe)
@@ -54,7 +89,7 @@ collect_artifacts() {
   # artifacts whose name carries the current VERSION (both the semver form and
   # the Arch underscore form, e.g. 0.2.1-fix1 vs 0.2.1_fix1).
   local version
-  version="$(cat "${ROOT_DIR}/VERSION")"
+  version="$(read_project_version)"
   local patterns=("${version}" "${version//-/_}")
   mkdir -p "${RELEASES_DIR}"
   local copied=0
@@ -95,7 +130,8 @@ fi
 # of the current version so step-by-step builds (appimage, then arch, then
 # windows) accumulate into one complete release set.
 clean_stale_releases() {
-  local version="$(cat "${ROOT_DIR}/VERSION")"
+  local version
+  version="$(read_project_version)"
   local patterns=("${version}" "${version//-/_}")
   mkdir -p "${RELEASES_DIR}"
   local file

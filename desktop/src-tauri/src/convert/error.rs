@@ -51,32 +51,198 @@ pub fn convert_error(entry: &str, upstream_protocol: &str, body: &[u8]) -> Vec<u
 // stream diagnostics used by the proxy pipeline
 // ---------------------------------------------------------------------------
 
-/// True when a streamed chunk carries the first generated content token.
+/// True when a streamed chunk carries the first generated token.
+///
+/// Counts visible text, reasoning/thinking, and tool-call deltas. Newer
+/// models (DeepSeek V4, GPT-5.x, Claude thinking) often emit those before
+/// any string `delta.content` / `delta.text`; treating only the latter as
+/// content left `first_token_ms` null on successful streams.
 pub fn chunk_has_content(protocol: &str, value: &Value) -> bool {
     match protocol {
-        "claude" => value
-            .get("delta")
-            .and_then(|delta| delta.get("text"))
-            .and_then(Value::as_str)
-            .is_some_and(|text| !text.is_empty()),
-        "gemini" => value
-            .get("candidates")
-            .and_then(Value::as_array)
-            .and_then(|items| items.first())
-            .and_then(|candidate| {
-                candidate
-                    .get("content")
-                    .and_then(|content| content.get("parts"))
-                    .and_then(Value::as_array)
+        "claude" => claude_chunk_has_content(value),
+        "gemini" => gemini_chunk_has_content(value),
+        "openai_responses" => responses_chunk_has_content(value),
+        _ => openai_chat_chunk_has_content(value),
+    }
+}
+
+fn nonempty_text(value: Option<&Value>) -> bool {
+    value.is_some_and(|value| !chat_message_text(value).is_empty())
+}
+
+fn openai_chat_chunk_has_content(value: &Value) -> bool {
+    let Some(choice) = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+    else {
+        return false;
+    };
+    let delta = choice.get("delta").unwrap_or(&Value::Null);
+    const TEXT_KEYS: &[&str] = &[
+        "content",
+        "reasoning_content",
+        "reasoning",
+        "thinking",
+        "reasoning_text",
+    ];
+    if TEXT_KEYS.iter().any(|key| nonempty_text(delta.get(key))) {
+        return true;
+    }
+    if delta
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .is_some_and(|calls| !calls.is_empty())
+        || delta.get("function_call").is_some_and(|call| !call.is_null())
+    {
+        return true;
+    }
+    nonempty_text(choice.get("text"))
+}
+
+fn claude_chunk_has_content(value: &Value) -> bool {
+    if let Some(delta) = value.get("delta")
+        && (nonempty_text(delta.get("text"))
+            || nonempty_text(delta.get("thinking"))
+            || nonempty_text(delta.get("partial_json")))
+    {
+        return true;
+    }
+    if value.get("type").and_then(Value::as_str) == Some("content_block_start")
+        && let Some(block) = value.get("content_block")
+    {
+        let block_type = block.get("type").and_then(Value::as_str);
+        if matches!(
+            block_type,
+            Some("tool_use" | "server_tool_use" | "redacted_thinking")
+        ) {
+            return true;
+        }
+        if nonempty_text(block.get("text")) || nonempty_text(block.get("thinking")) {
+            return true;
+        }
+    }
+    false
+}
+
+fn gemini_chunk_has_content(value: &Value) -> bool {
+    value
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(|candidate| {
+            candidate
+                .get("content")
+                .and_then(|content| content.get("parts"))
+                .and_then(Value::as_array)
+        })
+        .is_some_and(|parts| {
+            parts.iter().any(|part| {
+                nonempty_text(part.get("text"))
+                    || part.get("functionCall").is_some()
+                    || part.get("function_call").is_some()
             })
-            .is_some_and(|parts| parts.iter().any(|part| part.get("text").is_some())),
-        "openai_responses" => value.get("delta").is_some(),
-        _ => value
-            .get("choices")
-            .and_then(Value::as_array)
-            .and_then(|items| items.first())
-            .and_then(|choice| choice.get("delta"))
-            .and_then(|delta| delta.get("content").and_then(Value::as_str))
-            .is_some_and(|text| !text.is_empty()),
+        })
+}
+
+fn responses_chunk_has_content(value: &Value) -> bool {
+    if let Some(delta) = value.get("delta") {
+        match delta {
+            Value::String(text) if !text.is_empty() => return true,
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+            _ => return true,
+        }
+    }
+    let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+    event_type.contains("output_text")
+        || event_type.contains("reasoning")
+        || event_type.contains("function_call_arguments")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn openai_chat_string_content_still_counts() {
+        assert!(chunk_has_content(
+            "openai_compatible",
+            &json!({"choices":[{"delta":{"content":"hi"}}]})
+        ));
+        assert!(!chunk_has_content(
+            "openai_compatible",
+            &json!({"choices":[{"delta":{"role":"assistant"}}]})
+        ));
+        assert!(!chunk_has_content(
+            "openai_compatible",
+            &json!({"choices":[{"delta":{"content":""}}]})
+        ));
+    }
+
+    #[test]
+    fn openai_chat_reasoning_and_array_content_count() {
+        assert!(
+            chunk_has_content(
+                "openai_compatible",
+                &json!({"choices":[{"delta":{"reasoning_content":"think"}}]})
+            ),
+            "DeepSeek-style reasoning_content is the first generated token"
+        );
+        assert!(chunk_has_content(
+            "openai_compatible",
+            &json!({"choices":[{"delta":{"content":[{"type":"output_text","text":"hi"}]}}]})
+        ));
+        assert!(chunk_has_content(
+            "openai_compatible",
+            &json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1"}]}}]})
+        ));
+    }
+
+    #[test]
+    fn claude_thinking_and_tool_use_count() {
+        assert!(chunk_has_content(
+            "claude",
+            &json!({"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}})
+        ));
+        assert!(
+            chunk_has_content(
+                "claude",
+                &json!({"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"plan"}})
+            ),
+            "Claude thinking deltas are first-token signals"
+        );
+        assert!(chunk_has_content(
+            "claude",
+            &json!({"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{"}})
+        ));
+        assert!(chunk_has_content(
+            "claude",
+            &json!({"type":"content_block_start","content_block":{"type":"tool_use","id":"t1","name":"x"}})
+        ));
+        assert!(!chunk_has_content(
+            "claude",
+            &json!({"type":"content_block_start","content_block":{"type":"text","text":""}})
+        ));
+    }
+
+    #[test]
+    fn responses_and_gemini_keep_previous_hits() {
+        assert!(chunk_has_content(
+            "openai_responses",
+            &json!({"type":"response.output_text.delta","delta":"hi"})
+        ));
+        assert!(chunk_has_content(
+            "openai_responses",
+            &json!({"type":"response.reasoning_text.delta","delta":"think"})
+        ));
+        assert!(chunk_has_content(
+            "gemini",
+            &json!({"candidates":[{"content":{"parts":[{"text":"hi"}]}}]})
+        ));
+        assert!(chunk_has_content(
+            "gemini",
+            &json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":"x"}}]}}]})
+        ));
     }
 }

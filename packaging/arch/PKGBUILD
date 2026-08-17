@@ -1,9 +1,9 @@
 # Maintainer: Local AI Gateway contributors
 pkgname=local-ai-gateway
-# 项目版本唯一来源是仓库根目录 VERSION；本行由 scripts/version.sh set 自动同步。
+# 项目版本唯一来源是仓库根目录 VERSION；本行由 scripts/version.sh sync 自动同步。
 # Arch pkgver 不允许连字符，预发布段映射为下划线（如 0.3.0-rc.1 -> 0.3.0_rc.1）；
 # packaging/build-arch.sh 构建时还会从 Cargo.toml 覆盖此值，两者由 version.sh check 保证一致。
-pkgver=0.2.2
+pkgver=0.2.3
 pkgrel=1
 pkgdesc='Cross-platform local AI gateway and routing manager'
 arch=('x86_64')
@@ -17,6 +17,7 @@ source=()
 sha256sums=()
 
 _repo_root="${startdir}/repo"
+_cargo_target="${CARGO_TARGET_DIR:-${_repo_root}/desktop/src-tauri/target}"
 
 build() {
   cd "${_repo_root}/desktop/src-tauri"
@@ -24,7 +25,7 @@ build() {
 }
 
 package() {
-  install -Dm755 "${_repo_root}/desktop/src-tauri/target/release/local-ai-gateway" \
+  install -Dm755 "${_cargo_target}/release/local-ai-gateway" \
     "${pkgdir}/usr/bin/local-ai-gateway"
   install -Dm644 "${_repo_root}/packaging/arch/local-ai-gateway.desktop" \
     "${pkgdir}/usr/share/applications/local-ai-gateway.desktop"

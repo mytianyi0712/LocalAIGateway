@@ -5,9 +5,9 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 TAURI_DIR="${SCRIPT_DIR}/../src-tauri"
 cd "$TAURI_DIR"
 
-# Tauri caches linuxdeploy in target/.tauri when useLocalToolsDir is enabled.
-# Keep the tools inside the project so CI and local builds use the same patched
-# plugin instead of a machine-wide cache.
+# Tauri caches linuxdeploy in $CARGO_TARGET_DIR/.tauri when useLocalToolsDir
+# is enabled. On WSL the repo lives on drvfs (/mnt/d) which cannot chmod +x;
+# the Makefile therefore points CARGO_TARGET_DIR at a Linux-native cache.
 TARGET_DIR="$(cargo metadata --no-deps --format-version 1 | python -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
 TOOLS_DIR="${TARGET_DIR}/.tauri"
 mkdir -p "$TOOLS_DIR"
@@ -22,6 +22,24 @@ case "$(uname -m)" in
     ;;
 esac
 
+# WSL usually has no FUSE; linuxdeploy AppImages must extract-and-run.
+if [[ -n "${WSL_DISTRO_NAME:-}" || -e /proc/sys/fs/binfmt_misc/WSLInterop ]]; then
+  export APPIMAGE_EXTRACT_AND_RUN="${APPIMAGE_EXTRACT_AND_RUN:-1}"
+fi
+
+ensure_executable() {
+  local path="$1"
+  if chmod +x "$path" 2>/dev/null && [[ -x "$path" ]]; then
+    return 0
+  fi
+  local cache="${HOME}/.cache/local-ai-gateway/tauri-tools"
+  mkdir -p "$cache"
+  local copy="${cache}/$(basename "$path")"
+  cp -f "$path" "$copy"
+  chmod +x "$copy"
+  ln -sfn "$copy" "$path"
+}
+
 fetch_tool() {
   local destination="$1"
   local url="$2"
@@ -30,7 +48,7 @@ fetch_tool() {
     curl --fail --location --retry 3 --silent --show-error "$url" --output "$temporary"
     mv -- "$temporary" "$destination"
   fi
-  chmod +x "$destination"
+  ensure_executable "$destination"
 }
 
 fetch_tool "$TOOLS_DIR/AppRun-${TOOLS_ARCH}" \
