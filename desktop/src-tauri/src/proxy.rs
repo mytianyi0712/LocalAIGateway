@@ -25,6 +25,7 @@ use crate::{
     crypto::SecretStore,
     db::Database,
     protocol,
+    remote_compaction::{self, CompactionMode, CompactionSupport, CompactionV2Validator},
     routing::{self, Candidate, RoutableModel},
     runtime::RuntimeLimits,
     settings,
@@ -223,6 +224,7 @@ fn mapped_path(
     request_path: &str,
     stream_requested: bool,
     model: &str,
+    compaction: Option<CompactionMode>,
 ) -> String {
     if mapping.entry == "claude" && request_path.starts_with("/claudecode/") {
         return match mapping.upstream_protocol.as_str() {
@@ -241,6 +243,10 @@ fn mapped_path(
         };
     }
     if mapping.entry == "openai_responses" && request_path.starts_with("/codex/") {
+        if compaction == Some(CompactionMode::V1) && mapping.upstream_protocol == "openai_responses"
+        {
+            return "/v1/responses/compact".into();
+        }
         return match mapping.upstream_protocol.as_str() {
             "openai_compatible" => "/v1/chat/completions".into(),
             "openai_responses" => "/v1/responses".into(),
@@ -1790,6 +1796,7 @@ struct PreparedRequest {
     upstream_model: String,
     converted_body: Bytes,
     candidates: Vec<Candidate>,
+    compaction_mode: Option<CompactionMode>,
 }
 
 /// Request preparation (P2-4): settings, body read, gateway auth, model
@@ -1867,6 +1874,20 @@ async fn prepare_request(
             request_id,
         ));
     };
+    let compaction_mode =
+        match remote_compaction::detect_compaction(&path, &body) {
+            Ok(mode) => mode,
+            Err(error) => {
+                tracing::warn!(request_id = %request_id, %error, "invalid remote compaction request");
+                return Err(gateway_error(
+                    entry_protocol,
+                    StatusCode::BAD_REQUEST,
+                    "invalid_compaction_request",
+                    &error.to_string(),
+                    request_id,
+                ));
+            }
+        };
     // Model mappings only apply to the dedicated mapping entry points
     // (/codex/v1/responses, /claudecode/v1/messages); the regular protocol
     // endpoints (/v1/responses, /v1/messages) are always routed directly,
@@ -1934,6 +1955,35 @@ async fn prepare_request(
         .as_ref()
         .map(|value| value.upstream_model.as_str())
         .unwrap_or(entry_model.as_str());
+    if compaction_mode.is_some() && upstream_protocol != "openai_responses" {
+        let finished = svc.clock.now_utc();
+        svc.telemetry.emit(Event::RequestStart {
+            id: request_id.to_owned(),
+            protocol: entry_protocol.to_owned(),
+            model_id: Some(entry_model.clone()),
+            endpoint: path.clone(),
+            stream: stream_requested,
+            started_at: started_at.clone(),
+            request_bytes: body.len() as i64,
+        });
+        svc.telemetry.emit(Event::RequestFinish {
+            id: request_id.to_owned(),
+            finished_at: finished.to_rfc3339(),
+            duration_ms: finished.signed_duration_since(started).num_milliseconds(),
+            status: Some(422),
+            outcome: "gateway_error".into(),
+            attempts: 0,
+            channel_id: None,
+            response_bytes: 0,
+        });
+        return Err(gateway_error(
+            entry_protocol,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "remote_compaction_unsupported_upstream",
+            "Remote compaction is only supported for openai_responses upstream channels.",
+            request_id,
+        ));
+    }
     let converted_body = if let Some(value) = mapping.as_ref() {
         match convert::convert_request(
             &value.entry,
@@ -1968,15 +2018,24 @@ async fn prepare_request(
         started_at: started_at.clone(),
         request_bytes: body.len() as i64,
     });
-    let candidates = match svc
-        .routes
-        .resolve_candidates(
-            upstream_protocol,
-            route_model,
-            runtime.max_failover_attempts,
-        )
-        .await
-    {
+    let candidates = match if let Some(mode) = compaction_mode {
+        svc.routes
+            .resolve_compaction_candidates(
+                upstream_protocol,
+                route_model,
+                mode,
+                runtime.max_failover_attempts,
+            )
+            .await
+    } else {
+        svc.routes
+            .resolve_candidates(
+                upstream_protocol,
+                route_model,
+                runtime.max_failover_attempts,
+            )
+            .await
+    } {
         Ok(value) => value,
         Err(error) => {
             tracing::error!(request_id = %request_id, error = %error, "candidate resolution failed");
@@ -1990,6 +2049,19 @@ async fn prepare_request(
         }
     };
     if candidates.is_empty() {
+        let (status_code, code, message) = if compaction_mode.is_some() {
+            (
+                422,
+                "remote_compaction_unavailable",
+                "No active channel supports remote compaction for this model.",
+            )
+        } else {
+            (
+                503,
+                "no_active_channel",
+                "No active channel is available for this model.",
+            )
+        };
         svc.telemetry.emit(Event::RequestFinish {
             id: request_id.to_owned(),
             finished_at: svc.clock.now_utc().to_rfc3339(),
@@ -1998,7 +2070,7 @@ async fn prepare_request(
                 .now_utc()
                 .signed_duration_since(started)
                 .num_milliseconds(),
-            status: Some(503),
+            status: Some(status_code),
             outcome: "gateway_error".into(),
             attempts: 0,
             channel_id: None,
@@ -2006,9 +2078,10 @@ async fn prepare_request(
         });
         return Err(gateway_error(
             entry_protocol,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no_active_channel",
-            "No active channel is available for this model.",
+            StatusCode::from_u16(status_code as u16)
+                .unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+            code,
+            message,
             request_id,
         ));
     }
@@ -2026,6 +2099,7 @@ async fn prepare_request(
         upstream_model,
         converted_body,
         candidates,
+        compaction_mode,
     })
 }
 
@@ -2317,6 +2391,553 @@ async fn bounded_non_stream(
     NonStreamResult::Respond(result)
 }
 
+/// Outcome of a remote-compaction attempt.
+enum CompactionResult {
+    Respond(Response<Body>),
+    FailOver(Option<TransportFailure>),
+    /// The attempt failed with an upstream HTTP error body that should be
+    /// replayed if no further candidate succeeds.
+    FailOverError(StatusCode, axum::http::HeaderMap, Vec<u8>, String),
+}
+
+/// Best-effort persistence of a runtime-confirmed remote-compaction capability.
+async fn update_compaction_capability(
+    db: &Database,
+    channel_id: &str,
+    mode: CompactionMode,
+    supported: bool,
+) {
+    let column = match mode {
+        CompactionMode::V1 => "remote_compaction_v1_support",
+        CompactionMode::V2 => "remote_compaction_v2_support",
+    };
+    let value = if supported {
+        CompactionSupport::Supported.as_db()
+    } else {
+        CompactionSupport::Unsupported.as_db()
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let sql = format!(
+        "UPDATE channel_protocols SET {column} = ?, remote_compaction_probed_at = ? \
+         WHERE channel_id = ? AND protocol = 'openai_responses'"
+    );
+    if let Err(error) = sqlx::query(&sql)
+        .bind(value)
+        .bind(&now)
+        .bind(channel_id)
+        .execute(db.pool())
+        .await
+    {
+        tracing::warn!(
+            channel_id,
+            mode = mode.as_str(),
+            %error,
+            "failed to persist remote compaction capability"
+        );
+    }
+}
+
+/// Handles one remote-compaction upstream response. Both V1 and V2 validate
+/// the full body before returning bytes to the client so a bad upstream can
+/// still fail over to the next candidate.
+async fn compaction_attempt(
+    db: &Database,
+    env: AttemptEnv<'_>,
+    mode: CompactionMode,
+    response: crate::ports::UpstreamResponse,
+    status: axum::http::StatusCode,
+    response_headers: axum::http::HeaderMap,
+) -> CompactionResult {
+    if !status.is_success() {
+        return compaction_error_attempt(db, env, mode, response, status, response_headers).await;
+    }
+    match mode {
+        CompactionMode::V1 => compaction_v1_success(db, env, response, status, response_headers).await,
+        CompactionMode::V2 => compaction_v2_success(db, env, response, status, response_headers).await,
+    }
+}
+
+async fn compaction_error_attempt(
+    db: &Database,
+    env: AttemptEnv<'_>,
+    mode: CompactionMode,
+    response: crate::ports::UpstreamResponse,
+    status: axum::http::StatusCode,
+    response_headers: axum::http::HeaderMap,
+) -> CompactionResult {
+    let (raw_result, truncated) = read_bounded_body(
+        response.body.into_stream(),
+        Duration::from_secs(env.runtime.first_byte_timeout_seconds.max(1) as u64),
+        env.runtime.max_buffered_upstream_body_mb.max(1) as usize * 1024 * 1024,
+    )
+    .await;
+    let raw = match raw_result {
+        Ok(raw) => raw,
+        Err(TransportFailure::ConnectionReset) => Vec::new(),
+        Err(_) => Vec::new(),
+    };
+    if truncated {
+        tracing::warn!(
+            request_id = %env.request_id,
+            channel_id = %env.candidate.channel_id,
+            "remote compaction error body truncated"
+        );
+    }
+
+    let capability_rejected = matches!(status.as_u16(), 404 | 405 | 501);
+    if capability_rejected {
+        update_compaction_capability(db, &env.candidate.channel_id, mode, false).await;
+    }
+
+    let (kind, countable) = if capability_rejected {
+        ("remote_compaction_unsupported", false)
+    } else {
+        let (kind, countable) = status_kind(status);
+        (kind, countable)
+    };
+    let finished = env.clock.now_utc();
+    AttemptFinalizer::new(
+        Arc::new(env.telemetry.clone()),
+        env.request_id,
+        env.started,
+        env.runtime.failure_threshold,
+        env.runtime.circuit_open_seconds,
+    )
+    .finalize(
+        env.candidate,
+        env.attempts,
+        env.attempt_started,
+        finished,
+        AttemptOutcome::UpstreamError,
+        Some(status.as_u16() as i64),
+        Some(kind.into()),
+        env.attempts < env.candidates_len,
+        false,
+        None,
+        None,
+        Usage::default(),
+        raw.len() as i64,
+        Some(env.upstream_protocol.into()),
+        Some(env.upstream_model.into()),
+        countable,
+    );
+    CompactionResult::FailOverError(
+        status,
+        response_headers,
+        raw,
+        env.candidate.channel_id.clone(),
+    )
+}
+
+async fn compaction_v1_success(
+    db: &Database,
+    env: AttemptEnv<'_>,
+    response: crate::ports::UpstreamResponse,
+    status: axum::http::StatusCode,
+    response_headers: axum::http::HeaderMap,
+) -> CompactionResult {
+    let buffered_cap = (env.runtime.max_buffered_upstream_body_mb.max(1) as usize) * 1024 * 1024;
+    let (raw_result, truncated) = read_bounded_body(
+        response.body.into_stream(),
+        Duration::from_secs(env.runtime.non_stream_total_timeout_seconds.max(1) as u64),
+        buffered_cap,
+    )
+    .await;
+    let raw = match raw_result {
+        Ok(raw) if !truncated => raw,
+        Ok(_) => {
+            let finished = env.clock.now_utc();
+            AttemptFinalizer::new(
+                Arc::new(env.telemetry.clone()),
+                env.request_id,
+                env.started,
+                env.runtime.failure_threshold,
+                env.runtime.circuit_open_seconds,
+            )
+            .finalize(
+                env.candidate,
+                env.attempts,
+                env.attempt_started,
+                finished,
+                AttemptOutcome::GatewayError,
+                Some(502),
+                Some("upstream_response_too_large".into()),
+                env.attempts < env.candidates_len,
+                false,
+                None,
+                None,
+                Usage::default(),
+                buffered_cap as i64,
+                Some(env.upstream_protocol.into()),
+                Some(env.upstream_model.into()),
+                true,
+            );
+            return CompactionResult::FailOver(None);
+        }
+        Err(kind) => {
+            let finished = env.clock.now_utc();
+            AttemptFinalizer::new(
+                Arc::new(env.telemetry.clone()),
+                env.request_id,
+                env.started,
+                env.runtime.failure_threshold,
+                env.runtime.circuit_open_seconds,
+            )
+            .finalize(
+                env.candidate,
+                env.attempts,
+                env.attempt_started,
+                finished,
+                AttemptOutcome::TransportError,
+                None,
+                Some("transport_error".into()),
+                env.attempts < env.candidates_len,
+                false,
+                None,
+                None,
+                Usage::default(),
+                0,
+                Some(env.upstream_protocol.into()),
+                Some(env.upstream_model.into()),
+                true,
+            );
+            return CompactionResult::FailOver(Some(kind));
+        }
+    };
+
+    let decoded = match decode_mapped_response(&env, response_headers.get("content-encoding"), &raw, buffered_cap) {
+        Ok(decoded) => decoded,
+        Err(result) => return result,
+    };
+    if !remote_compaction::validate_v1_response(&decoded) {
+        let finished = env.clock.now_utc();
+        AttemptFinalizer::new(
+            Arc::new(env.telemetry.clone()),
+            env.request_id,
+            env.started,
+            env.runtime.failure_threshold,
+            env.runtime.circuit_open_seconds,
+        )
+        .finalize(
+            env.candidate,
+            env.attempts,
+            env.attempt_started,
+            finished,
+            AttemptOutcome::GatewayError,
+            Some(502),
+            Some("upstream_compaction_format_error".into()),
+            env.attempts < env.candidates_len,
+            false,
+            None,
+            None,
+            Usage::default(),
+            decoded.len() as i64,
+            Some(env.upstream_protocol.into()),
+            Some(env.upstream_model.into()),
+            true,
+        );
+        return CompactionResult::FailOver(None);
+    }
+
+    update_compaction_capability(db, &env.candidate.channel_id, CompactionMode::V1, true).await;
+
+    let finished = env.clock.now_utc();
+    AttemptFinalizer::new(
+        Arc::new(env.telemetry.clone()),
+        env.request_id,
+        env.started,
+        env.runtime.failure_threshold,
+        env.runtime.circuit_open_seconds,
+    )
+    .finalize(
+        env.candidate,
+        env.attempts,
+        env.attempt_started,
+        finished,
+        AttemptOutcome::Success,
+        Some(status.as_u16() as i64),
+        None,
+        false,
+        true,
+        None,
+        None,
+        Usage::default(),
+        decoded.len() as i64,
+        Some(env.upstream_protocol.into()),
+        Some(env.upstream_model.into()),
+        false,
+    );
+
+    let mut result = response_with_headers(status, response_headers, decoded);
+    result.headers_mut().remove("content-encoding");
+    result.headers_mut().remove("content-length");
+    result.headers_mut().insert(
+        "content-type",
+        HeaderValue::from_static("application/json"),
+    );
+    CompactionResult::Respond(result)
+}
+
+async fn compaction_v2_success(
+    db: &Database,
+    env: AttemptEnv<'_>,
+    response: crate::ports::UpstreamResponse,
+    status: axum::http::StatusCode,
+    response_headers: axum::http::HeaderMap,
+) -> CompactionResult {
+    let buffered_cap = (env.runtime.max_buffered_upstream_body_mb.max(1) as usize) * 1024 * 1024;
+    let (raw_result, truncated) = read_bounded_body(
+        response.body.into_stream(),
+        Duration::from_secs(env.runtime.non_stream_total_timeout_seconds.max(1) as u64),
+        buffered_cap,
+    )
+    .await;
+    let raw = match raw_result {
+        Ok(raw) if !truncated => raw,
+        Ok(_) => {
+            let finished = env.clock.now_utc();
+            AttemptFinalizer::new(
+                Arc::new(env.telemetry.clone()),
+                env.request_id,
+                env.started,
+                env.runtime.failure_threshold,
+                env.runtime.circuit_open_seconds,
+            )
+            .finalize(
+                env.candidate,
+                env.attempts,
+                env.attempt_started,
+                finished,
+                AttemptOutcome::GatewayError,
+                Some(502),
+                Some("upstream_response_too_large".into()),
+                env.attempts < env.candidates_len,
+                false,
+                None,
+                None,
+                Usage::default(),
+                buffered_cap as i64,
+                Some(env.upstream_protocol.into()),
+                Some(env.upstream_model.into()),
+                true,
+            );
+            return CompactionResult::FailOver(None);
+        }
+        Err(kind) => {
+            let finished = env.clock.now_utc();
+            AttemptFinalizer::new(
+                Arc::new(env.telemetry.clone()),
+                env.request_id,
+                env.started,
+                env.runtime.failure_threshold,
+                env.runtime.circuit_open_seconds,
+            )
+            .finalize(
+                env.candidate,
+                env.attempts,
+                env.attempt_started,
+                finished,
+                AttemptOutcome::TransportError,
+                None,
+                Some("transport_error".into()),
+                env.attempts < env.candidates_len,
+                false,
+                None,
+                None,
+                Usage::default(),
+                0,
+                Some(env.upstream_protocol.into()),
+                Some(env.upstream_model.into()),
+                true,
+            );
+            return CompactionResult::FailOver(Some(kind));
+        }
+    };
+
+    let decoded = match decode_mapped_response(&env, response_headers.get("content-encoding"), &raw, buffered_cap) {
+        Ok(decoded) => decoded,
+        Err(result) => return result,
+    };
+
+    let mut validator = CompactionV2Validator::new();
+    validator.feed(&decoded);
+    let validation = validator.finish();
+
+    let (outcome, error_kind, status_code, countable, usage) = match validation {
+        Ok(()) => {
+            update_compaction_capability(db, &env.candidate.channel_id, CompactionMode::V2, true)
+                .await;
+            let usage = validator
+                .usage()
+                .map(|value| protocol::normalize_usage(env.upstream_protocol, value))
+                .unwrap_or_default();
+            (
+                AttemptOutcome::Success,
+                None,
+                status.as_u16() as i64,
+                false,
+                usage,
+            )
+        }
+        Err(remote_compaction::CompactionV2Error::Upstream(message)) => {
+            tracing::warn!(
+                request_id = %env.request_id,
+                channel_id = %env.candidate.channel_id,
+                message,
+                "remote compaction v2 upstream stream failed"
+            );
+            (
+                AttemptOutcome::UpstreamError,
+                Some("upstream_error".into()),
+                502,
+                true,
+                Usage::default(),
+            )
+        }
+        Err(remote_compaction::CompactionV2Error::NotCompaction) => {
+            update_compaction_capability(db, &env.candidate.channel_id, CompactionMode::V2, false)
+                .await;
+            (
+                AttemptOutcome::UpstreamError,
+                Some("remote_compaction_unsupported".into()),
+                502,
+                false,
+                Usage::default(),
+            )
+        }
+        Err(error) => {
+            tracing::warn!(
+                request_id = %env.request_id,
+                channel_id = %env.candidate.channel_id,
+                %error,
+                "remote compaction v2 response invalid"
+            );
+            (
+                AttemptOutcome::GatewayError,
+                Some("upstream_compaction_format_error".into()),
+                502,
+                true,
+                Usage::default(),
+            )
+        }
+    };
+
+    let finished = env.clock.now_utc();
+    AttemptFinalizer::new(
+        Arc::new(env.telemetry.clone()),
+        env.request_id,
+        env.started,
+        env.runtime.failure_threshold,
+        env.runtime.circuit_open_seconds,
+    )
+    .finalize(
+        env.candidate,
+        env.attempts,
+        env.attempt_started,
+        finished,
+        outcome,
+        Some(status_code),
+        error_kind,
+        env.attempts < env.candidates_len,
+        outcome == AttemptOutcome::Success,
+        None,
+        None,
+        usage,
+        decoded.len() as i64,
+        Some(env.upstream_protocol.into()),
+        Some(env.upstream_model.into()),
+        countable,
+    );
+
+    if outcome != AttemptOutcome::Success {
+        return CompactionResult::FailOver(None);
+    }
+
+    let mut result = response_with_headers(status, response_headers, decoded);
+    result.headers_mut().remove("content-encoding");
+    result.headers_mut().remove("content-length");
+    result.headers_mut().insert(
+        "content-type",
+        HeaderValue::from_static("text/event-stream"),
+    );
+    CompactionResult::Respond(result)
+}
+
+/// Shared lossless decode for mapped compaction responses. On failure it
+/// finalizes the attempt and returns the appropriate `CompactionResult`.
+fn decode_mapped_response(
+    env: &AttemptEnv<'_>,
+    content_encoding: Option<&axum::http::HeaderValue>,
+    raw: &[u8],
+    buffered_cap: usize,
+) -> Result<Vec<u8>, CompactionResult> {
+    let mut decoder = compression::RequiredDecoder::new(
+        compression::ContentDecoder::from_encoding(content_encoding),
+        buffered_cap,
+    );
+    match decoder.feed_required(raw) {
+        Ok(decoded) if decoder.finished() => Ok(decoded),
+        Ok(_) => {
+            let finished = env.clock.now_utc();
+            AttemptFinalizer::new(
+                Arc::new(env.telemetry.clone()),
+                env.request_id,
+                env.started,
+                env.runtime.failure_threshold,
+                env.runtime.circuit_open_seconds,
+            )
+            .finalize(
+                env.candidate,
+                env.attempts,
+                env.attempt_started,
+                finished,
+                AttemptOutcome::GatewayError,
+                Some(502),
+                Some("upstream_decode_error".into()),
+                env.attempts < env.candidates_len,
+                false,
+                None,
+                None,
+                Usage::default(),
+                raw.len() as i64,
+                Some(env.upstream_protocol.into()),
+                Some(env.upstream_model.into()),
+                true,
+            );
+            Err(CompactionResult::FailOver(None))
+        }
+        Err(_) => {
+            let finished = env.clock.now_utc();
+            AttemptFinalizer::new(
+                Arc::new(env.telemetry.clone()),
+                env.request_id,
+                env.started,
+                env.runtime.failure_threshold,
+                env.runtime.circuit_open_seconds,
+            )
+            .finalize(
+                env.candidate,
+                env.attempts,
+                env.attempt_started,
+                finished,
+                AttemptOutcome::GatewayError,
+                Some(502),
+                Some("upstream_decode_error".into()),
+                env.attempts < env.candidates_len,
+                false,
+                None,
+                None,
+                Usage::default(),
+                raw.len() as i64,
+                Some(env.upstream_protocol.into()),
+                Some(env.upstream_model.into()),
+                true,
+            );
+            Err(CompactionResult::FailOver(None))
+        }
+    }
+}
+
 /// Final gateway response after every candidate failed (P2-4): replays the
 /// last upstream error, classifies pure-transport failures into 502/504,
 /// and writes the request terminal telemetry.
@@ -2472,7 +3093,7 @@ impl ProxyService {
             upstream_model,
             converted_body,
             candidates,
-            ..
+            compaction_mode,
         } = prepared;
         let upstream_protocol = upstream_protocol.as_str();
         let upstream_model = upstream_model.as_str();
@@ -2548,7 +3169,15 @@ impl ProxyService {
             };
             let target_path = mapping
                 .as_ref()
-                .map(|value| mapped_path(value, &path, stream_requested, &value.upstream_model))
+                .map(|value| {
+                    mapped_path(
+                        value,
+                        &path,
+                        stream_requested,
+                        &value.upstream_model,
+                        compaction_mode,
+                    )
+                })
                 .unwrap_or_else(|| path.clone());
             let target_url = match protocol::upstream_url(
                 &candidate.base_url,
@@ -2685,6 +3314,50 @@ impl ProxyService {
             };
             let status = response.status;
             let response_headers = protocol::response_headers(&response.headers);
+            if let Some(mode) = compaction_mode {
+                // Remote compaction has its own builders: V1 is unary and V2 is
+                // buffered/validated before any client bytes are emitted so a
+                // malformed or unsupported upstream response can still fail over.
+                let env = AttemptEnv {
+                    telemetry: &self.telemetry,
+                    clock: Arc::clone(&self.clock),
+                    request_id: &request_id,
+                    started,
+                    candidate,
+                    attempts,
+                    attempt_started,
+                    attempt_started_instant,
+                    runtime: &runtime,
+                    entry_protocol,
+                    entry_model: &entry_model,
+                    upstream_protocol,
+                    upstream_model,
+                    mapping: mapping.as_ref(),
+                    candidates_len: candidates.len() as i64,
+                };
+                match compaction_attempt(
+                    &self.db,
+                    env,
+                    mode,
+                    response,
+                    status,
+                    response_headers,
+                )
+                .await
+                {
+                    CompactionResult::Respond(result) => return result,
+                    CompactionResult::FailOver(transport) => {
+                        last_transport_kind = transport;
+                        last_error = None;
+                        continue;
+                    }
+                    CompactionResult::FailOverError(error_status, error_headers, raw, channel_id) => {
+                        last_transport_kind = None;
+                        last_error = Some((error_status, error_headers, raw, channel_id));
+                        continue;
+                    }
+                }
+            }
             if status.is_success() {
                 if stream_requested && mapping.is_none() {
                     // P2-4: transparent forwarding lives in its own builder.
@@ -2858,6 +3531,12 @@ pub async fn openai(State(state): State<AppContext>, request: Request) -> Respon
 pub async fn responses(State(state): State<AppContext>, request: Request) -> Response<Body> {
     normal(State(state), request, "openai_responses").await
 }
+pub async fn responses_compact(
+    State(state): State<AppContext>,
+    request: Request,
+) -> Response<Body> {
+    normal(State(state), request, "openai_responses").await
+}
 pub async fn claude(State(state): State<AppContext>, request: Request) -> Response<Body> {
     normal(State(state), request, "claude").await
 }
@@ -2872,6 +3551,12 @@ pub async fn claudecode(State(state): State<AppContext>, request: Request) -> Re
     normal(State(state), request, "claude").await
 }
 pub async fn codex(State(state): State<AppContext>, request: Request) -> Response<Body> {
+    normal(State(state), request, "openai_responses").await
+}
+pub async fn codex_compact(
+    State(state): State<AppContext>,
+    request: Request,
+) -> Response<Body> {
     normal(State(state), request, "openai_responses").await
 }
 

@@ -1,6 +1,8 @@
 use serde::Serialize;
 use sqlx::FromRow;
 
+use crate::remote_compaction::CompactionSupport;
+
 /// A configured mapping from an entry model to an upstream protocol+model
 /// (claudecode/codex entries).
 #[derive(Clone)]
@@ -19,6 +21,22 @@ pub struct Candidate {
     pub base_url: String,
     pub api_key_encrypted: Vec<u8>,
     pub model_id: String,
+    /// Raw `channel_protocols.remote_compaction_v1_support`:
+    /// 0 unknown, 1 supported, 2 unsupported.
+    pub remote_compaction_v1_support: i64,
+    /// Raw `channel_protocols.remote_compaction_v2_support`:
+    /// 0 unknown, 1 supported, 2 unsupported.
+    pub remote_compaction_v2_support: i64,
+}
+
+impl Candidate {
+    pub fn remote_compaction_v1(&self) -> CompactionSupport {
+        CompactionSupport::from_db(Some(self.remote_compaction_v1_support))
+    }
+
+    pub fn remote_compaction_v2(&self) -> CompactionSupport {
+        CompactionSupport::from_db(Some(self.remote_compaction_v2_support))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, FromRow)]

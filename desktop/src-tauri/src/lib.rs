@@ -18,6 +18,7 @@ pub mod notification;
 pub mod ports;
 pub mod protocol;
 pub mod proxy;
+pub mod remote_compaction;
 pub mod routing;
 pub mod runtime;
 pub mod server;

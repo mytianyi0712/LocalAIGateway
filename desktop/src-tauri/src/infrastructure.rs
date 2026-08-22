@@ -20,6 +20,7 @@ use crate::{
         RouteRepository, UpstreamBody, UpstreamClient, UpstreamError, UpstreamRequest,
         UpstreamResponse,
     },
+    remote_compaction::CompactionMode,
 };
 
 /// Per-connect-timeout reqwest client pool. reqwest has no per-request
@@ -131,7 +132,9 @@ impl RouteRepository for SqliteRouteRepository {
         Box::pin(async move {
             Ok(sqlx::query_as::<_, Candidate>(
             "SELECT rc.id AS candidate_id, c.id AS channel_id, c.name AS channel_name, \
-                    rc.priority, p.base_url, c.api_key_encrypted, cm.model_id \
+                    rc.priority, p.base_url, c.api_key_encrypted, cm.model_id, \
+                    COALESCE(cp.remote_compaction_v1_support, 0) AS remote_compaction_v1_support, \
+                    COALESCE(cp.remote_compaction_v2_support, 0) AS remote_compaction_v2_support \
              FROM route_candidates rc \
              JOIN model_routes mr ON mr.id = rc.route_id \
              JOIN channel_models cm ON cm.id = rc.channel_model_id \
@@ -139,6 +142,7 @@ impl RouteRepository for SqliteRouteRepository {
              JOIN channels c ON c.id = cm.channel_id \
              JOIN providers p ON p.id = c.provider_id \
              JOIN channel_health ch ON ch.channel_id = c.id \
+             LEFT JOIN channel_protocols cp ON cp.channel_id = c.id AND cp.protocol = mr.protocol \
              WHERE mr.protocol = ? AND mr.requested_model_id = ? AND mr.enabled = 1 \
                AND rc.enabled = 1 AND cm.available = 1 AND c.manual_enabled = 1 AND ch.state = 'active' \
              ORDER BY rc.priority ASC LIMIT ?"
@@ -148,6 +152,48 @@ impl RouteRepository for SqliteRouteRepository {
         .bind(limit)
         .fetch_all(db.pool())
         .await?)
+        })
+    }
+
+    fn resolve_compaction_candidates(
+        &self,
+        protocol: &str,
+        model_id: &str,
+        mode: CompactionMode,
+        limit: i64,
+    ) -> futures_util::future::BoxFuture<'static, Result<Vec<Candidate>>> {
+        let db = self.db.clone();
+        let protocol = protocol.to_owned();
+        let model_id = model_id.to_owned();
+        let capability_column = match mode {
+            CompactionMode::V1 => "cp.remote_compaction_v1_support",
+            CompactionMode::V2 => "cp.remote_compaction_v2_support",
+        };
+        let sql = format!(
+            "SELECT rc.id AS candidate_id, c.id AS channel_id, c.name AS channel_name, \
+                    rc.priority, p.base_url, c.api_key_encrypted, cm.model_id, \
+                    COALESCE(cp.remote_compaction_v1_support, 0) AS remote_compaction_v1_support, \
+                    COALESCE(cp.remote_compaction_v2_support, 0) AS remote_compaction_v2_support \
+             FROM route_candidates rc \
+             JOIN model_routes mr ON mr.id = rc.route_id \
+             JOIN channel_models cm ON cm.id = rc.channel_model_id \
+             JOIN channel_model_protocols cmp ON cmp.channel_model_id = cm.id AND cmp.protocol = mr.protocol \
+             JOIN channels c ON c.id = cm.channel_id \
+             JOIN providers p ON p.id = c.provider_id \
+             JOIN channel_health ch ON ch.channel_id = c.id \
+             LEFT JOIN channel_protocols cp ON cp.channel_id = c.id AND cp.protocol = mr.protocol \
+             WHERE mr.protocol = ? AND mr.requested_model_id = ? AND mr.enabled = 1 \
+               AND rc.enabled = 1 AND cm.available = 1 AND c.manual_enabled = 1 AND ch.state = 'active' \
+               AND COALESCE({capability_column}, 0) != 2 \
+             ORDER BY rc.priority ASC LIMIT ?"
+        );
+        Box::pin(async move {
+            Ok(sqlx::query_as::<_, Candidate>(&sql)
+                .bind(protocol.as_str())
+                .bind(model_id.as_str())
+                .bind(limit)
+                .fetch_all(db.pool())
+                .await?)
         })
     }
 

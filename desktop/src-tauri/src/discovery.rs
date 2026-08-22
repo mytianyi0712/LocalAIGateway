@@ -19,7 +19,8 @@ use crate::{
     crypto::SecretStore,
     db::Database,
     ports::{ChannelRepository, Clock, UpstreamClient},
-    protocol, settings,
+    protocol, remote_compaction,
+    settings,
 };
 
 /// Immutable outcome of the network phase (P2-5): nothing is written to the
@@ -38,6 +39,25 @@ pub struct DiscoverySnapshot {
     status_code: Option<i64>,
     /// Aggregated failure detail when at least one protocol failed.
     error_kind: Option<String>,
+    /// Remote-compaction capability probe result for `openai_responses`.
+    remote_compaction: Option<RemoteCompactionProbe>,
+}
+
+/// Outcome of probing one channel's remote-compaction endpoints.
+#[derive(Debug, Clone)]
+pub struct RemoteCompactionProbe {
+    pub v1: ProbeVerdict,
+    pub v2: ProbeVerdict,
+    pub probed_at: String,
+}
+
+/// A remote-compaction probe verdict. `Inconclusive` preserves the previously
+/// persisted value and only adds a discovery-run diagnostic.
+#[derive(Debug, Clone)]
+pub enum ProbeVerdict {
+    Supported,
+    Unsupported,
+    Inconclusive(String),
 }
 
 /// Discovery service (P2-1): network phase + atomic apply, depending only on
@@ -344,18 +364,224 @@ impl DiscoveryService {
             .flat_map(|models| models.keys().cloned().collect::<Vec<_>>())
             .collect::<HashSet<_>>()
             .len() as i64;
-        let error_kind = if failed.is_empty() {
+        let mut remote_compaction_probe = None;
+        if succeeded.contains("openai_responses")
+            && let Some(models) = seen_by_protocol.get("openai_responses")
+            && let Some(model_id) = models.keys().next()
+        {
+            remote_compaction_probe = Some(
+                self.probe_remote_compaction(
+                    state,
+                    &base_url,
+                    &api_key,
+                    model_id,
+                    channel_id,
+                )
+                .await,
+            );
+        }
+        let mut error_kind = if failed.is_empty() {
             None
         } else {
             Some(format!("protocol_discovery_failed:{}", failed.join(",")))
         };
+        if let Some(probe) = &remote_compaction_probe {
+            let mut diagnostics = Vec::new();
+            if let ProbeVerdict::Inconclusive(reason) = &probe.v1 {
+                diagnostics.push(format!("remote_compaction_v1_inconclusive:{reason}"));
+            }
+            if let ProbeVerdict::Inconclusive(reason) = &probe.v2 {
+                diagnostics.push(format!("remote_compaction_v2_inconclusive:{reason}"));
+            }
+            if !diagnostics.is_empty() {
+                let suffix = diagnostics.join(",");
+                error_kind = Some(match error_kind.take() {
+                    Some(prefix) => format!("{prefix};{suffix}"),
+                    None => suffix,
+                });
+            }
+        }
         Ok(DiscoverySnapshot {
             succeeded,
             seen_by_protocol,
             model_count,
             status_code: last_status_code,
             error_kind,
+            remote_compaction: remote_compaction_probe,
         })
+    }
+
+    /// Probes both remote-compaction protocols on an `openai_responses`
+    /// channel. The probe never fails discovery: inconclusive outcomes are
+    /// recorded as diagnostics and preserve previously stored capability.
+    async fn probe_remote_compaction(
+        &self,
+        state: &Context,
+        base_url: &str,
+        api_key: &str,
+        model_id: &str,
+        channel_id: &str,
+    ) -> RemoteCompactionProbe {
+        let probed_at = self.clock.now_utc().to_rfc3339();
+        let v1 = self
+            .probe_remote_compaction_v1(state, base_url, api_key, model_id, channel_id)
+            .await;
+        let v2 = self
+            .probe_remote_compaction_v2(state, base_url, api_key, model_id, channel_id)
+            .await;
+        RemoteCompactionProbe {
+            v1,
+            v2,
+            probed_at,
+        }
+    }
+
+    async fn probe_remote_compaction_v1(
+        &self,
+        state: &Context,
+        base_url: &str,
+        api_key: &str,
+        model_id: &str,
+        channel_id: &str,
+    ) -> ProbeVerdict {
+        let _ = channel_id;
+        let url = match protocol::upstream_url(
+            base_url,
+            "/v1/responses/compact",
+            None,
+            "openai_responses",
+        ) {
+            Ok(url) => url,
+            Err(error) => return ProbeVerdict::Inconclusive(format!("url:{error}")),
+        };
+        let mut headers = match protocol::outbound_headers(
+            &axum::http::HeaderMap::new(),
+            "openai_responses",
+            api_key,
+        ) {
+            Ok(headers) => headers,
+            Err(error) => return ProbeVerdict::Inconclusive(format!("headers:{error}")),
+        };
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        let payload = match serde_json::to_vec(&remote_compaction::v1_probe_body(model_id)) {
+            Ok(payload) => payload,
+            Err(error) => return ProbeVerdict::Inconclusive(format!("body:{error}")),
+        };
+        let response = match state
+            .http
+            .send(crate::ports::UpstreamRequest {
+                url,
+                headers,
+                body: Some(bytes::Bytes::from(payload)),
+                connect_timeout: std::time::Duration::from_secs(10),
+                deadline: self.limits.probe_timeout,
+            })
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => return ProbeVerdict::Inconclusive(format!("transport:{error:?}")),
+        };
+        let status = response.status.as_u16();
+        let (body, _truncated) = match timeout(self.limits.probe_timeout, response.body.read_capped(self.limits.error_body_max)).await {
+            Ok(result) => result,
+            Err(_) => return ProbeVerdict::Inconclusive("timeout".into()),
+        };
+        if response.status.is_success() && remote_compaction::validate_v1_response(&body) {
+            ProbeVerdict::Supported
+        } else if matches!(status, 404 | 405 | 501) {
+            ProbeVerdict::Unsupported
+        } else {
+            ProbeVerdict::Inconclusive(format!("status:{status}"))
+        }
+    }
+
+    async fn probe_remote_compaction_v2(
+        &self,
+        state: &Context,
+        base_url: &str,
+        api_key: &str,
+        model_id: &str,
+        channel_id: &str,
+    ) -> ProbeVerdict {
+        let _ = channel_id;
+        let url = match protocol::upstream_url(base_url, "/v1/responses", None, "openai_responses")
+        {
+            Ok(url) => url,
+            Err(error) => return ProbeVerdict::Inconclusive(format!("url:{error}")),
+        };
+        let mut headers = match protocol::outbound_headers(
+            &axum::http::HeaderMap::new(),
+            "openai_responses",
+            api_key,
+        ) {
+            Ok(headers) => headers,
+            Err(error) => return ProbeVerdict::Inconclusive(format!("headers:{error}")),
+        };
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            axum::http::HeaderName::from_static("x-codex-beta-features"),
+            axum::http::HeaderValue::from_static("remote_compaction_v2"),
+        );
+        let payload = match serde_json::to_vec(&remote_compaction::v2_probe_body(model_id)) {
+            Ok(payload) => payload,
+            Err(error) => return ProbeVerdict::Inconclusive(format!("body:{error}")),
+        };
+        let response = match state
+            .http
+            .send(crate::ports::UpstreamRequest {
+                url,
+                headers,
+                body: Some(bytes::Bytes::from(payload)),
+                connect_timeout: std::time::Duration::from_secs(10),
+                deadline: self.limits.probe_timeout,
+            })
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => return ProbeVerdict::Inconclusive(format!("transport:{error:?}")),
+        };
+        let status = response.status.as_u16();
+        let (body, _truncated) = match timeout(
+            self.limits.probe_timeout,
+            response
+                .body
+                .read_capped((self.limits.error_body_max * 4).max(4 * 1024 * 1024)),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => return ProbeVerdict::Inconclusive("timeout".into()),
+        };
+        let mut validator = remote_compaction::CompactionV2Validator::new();
+        validator.feed(&body);
+        let verdict = validator.finish();
+        if response.status.is_success() && verdict.is_ok() {
+            ProbeVerdict::Supported
+        } else if matches!(status, 404 | 405 | 501) {
+            ProbeVerdict::Unsupported
+        } else if response.status.is_success()
+            && matches!(
+                verdict,
+                Err(remote_compaction::CompactionV2Error::NotCompaction)
+            )
+        {
+            ProbeVerdict::Unsupported
+        } else {
+            ProbeVerdict::Inconclusive(format!(
+                "status:{status};verdict:{:?}",
+                verdict.err().map(|error| error.to_string())
+            ))
+        }
     }
 
     /// Applies a discovery snapshot to the catalog in ONE transaction (P2-5):
@@ -533,6 +759,36 @@ impl DiscoveryService {
                     .bind(row_id)
                     .execute(&mut *tx)
                     .await?;
+            }
+        }
+
+        // Persist remote-compaction probe results in the same transaction.
+        // Inconclusive verdicts leave existing capability values untouched.
+        if let Some(probe) = &snapshot.remote_compaction {
+            let v1 = match &probe.v1 {
+                ProbeVerdict::Supported => Some(1i64),
+                ProbeVerdict::Unsupported => Some(2i64),
+                ProbeVerdict::Inconclusive(_) => None,
+            };
+            let v2 = match &probe.v2 {
+                ProbeVerdict::Supported => Some(1i64),
+                ProbeVerdict::Unsupported => Some(2i64),
+                ProbeVerdict::Inconclusive(_) => None,
+            };
+            if v1.is_some() || v2.is_some() {
+                sqlx::query(
+                    "UPDATE channel_protocols \
+                     SET remote_compaction_v1_support = COALESCE(?, remote_compaction_v1_support), \
+                         remote_compaction_v2_support = COALESCE(?, remote_compaction_v2_support), \
+                         remote_compaction_probed_at = ? \
+                     WHERE channel_id = ? AND protocol = 'openai_responses'",
+                )
+                .bind(v1)
+                .bind(v2)
+                .bind(&probe.probed_at)
+                .bind(channel_id)
+                .execute(&mut *tx)
+                .await?;
             }
         }
 

@@ -18,6 +18,7 @@ use futures_util::{Stream, StreamExt};
 use http::{HeaderMap, StatusCode};
 use url::Url;
 
+use crate::remote_compaction::CompactionMode;
 use crate::telemetry::Event;
 
 pub use crate::routing::{Candidate, MappingTarget, RoutableModel};
@@ -122,6 +123,17 @@ pub trait RouteRepository: Send + Sync {
         &self,
         protocol: &str,
         model: &str,
+        max_attempts: i64,
+    ) -> BoxFuture<'static, Result<Vec<Candidate>>>;
+
+    /// Ordered eligible candidates for a Codex remote-compaction request.
+    /// Known-unsupported candidates for `mode` are excluded before the
+    /// attempt limit is applied.
+    fn resolve_compaction_candidates(
+        &self,
+        protocol: &str,
+        model: &str,
+        mode: CompactionMode,
         max_attempts: i64,
     ) -> BoxFuture<'static, Result<Vec<Candidate>>>;
 

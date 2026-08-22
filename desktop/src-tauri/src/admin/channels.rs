@@ -40,8 +40,28 @@ pub(super) async fn load_channel(db: &Database, row_id: &str) -> Result<ChannelR
 }
 pub(super) async fn channel_json(db: &Database, row: ChannelRow) -> Result<Value, ApiError> {
     let protocols:Vec<String>=sqlx::query_scalar("SELECT protocol FROM channel_protocols WHERE channel_id=? ORDER BY CASE protocol WHEN 'openai_compatible' THEN 0 WHEN 'openai_responses' THEN 1 WHEN 'claude' THEN 2 ELSE 3 END").bind(&row.id).fetch_all(db.pool()).await?;
+    let mut remote_compaction = json!({});
+    let compaction_rows: Vec<(String, i64, i64, Option<String>)> = sqlx::query_as(
+        "SELECT protocol, remote_compaction_v1_support, remote_compaction_v2_support, remote_compaction_probed_at \
+         FROM channel_protocols WHERE channel_id=? AND protocol='openai_responses'",
+    )
+    .bind(&row.id)
+    .fetch_all(db.pool())
+    .await?;
+    for (protocol, v1, v2, probed_at) in compaction_rows {
+        let support = |value: i64| match value {
+            1 => "supported",
+            2 => "unsupported",
+            _ => "unknown",
+        };
+        remote_compaction[protocol] = json!({
+            "v1": support(v1),
+            "v2": support(v2),
+            "probed_at": probed_at,
+        });
+    }
     Ok(
-        json!({"id":row.id,"provider_id":row.provider_id,"provider_name":row.provider_name,"name":row.name,"protocol":row.protocol,"protocols":protocols,"manual_enabled":row.manual_enabled,"health_check_model_id":row.health_check_model_id,"has_api_key":!row.api_key_encrypted.is_empty(),"api_key_hint":row.api_key_hint,"health":{"state":row.state.unwrap_or_else(||"active".into()),"consecutive_failures":row.consecutive_failures.unwrap_or(0),"disabled_until":row.disabled_until,"last_success_at":row.last_success_at,"last_failure_at":row.last_failure_at,"last_error_kind":row.last_error_kind,"last_status_code":row.last_status_code},"model_count":row.model_count,"created_at":row.created_at,"updated_at":row.updated_at}),
+        json!({"id":row.id,"provider_id":row.provider_id,"provider_name":row.provider_name,"name":row.name,"protocol":row.protocol,"protocols":protocols,"manual_enabled":row.manual_enabled,"health_check_model_id":row.health_check_model_id,"has_api_key":!row.api_key_encrypted.is_empty(),"api_key_hint":row.api_key_hint,"health":{"state":row.state.unwrap_or_else(||"active".into()),"consecutive_failures":row.consecutive_failures.unwrap_or(0),"disabled_until":row.disabled_until,"last_success_at":row.last_success_at,"last_failure_at":row.last_failure_at,"last_error_kind":row.last_error_kind,"last_status_code":row.last_status_code},"model_count":row.model_count,"remote_compaction":remote_compaction,"created_at":row.created_at,"updated_at":row.updated_at}),
     )
 }
 #[derive(Deserialize)]

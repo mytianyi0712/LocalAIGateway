@@ -37,7 +37,8 @@
   3. 映射仅通过独立入口 `/codex` 提供服务，不影响其他应用调用常规 `/v1/*` 端点：
      - `GET /codex`：接入信息（端点清单与配置提示）
      - `GET /codex/v1/models`、`GET /codex/v1/responses/models`：Codex 探测模型目录（OpenAI 格式）
-     - `POST /codex/v1/responses`：模型请求入口，自动转换请求为上游协议、转发并故障转移，再把响应转换回 OpenAI Responses 格式（流式响应逐事件转换）
+     - `POST /codex/v1/responses`：模型请求入口，自动转换请求为上游协议、转发并故障转移，再把响应转换回 OpenAI Responses 格式（流式响应逐事件转换）；支持 `input` 末尾带 `compaction_trigger` 的 V2 远程压缩请求
+     - `POST /codex/v1/responses/compact`：Codex V1 远程压缩专属端点（仅 `openai_responses` 上游）
   4. Codex CLI 接入：在 `~/.codex/config.toml` 中设置（Codex 会向 base URL 追加 `/responses` 与 `/models`，因此必须带 `/v1` 前缀）：
      ```toml
      openai_base_url = "http://<网关地址>:3000/codex/v1"
@@ -54,6 +55,7 @@
      env_key = "LOCAL_GATEWAY_KEY"
      supports_websockets = false
      ```
+  5. Codex 远程压缩（Remote Compaction）：仅映射到 `openai_responses` 上游时可用。模型探测会自动探测渠道的 V1/V2 能力并原子落库；压缩请求在向客户端输出任何字节前完成校验，并按渠道优先级故障转移。管理端渠道列表会显示各渠道的 V1/V2 能力徽标。
 
 ### 控制台操作示意
 

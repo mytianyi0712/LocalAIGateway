@@ -249,6 +249,18 @@ function cacheHitCard(provider, metrics) {
   </article>`;
 }
 
+function remoteCompactionBadge(channel) {
+  const entry = (channel.remote_compaction || {})['openai_responses'];
+  if (!entry) return '';
+  const parts = [];
+  if (entry.v1 === 'supported') parts.push('V1');
+  if (entry.v2 === 'supported') parts.push('V2');
+  if (!parts.length) {
+    parts.push(entry.v1 === 'unsupported' && entry.v2 === 'unsupported' ? '不支持压缩' : '未知');
+  }
+  return `<span class="subtle-text">${escapeHtml(parts.join('/'))}</span>`;
+}
+
 function channelRows(channels, includeProvider = true) {
   return channels.map((channel) => {
     const health = healthInfo(channel);
@@ -436,7 +448,7 @@ function renderProvidersMarkup() {
     return `<tr>
       <td>${escapeHtml(channel.provider_name || '-')}</td>
       <td>${escapeHtml(channel.name)}</td>
-      <td>${protocols(channel.protocols || [channel.protocol])}</td>
+      <td>${protocols(channel.protocols || [channel.protocol])} ${remoteCompactionBadge(channel)}</td>
       <td><span class="mono">${escapeHtml(channel.api_key_hint || '-')}</span></td>
       <td class="align-right">${number(channel.model_count)}</td>
       <td>${statusDot(health.label, health.statusClass)}</td>

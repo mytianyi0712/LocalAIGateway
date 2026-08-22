@@ -100,6 +100,10 @@ pub async fn build(config: AppConfig) -> Result<GatewayRuntime> {
             "/v1/responses",
             axum::routing::post(crate::proxy::responses),
         )
+        .route(
+            "/v1/responses/compact",
+            axum::routing::post(crate::proxy::responses_compact),
+        )
         .route("/v1/messages", axum::routing::post(crate::proxy::claude))
         .route(
             "/v1beta/models/{*action}",
@@ -127,6 +131,10 @@ pub async fn build(config: AppConfig) -> Result<GatewayRuntime> {
         .route(
             "/codex/v1/responses",
             axum::routing::post(crate::proxy::codex),
+        )
+        .route(
+            "/codex/v1/responses/compact",
+            axum::routing::post(crate::proxy::codex_compact),
         )
         .fallback(assets::serve)
         .layer(TraceLayer::new_for_http())
