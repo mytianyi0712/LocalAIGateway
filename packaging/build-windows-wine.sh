@@ -86,6 +86,11 @@ PYTHON
   fi
   args+=("$arg")
 done
+# wine cannot open a CWD containing non-ASCII bytes (e.g. a repo path with
+# CJK characters), and refuses to run when the CWD is not writable by the
+# current user (e.g. /tmp owned by root); start it from the user home so the
+# prefix loads and the tools dir is reachable.
+cd "${HOME}"
 exec wine "${NSIS_EXE:?NSIS_EXE is not set}" "${args[@]}"
 WRAPPER
 chmod +x "${TOOLS_DIR}/bin/makensis"
