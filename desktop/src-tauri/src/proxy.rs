@@ -2489,11 +2489,13 @@ async fn compaction_error_attempt(
         update_compaction_capability(db, &env.candidate.channel_id, mode, false).await;
     }
 
-    let (kind, countable) = if capability_rejected {
-        ("remote_compaction_unsupported", false)
+    // Remote-compaction attempts never participate in the channel circuit
+    // breaker: the gateway may deliberately fall through unsupported
+    // compaction modes without penalizing the provider's ordinary traffic.
+    let kind = if capability_rejected {
+        "remote_compaction_unsupported"
     } else {
-        let (kind, countable) = status_kind(status);
-        (kind, countable)
+        status_kind(status).0
     };
     let finished = env.clock.now_utc();
     AttemptFinalizer::new(
@@ -2519,7 +2521,7 @@ async fn compaction_error_attempt(
         raw.len() as i64,
         Some(env.upstream_protocol.into()),
         Some(env.upstream_model.into()),
-        countable,
+        false,
     );
     CompactionResult::FailOverError(
         status,
@@ -2570,7 +2572,7 @@ async fn compaction_v1_success(
                 buffered_cap as i64,
                 Some(env.upstream_protocol.into()),
                 Some(env.upstream_model.into()),
-                true,
+                false,
             );
             return CompactionResult::FailOver(None);
         }
@@ -2599,7 +2601,7 @@ async fn compaction_v1_success(
                 0,
                 Some(env.upstream_protocol.into()),
                 Some(env.upstream_model.into()),
-                true,
+                false,
             );
             return CompactionResult::FailOver(Some(kind));
         }
@@ -2634,7 +2636,7 @@ async fn compaction_v1_success(
             decoded.len() as i64,
             Some(env.upstream_protocol.into()),
             Some(env.upstream_model.into()),
-            true,
+            false,
         );
         return CompactionResult::FailOver(None);
     }
@@ -2719,7 +2721,7 @@ async fn compaction_v2_success(
                 buffered_cap as i64,
                 Some(env.upstream_protocol.into()),
                 Some(env.upstream_model.into()),
-                true,
+                false,
             );
             return CompactionResult::FailOver(None);
         }
@@ -2748,7 +2750,7 @@ async fn compaction_v2_success(
                 0,
                 Some(env.upstream_protocol.into()),
                 Some(env.upstream_model.into()),
-                true,
+                false,
             );
             return CompactionResult::FailOver(Some(kind));
         }
@@ -2790,7 +2792,7 @@ async fn compaction_v2_success(
                 AttemptOutcome::UpstreamError,
                 Some("upstream_error".into()),
                 502,
-                true,
+                false,
                 Usage::default(),
             )
         }
@@ -2816,7 +2818,7 @@ async fn compaction_v2_success(
                 AttemptOutcome::GatewayError,
                 Some("upstream_compaction_format_error".into()),
                 502,
-                true,
+                false,
                 Usage::default(),
             )
         }
@@ -2902,7 +2904,7 @@ fn decode_mapped_response(
                 raw.len() as i64,
                 Some(env.upstream_protocol.into()),
                 Some(env.upstream_model.into()),
-                true,
+                false,
             );
             Err(CompactionResult::FailOver(None))
         }
@@ -2931,7 +2933,7 @@ fn decode_mapped_response(
                 raw.len() as i64,
                 Some(env.upstream_protocol.into()),
                 Some(env.upstream_model.into()),
-                true,
+                false,
             );
             Err(CompactionResult::FailOver(None))
         }
@@ -3111,12 +3113,15 @@ impl ProxyService {
         for (index, candidate) in candidates.iter().enumerate() {
             attempts = index as i64 + 1;
             // Entering a backup candidate means the previous one failed:
-            // alert the user. The notifier queues and coalesces the notice
-            // (1s window, P2-1) — this path never blocks. `last_transport_kind`
-            // and `last_error` are mutually exclusive by construction (each
-            // failure path clears the other), so the surviving one describes
-            // the previous candidate's failure.
-            if index > 0 {
+            // alert the user. Remote-compaction failover is silent by design
+            // (P2-remote-compaction): the Codex client itself retries/falls
+            // back through the gateway, so we do not send a desktop notice.
+            // The notifier queues and coalesces the notice (1s window, P2-1) —
+            // this path never blocks. `last_transport_kind` and `last_error`
+            // are mutually exclusive by construction (each failure path clears
+            // the other), so the surviving one describes the previous
+            // candidate's failure.
+            if index > 0 && compaction_mode.is_none() {
                 let error_kind = last_transport_kind
                     .map(|kind| kind.as_str().to_owned())
                     .or_else(|| {
@@ -3164,7 +3169,7 @@ impl ProxyService {
                         0,
                         Some(upstream_protocol.into()),
                         Some(upstream_model.into()),
-                        true,
+                        compaction_mode.is_none(),
                     );
                     let _ = error;
                     continue;
@@ -3261,7 +3266,7 @@ impl ProxyService {
                         0,
                         Some(upstream_protocol.into()),
                         Some(upstream_model.into()),
-                        true,
+                        compaction_mode.is_none(),
                     );
                     continue;
                 }
@@ -3292,7 +3297,7 @@ impl ProxyService {
                         0,
                         Some(upstream_protocol.into()),
                         Some(upstream_model.into()),
-                        true,
+                        compaction_mode.is_none(),
                     );
                     continue;
                 }
@@ -3323,7 +3328,7 @@ impl ProxyService {
                         0,
                         Some(upstream_protocol.into()),
                         Some(upstream_model.into()),
-                        true,
+                        compaction_mode.is_none(),
                     );
                     continue;
                 }

@@ -251,14 +251,15 @@ function cacheHitCard(provider, metrics) {
 
 function remoteCompactionBadge(channel) {
   const entry = (channel.remote_compaction || {})['openai_responses'];
-  if (!entry) return '';
-  const parts = [];
-  if (entry.v1 === 'supported') parts.push('V1');
-  if (entry.v2 === 'supported') parts.push('V2');
-  if (!parts.length) {
-    parts.push(entry.v1 === 'unsupported' && entry.v2 === 'unsupported' ? '不支持压缩' : '未知');
-  }
-  return `<span class="subtle-text">${escapeHtml(parts.join('/'))}</span>`;
+  if (!entry) return '<span class="subtle-text">-</span>';
+  const status = [];
+  if (entry.v1 === 'supported') status.push('V1 支持');
+  else if (entry.v1 === 'unsupported') status.push('V1 不支持');
+  else status.push('V1 未探测');
+  if (entry.v2 === 'supported') status.push('V2 支持');
+  else if (entry.v2 === 'unsupported') status.push('V2 不支持');
+  else status.push('V2 未探测');
+  return `<span class="subtle-text">${escapeHtml(status.join(' / '))}</span>`;
 }
 
 function channelRows(channels, includeProvider = true) {
@@ -448,7 +449,8 @@ function renderProvidersMarkup() {
     return `<tr>
       <td>${escapeHtml(channel.provider_name || '-')}</td>
       <td>${escapeHtml(channel.name)}</td>
-      <td>${protocols(channel.protocols || [channel.protocol])} ${remoteCompactionBadge(channel)}</td>
+      <td>${protocols(channel.protocols || [channel.protocol])}</td>
+      <td>${remoteCompactionBadge(channel)}</td>
       <td><span class="mono">${escapeHtml(channel.api_key_hint || '-')}</span></td>
       <td class="align-right">${number(channel.model_count)}</td>
       <td>${statusDot(health.label, health.statusClass)}</td>
@@ -465,7 +467,7 @@ function renderProvidersMarkup() {
   return `<div class="page-stack">
     ${toolbar('上游资源', '供应商只保存名称与 API 根地址，渠道承载账号和请求格式', `${button({ action: 'refresh-providers', label: '刷新', iconName: 'refresh-cw' })}${button({ action: 'open-provider', label: '添加供应商', iconName: 'plus', primary: true })}${button({ action: 'open-channel', label: '添加渠道', iconName: 'network', disabled: !providers.length })}`)}
     ${panel('供应商', '仅保存名称与 Base URL', `<div class="section-body-flush">${providers.length ? `<div class="table-scroll"><table class="data-table provider-table"><thead><tr><th>名称</th><th>Base URL</th><th class="align-right">渠道</th><th class="action-cell">操作</th></tr></thead><tbody>${providerRows}</tbody></table></div>` : emptyState('尚未创建供应商', '添加供应商后即可配置一个或多个渠道。', 'network')}</div>`) }
-    ${panel('账号与渠道', '路由与熔断的最小单位', `<div class="section-body-flush">${channels.length ? `<div class="table-scroll"><table class="data-table channels-table"><thead><tr><th>供应商</th><th>渠道</th><th>请求格式</th><th>密钥</th><th class="align-right">模型</th><th>健康</th><th>启用</th><th class="action-cell">操作</th></tr></thead><tbody>${channelRowsHtml}</tbody></table></div>` : emptyState('尚未配置渠道', '请在供应商下添加渠道，并选择上游支持的请求格式。', 'network')}</div>`) }
+    ${panel('账号与渠道', '路由与熔断的最小单位', `<div class="section-body-flush">${channels.length ? `<div class="table-scroll"><table class="data-table channels-table"><thead><tr><th>供应商</th><th>渠道</th><th>请求格式</th><th>远程压缩</th><th>密钥</th><th class="align-right">模型</th><th>健康</th><th>启用</th><th class="action-cell">操作</th></tr></thead><tbody>${channelRowsHtml}</tbody></table></div>` : emptyState('尚未配置渠道', '请在供应商下添加渠道，并选择上游支持的请求格式。', 'network')}</div>`) }
   </div>`;
 }
 
@@ -484,6 +486,12 @@ function providerForm(editing = null) {
 function channelForm(providerId = '', editing = null) {
   const selected = new Set(editing?.protocols || (editing?.protocol ? [editing.protocol] : ['openai_compatible']));
   const options = state.providers.map((provider) => `<option value="${escapeAttr(provider.id)}" ${provider.id === (editing?.provider_id || providerId) ? 'selected' : ''}>${escapeHtml(provider.name)}</option>`).join('');
+  const compactionStatus = editing
+    ? remoteCompactionBadge(editing)
+    : '<span class="subtle-text">保存并探测后自动检测</span>';
+  const compactionField = selected.has('openai_responses')
+    ? `<div class="field"><label for="channel-compaction">Codex 远程压缩</label><div id="channel-compaction">${compactionStatus}</div><span class="field-help">模型探测时会自动检测渠道的 V1/V2 远程压缩能力；远程压缩只作用于 Codex 映射入口，无需单独配置。</span></div>`
+    : '';
   const healthModels = editing
     ? state.channelModels.filter((model) => model.channel_id === editing.id && model.available && (model.protocols || [model.protocol]).includes(editing.protocol))
     : [];
@@ -495,6 +503,7 @@ function channelForm(providerId = '', editing = null) {
       <div class="field"><label for="channel-provider">供应商</label><select class="select" id="channel-provider" name="provider_id" required ${editing ? 'disabled' : ''}><option value="">请选择供应商</option>${options}</select>${editing ? `<input type="hidden" name="provider_id" value="${escapeAttr(editing.provider_id)}">` : ''}</div>
       <div class="field"><label for="channel-name">渠道名称</label><input class="input" id="channel-name" name="name" required maxlength="120" value="${escapeAttr(editing?.name || '')}" autocomplete="off"></div>
       <fieldset class="protocol-fieldset"><legend class="fieldset-title">支持的请求格式</legend><div class="protocol-options">${protocolOptions().map((protocol) => `<label class="protocol-option"><input type="checkbox" name="protocols" value="${protocol}" ${selected.has(protocol) ? 'checked' : ''}>${escapeHtml(protocol)}</label>`).join('')}</div></fieldset>
+      ${compactionField}
       <div class="field"><label for="channel-api-key">${editing ? 'API Key（留空则保持不变）' : 'API Key'}</label><input class="input" id="channel-api-key" name="api_key" type="password" ${editing ? '' : 'required'} autocomplete="new-password" placeholder="${escapeAttr(editing?.api_key_hint || '')}"></div>
       <div class="field"><label for="channel-health-model">健康探测模型</label><select class="select" id="channel-health-model" name="health_check_model_id"><option value="" ${editing?.health_check_model_id ? '' : 'selected'}>自动（模型列表第一个）</option>${healthModelOptions}</select><span class="field-help">熔断到期或手动探测时使用；自动模式选择该渠道模型列表中的第一个可用模型。</span></div>
     </form>`,
