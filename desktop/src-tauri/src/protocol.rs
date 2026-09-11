@@ -635,6 +635,56 @@ pub fn outbound_headers(inbound: &HeaderMap, protocol: &str, api_key: &str) -> R
     Ok(headers)
 }
 
+/// Session header OpenCode Zen/Go requires on every request since 2026-09
+/// (missing it makes the upstream reject the request before routing).
+pub const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
+
+/// Whether `base_url` points at an OpenCode Zen/Go upstream. Zen is
+/// identified by its canonical host (`opencode.ai`) or by a `zen` path
+/// segment (`/zen/go`, `/zen/v1`), so relays that keep the canonical path
+/// are covered as well.
+pub fn requires_opencode_session(base_url: &str) -> bool {
+    let Ok(url) = Url::parse(base_url) else {
+        return false;
+    };
+    let host_matches = url.host_str().is_some_and(|host| {
+        let host = host.to_ascii_lowercase();
+        host == "opencode.ai" || host.ends_with(".opencode.ai")
+    });
+    let path_matches = url
+        .path()
+        .split('/')
+        .any(|segment| segment.eq_ignore_ascii_case("zen"));
+    host_matches || path_matches
+}
+
+/// Ensures [`OPENCODE_SESSION_HEADER`] is present for OpenCode upstreams.
+/// A non-empty value forwarded from the client always wins (duplicates are
+/// collapsed to one); the gateway's stable fallback is only used when the
+/// client supplied nothing usable.
+pub fn apply_opencode_session(
+    headers: &mut HeaderMap,
+    base_url: &str,
+    session_id: &str,
+) -> Result<()> {
+    if session_id.is_empty() || !requires_opencode_session(base_url) {
+        return Ok(());
+    }
+    let name = HeaderName::from_static(OPENCODE_SESSION_HEADER);
+    let supplied: Option<String> = headers
+        .get_all(&name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(|value| value.trim().to_owned())
+        .find(|value| !value.is_empty());
+    let value = match supplied {
+        Some(value) => value,
+        None => session_id.to_owned(),
+    };
+    headers.insert(name, HeaderValue::from_str(&value)?);
+    Ok(())
+}
+
 pub fn response_headers(inbound: &reqwest::header::HeaderMap) -> HeaderMap {
     let mut headers = HeaderMap::new();
     for (name, value) in inbound {
@@ -723,4 +773,67 @@ pub fn normalize_usage(protocol: &str, usage: &Value) -> Usage {
     ProtocolId::parse(protocol)
         .map(|id| id.adapter().normalize_usage(usage))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opencode_session_required_by_host_or_zen_path() {
+        assert!(requires_opencode_session("https://opencode.ai/zen/go"));
+        assert!(requires_opencode_session("https://api.opencode.ai/zen/v1"));
+        assert!(requires_opencode_session("https://opencode.ai"));
+        assert!(requires_opencode_session("http://127.0.0.1:8080/zen/go"));
+        assert!(!requires_opencode_session(
+            "https://opencode.ai.evil.example/v1"
+        ));
+        assert!(!requires_opencode_session("http://localhost/zenix"));
+        assert!(!requires_opencode_session("not a url"));
+    }
+
+    fn values(headers: &HeaderMap) -> Vec<String> {
+        headers
+            .get_all(OPENCODE_SESSION_HEADER)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn apply_opencode_session_keeps_client_value_and_collapses_duplicates() {
+        let mut headers = HeaderMap::new();
+        apply_opencode_session(&mut headers, "https://opencode.ai/zen/go", "install-1").unwrap();
+        assert_eq!(values(&headers), ["install-1"]);
+
+        // A valid client value wins, exactly once even when duplicated.
+        let mut headers = HeaderMap::new();
+        headers.append(
+            HeaderName::from_static(OPENCODE_SESSION_HEADER),
+            HeaderValue::from_static("client-1"),
+        );
+        headers.append(
+            HeaderName::from_static(OPENCODE_SESSION_HEADER),
+            HeaderValue::from_static("client-1"),
+        );
+        apply_opencode_session(&mut headers, "https://opencode.ai/zen/go", "install-1").unwrap();
+        assert_eq!(values(&headers), ["client-1"]);
+
+        // An empty client value is unusable: the fallback replaces it.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(OPENCODE_SESSION_HEADER),
+            HeaderValue::from_static(""),
+        );
+        apply_opencode_session(&mut headers, "https://opencode.ai/zen/go", "install-1").unwrap();
+        assert_eq!(values(&headers), ["install-1"]);
+
+        let mut headers = HeaderMap::new();
+        apply_opencode_session(&mut headers, "http://127.0.0.1:9999/v1", "install-1").unwrap();
+        assert!(values(&headers).is_empty());
+
+        let mut headers = HeaderMap::new();
+        apply_opencode_session(&mut headers, "https://opencode.ai", "").unwrap();
+        assert!(values(&headers).is_empty());
+    }
 }

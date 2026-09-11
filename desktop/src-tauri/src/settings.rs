@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Result, bail};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -423,6 +423,44 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
+/// Stable per-install id used as the fallback `x-opencode-session` value
+/// for OpenCode Zen/Go upstreams (see `protocol::apply_opencode_session`).
+/// Persisted once so the upstream keeps the same session across restarts;
+/// when the row cannot be read or written an ephemeral id keeps proxying
+/// alive, because the header only affects upstream routing/caching.
+pub async fn opencode_session_id(db: &Database) -> String {
+    match load_or_create_opencode_session_id(db).await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "opencode session id unavailable; using an ephemeral id");
+            uuid::Uuid::new_v4().to_string()
+        }
+    }
+}
+
+async fn load_or_create_opencode_session_id(db: &Database) -> Result<String> {
+    let existing: Option<String> = sqlx::query_scalar::<_, String>(
+        "SELECT CAST(value_json AS TEXT) FROM settings WHERE key='opencode_session_id'",
+    )
+    .fetch_optional(db.pool())
+    .await?
+    .and_then(|raw| serde_json::from_str::<String>(&raw).ok())
+    .filter(|value| HeaderValue::from_str(value).is_ok() && !value.is_empty());
+    if let Some(value) = existing {
+        return Ok(value);
+    }
+    let value = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO settings(key, value_json, updated_at) VALUES('opencode_session_id', ?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
+    )
+    .bind(serde_json::to_string(&value)?)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(db.pool())
+    .await?;
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -627,6 +665,55 @@ mod tests {
             .unwrap();
         let settings = runtime_settings(&state).await.unwrap();
         assert_eq!(settings.failure_threshold, 3, "preset cache must not leak in");
+        let _ = dir;
+    }
+
+    /// The OpenCode session id must be stable across calls and persisted,
+    /// so upstream sessions survive gateway restarts.
+    #[tokio::test]
+    async fn opencode_session_id_is_stable_and_persisted() {
+        let (state, dir) = test_state().await;
+        let first = opencode_session_id(&state.db).await;
+        assert!(!first.trim().is_empty());
+        let second = opencode_session_id(&state.db).await;
+        assert_eq!(first, second, "session id must be stable across calls");
+        let stored: String = sqlx::query_scalar(
+            "SELECT CAST(value_json AS TEXT) FROM settings WHERE key='opencode_session_id'",
+        )
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(stored, format!("\"{first}\""), "row must hold the id");
+        let _ = dir;
+    }
+
+    /// A malformed stored row is replaced instead of being forwarded as an
+    /// invalid header value.
+    #[tokio::test]
+    async fn opencode_session_id_replaces_invalid_row() {
+        let (state, dir) = test_state().await;
+        let time = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO settings(key, value_json, updated_at) VALUES('opencode_session_id', ?, ?)",
+        )
+        .bind(json!(123).to_string())
+        .bind(&time)
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+        let value = opencode_session_id(&state.db).await;
+        assert!(!value.is_empty());
+        let stored: String = sqlx::query_scalar(
+            "SELECT CAST(value_json AS TEXT) FROM settings WHERE key='opencode_session_id'",
+        )
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            stored,
+            format!("\"{value}\""),
+            "invalid row must be replaced"
+        );
         let _ = dir;
     }
 }

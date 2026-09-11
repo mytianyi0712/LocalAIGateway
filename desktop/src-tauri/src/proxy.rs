@@ -3104,6 +3104,9 @@ impl ProxyService {
         // was ever received) so the final gateway error can distinguish 504
         // timeouts from 502 unreachability.
         let mut last_transport_kind: Option<TransportFailure> = None;
+        // Lazily resolved fallback for the OpenCode Zen/Go session header;
+        // only requests routed to such an upstream ever read it.
+        let mut opencode_session_id: Option<String> = None;
         let mut attempts = 0i64;
         for (index, candidate) in candidates.iter().enumerate() {
             attempts = index as i64 + 1;
@@ -3193,15 +3196,28 @@ impl ProxyService {
                     continue;
                 }
             };
-            let outbound = match protocol::outbound_headers(&headers, upstream_protocol, &api_key) {
-                Ok(value) => value,
-                Err(error) => {
-                    last_error = None;
-                    last_transport_kind = Some(TransportFailure::ConnectionReset);
-                    let _ = error;
-                    continue;
+            let mut outbound =
+                match protocol::outbound_headers(&headers, upstream_protocol, &api_key) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        last_error = None;
+                        last_transport_kind = Some(TransportFailure::ConnectionReset);
+                        let _ = error;
+                        continue;
+                    }
+                };
+            if protocol::requires_opencode_session(&candidate.base_url) {
+                if opencode_session_id.is_none() {
+                    opencode_session_id =
+                        Some(crate::settings::opencode_session_id(&self.db).await);
                 }
-            };
+                let session_id = opencode_session_id.as_deref().unwrap_or_default();
+                if let Err(error) =
+                    protocol::apply_opencode_session(&mut outbound, &candidate.base_url, session_id)
+                {
+                    tracing::warn!(%error, "opencode session header skipped");
+                }
+            }
             // P2-1: the upstream port applies connect timeout and the send
             // deadline; the classified error decides the transport kind.
             let response = match self
@@ -6119,6 +6135,215 @@ mod tests {
         // No failover: the upstream's 500 error response is passed through.
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(gateway.notifier.notices().is_empty());
+        gateway.shutdown().await;
+    }
+
+    /// Raw HTTP/1.1 upstream that reports the captured request head to the
+    /// test and answers with a minimal OpenAI completion.
+    async fn spawn_upstream_capturing_head() -> (u16, tokio::sync::mpsc::UnboundedReceiver<String>)
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let mut total = 0usize;
+                loop {
+                    match stream.read(&mut buf[total..]).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            total += n;
+                            if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let _ = tx.send(String::from_utf8_lossy(&buf[..total]).into_owned());
+                let response = json_ok_upstream(
+                    r#"{"choices":[{"finish_reason":"stop","message":{"content":"OK"}}]}"#,
+                );
+                let _ = stream.write_all(&response).await;
+            }
+        });
+        (port, rx)
+    }
+
+    fn session_header_value(head: &str) -> Option<String> {
+        head.lines()
+            .find(|line| {
+                line.to_ascii_lowercase()
+                    .starts_with(&format!("{}:", protocol::OPENCODE_SESSION_HEADER))
+            })
+            .and_then(|line| line.split_once(':'))
+            .map(|(_, value)| value.trim().to_owned())
+    }
+
+    fn session_header_count(head: &str) -> usize {
+        head.lines()
+            .filter(|line| {
+                line.to_ascii_lowercase()
+                    .starts_with(&format!("{}:", protocol::OPENCODE_SESSION_HEADER))
+            })
+            .count()
+    }
+
+    /// OpenCode Zen/Go upstreams reject requests without a session header:
+    /// the gateway must inject its persisted install id when the client did
+    /// not supply one.
+    #[tokio::test]
+    async fn opencode_upstream_receives_injected_session_header() {
+        let (port, mut heads) = spawn_upstream_capturing_head().await;
+        let gateway = test_gateway(port, &[]).await;
+        sqlx::query("UPDATE providers SET base_url=? WHERE id='prov-1'")
+            .bind(format!("http://127.0.0.1:{port}/zen/go"))
+            .execute(gateway.db.pool())
+            .await
+            .unwrap();
+
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request(false), "openai_compatible", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let head = tokio::time::timeout(Duration::from_secs(5), heads.recv())
+            .await
+            .expect("captured upstream request timed out")
+            .expect("captured upstream request missing");
+        let session = session_header_value(&head).expect("x-opencode-session must be injected");
+        assert!(!session.is_empty(), "injected session id must not be empty");
+        assert_eq!(session_header_count(&head), 1, "exactly one session header");
+        let stored: String = sqlx::query_scalar(
+            "SELECT CAST(value_json AS TEXT) FROM settings WHERE key='opencode_session_id'",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            session,
+            stored.trim_matches('"'),
+            "injected value must be the persisted install id"
+        );
+        gateway.shutdown().await;
+    }
+
+    /// Non-OpenCode upstreams must stay untouched: the session header is
+    /// specific to opencode.ai/zen endpoints.
+    #[tokio::test]
+    async fn non_opencode_upstream_has_no_session_header() {
+        let (port, mut heads) = spawn_upstream_capturing_head().await;
+        let gateway = test_gateway(port, &[]).await;
+
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request(false), "openai_compatible", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let head = tokio::time::timeout(Duration::from_secs(5), heads.recv())
+            .await
+            .expect("captured upstream request timed out")
+            .expect("captured upstream request missing");
+        assert!(
+            session_header_value(&head).is_none(),
+            "plain upstreams must not receive x-opencode-session: {head}"
+        );
+        gateway.shutdown().await;
+    }
+
+    /// A session header supplied by the client always wins over the
+    /// gateway's own fallback id.
+    #[tokio::test]
+    async fn client_session_header_is_forwarded_unchanged() {
+        let (port, mut heads) = spawn_upstream_capturing_head().await;
+        let gateway = test_gateway(port, &[]).await;
+        sqlx::query("UPDATE providers SET base_url=? WHERE id='prov-1'")
+            .bind(format!("http://127.0.0.1:{port}/zen/go"))
+            .execute(gateway.db.pool())
+            .await
+            .unwrap();
+
+        let body =
+            r#"{"model":"test-model","stream":false,"messages":[{"role":"user","content":"hi"}]}"#;
+        let request = axum::extract::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header(protocol::OPENCODE_SESSION_HEADER, "client-session-42")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let response = gateway
+            .state
+            .proxy
+            .proxy(request, "openai_compatible", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let head = tokio::time::timeout(Duration::from_secs(5), heads.recv())
+            .await
+            .expect("captured upstream request timed out")
+            .expect("captured upstream request missing");
+        assert_eq!(
+            session_header_value(&head).as_deref(),
+            Some("client-session-42"),
+            "client-supplied session id must be forwarded unchanged"
+        );
+        assert_eq!(
+            session_header_count(&head),
+            1,
+            "client-supplied header must not be duplicated"
+        );
+        gateway.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn opencode_client_headers_pass_through_non_opencode_upstreams() {
+        let (port, mut heads) = spawn_upstream_capturing_head().await;
+        let gateway = test_gateway(port, &[]).await;
+
+        let body =
+            r#"{"model":"test-model","stream":false,"messages":[{"role":"user","content":"hi"}]}"#;
+        let request = axum::extract::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("x-opencode-client", "cli")
+            .header("x-opencode-project", "project-7")
+            .header("x-opencode-request", "request-9")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let response = gateway
+            .state
+            .proxy
+            .proxy(request, "openai_compatible", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let head = tokio::time::timeout(Duration::from_secs(5), heads.recv())
+            .await
+            .expect("captured upstream request timed out")
+            .expect("captured upstream request missing");
+        for (name, value) in [
+            ("x-opencode-client", "cli"),
+            ("x-opencode-project", "project-7"),
+            ("x-opencode-request", "request-9"),
+        ] {
+            let forwarded = head.lines().find_map(|line| {
+                let (header, found) = line.split_once(':')?;
+                if header.eq_ignore_ascii_case(name) {
+                    Some(found.trim().to_owned())
+                } else {
+                    None
+                }
+            });
+            assert_eq!(
+                forwarded.as_deref(),
+                Some(value),
+                "{name} must pass through unchanged"
+            );
+        }
+        assert!(session_header_value(&head).is_none());
         gateway.shutdown().await;
     }
 }

@@ -167,6 +167,10 @@ async fn probe(state: &Context, channel_id: &str, cancel: CancellationToken) -> 
         let url = protocol::upstream_url(&base, &path, None, protocol_name)?;
         let mut headers =
             protocol::outbound_headers(&axum::http::HeaderMap::new(), protocol_name, &key)?;
+        if protocol::requires_opencode_session(&base) {
+            let session_id = settings::opencode_session_id(&state.db).await;
+            protocol::apply_opencode_session(&mut headers, &base, &session_id)?;
+        }
         // Probes originate a JSON body without inbound headers to copy;
         // several upstreams (e.g. opencode.ai) reject the request with a 500
         // when Content-Type is missing.

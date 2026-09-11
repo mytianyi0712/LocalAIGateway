@@ -231,13 +231,21 @@ impl DiscoveryService {
         )?;
         let mut status_code: i64 = 0;
         let mut visited: HashSet<String> = HashSet::new();
+        let opencode_session = if protocol::requires_opencode_session(base_url) {
+            Some(settings::opencode_session_id(&state.db).await)
+        } else {
+            None
+        };
         for _ in 0..self.limits.discovery_max_pages {
             if visited.contains(url.as_str()) {
                 break;
             }
             visited.insert(url.to_string());
-            let headers =
+            let mut headers =
                 protocol::outbound_headers(&axum::http::HeaderMap::new(), protocol_name, api_key)?;
+            if let Some(session_id) = &opencode_session {
+                protocol::apply_opencode_session(&mut headers, base_url, session_id)?;
+            }
             let response = state
                 .http
                 .send(crate::ports::UpstreamRequest {
@@ -303,6 +311,11 @@ impl DiscoveryService {
         // Group protocols sharing one discovery URL + auth (the openai family
         // shares /v1/models with the same Bearer header, mirroring Python).
         let mut groups: Vec<(String, String, Vec<String>)> = Vec::new();
+        let opencode_session = if protocol::requires_opencode_session(&base_url) {
+            Some(settings::opencode_session_id(&state.db).await)
+        } else {
+            None
+        };
         for protocol_name in &protocols {
             let url = protocol::upstream_url(
                 &base_url,
@@ -310,8 +323,11 @@ impl DiscoveryService {
                 None,
                 protocol_name,
             )?;
-            let headers =
+            let mut headers =
                 protocol::outbound_headers(&axum::http::HeaderMap::new(), protocol_name, &api_key)?;
+            if let Some(session_id) = &opencode_session {
+                protocol::apply_opencode_session(&mut headers, &base_url, session_id)?;
+            }
             let mut header_key = String::new();
             for (name, value) in headers.iter() {
                 header_key.push_str(&format!("{}:{};", name, value.to_str().unwrap_or("")));
@@ -462,6 +478,14 @@ impl DiscoveryService {
             Ok(headers) => headers,
             Err(error) => return ProbeVerdict::Inconclusive(format!("headers:{error}")),
         };
+        if protocol::requires_opencode_session(base_url) {
+            let session_id = settings::opencode_session_id(&state.db).await;
+            if let Err(error) =
+                protocol::apply_opencode_session(&mut headers, base_url, &session_id)
+            {
+                return ProbeVerdict::Inconclusive(format!("session:{error}"));
+            }
+        }
         headers.insert(
             axum::http::header::CONTENT_TYPE,
             axum::http::HeaderValue::from_static("application/json"),
@@ -520,6 +544,14 @@ impl DiscoveryService {
             Ok(headers) => headers,
             Err(error) => return ProbeVerdict::Inconclusive(format!("headers:{error}")),
         };
+        if protocol::requires_opencode_session(base_url) {
+            let session_id = settings::opencode_session_id(&state.db).await;
+            if let Err(error) =
+                protocol::apply_opencode_session(&mut headers, base_url, &session_id)
+            {
+                return ProbeVerdict::Inconclusive(format!("session:{error}"));
+            }
+        }
         headers.insert(
             axum::http::header::CONTENT_TYPE,
             axum::http::HeaderValue::from_static("application/json"),
