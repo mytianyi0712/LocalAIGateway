@@ -181,6 +181,83 @@ Base URL 保存前执行语法校验，并移除尾部 `/`、`/v1` 或 `/v1beta`
 }
 ```
 
+### 4.3 渠道余额查询
+
+渠道余额是**旁路能力，默认关闭**：没有保存过配置的渠道不会产生任何余额请求，创建渠道时也不做任何探测或猜测。用户必须在渠道表单中手动选择适配器并打开「启用查询」，才会进入手动刷新与每小时自动刷新。
+
+支持的适配器：`newapi`（New API / one-api 系）、`sub2api`、`opencode_go`（OpenCode Zen / Go）、`deepseek`、`custom`（任意自定义端点）。`opencode_go` 只返回滚动 / 周 / 月三个窗口的百分比，不返回金额；余额为不限额度时 `unlimited=true` 且 `remaining=null`。New API / Sub2API 只要响应里带有可解析的具体额度字段（New API 的 `total_granted` / `total_available`，Sub2API 的 `quota` / `remaining`，含用 `total_granted - total_used` 推算出的可用值），就优先返回具体数字——即使该数字为负（已用超额）或上游同时标记了 `unlimited_quota` / `unrestricted`。只有拿到的是 `total_granted < 0` 这类明确的无限哨兵、或完全没有任何额度数值时，才返回 `unlimited=true`。
+
+New API 有两种取数模式：只配置渠道 API Key（`sk-`）时查询 `/api/usage/token/`，得到的是**该令牌的额度**（部分站点令牌标记为不限额或已超额，并不等于账户余额）；在渠道「独立令牌」中填入面板生成的**系统访问令牌 / PAT** 后，改为查询 `/api/user/self`，按 `data.quota / 500000`（`used_quota`、`request_count` 一并返回）展示**账户可用余额**，即 CCTQ 等面板顶部显示的余额。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/channels/{channel_id}/balance` | 读取配置与最近快照；未配置时返回 `configured:false` |
+| `POST` | `/channels/{channel_id}/balance` | 立即查询一次并写入快照，恒返回 `200`（上游失败时 `status=error`） |
+| `PUT` | `/channels/{channel_id}/balance-config` | 保存适配器、启用开关、自定义模板与独立令牌 |
+| `DELETE` | `/channels/{channel_id}/balance-config` | 删除配置与快照，回到未启用 |
+| `POST` | `/balances/refresh` | 批量刷新所有 `enabled=true` 的渠道 |
+
+保存配置示例（自定义适配器）：
+
+```json
+{
+  "adapter": "custom",
+  "enabled": true,
+  "method": "GET",
+  "path": "/api/me/balance",
+  "auth": "bearer",
+  "headers": { "X-Token": "${token}" },
+  "body": null,
+  "mapping": {
+    "remaining": "$.data.remaining",
+    "currency": "$.data.unit",
+    "used": "$.data.used",
+    "total": "$.data.total",
+    "label": "$.data.label"
+  },
+  "token": null,
+  "clear_token": false
+}
+```
+
+校验（`422`）：适配器必须为五值之一；自定义方法仅 `GET` / `POST` / `PUT`；`custom` 必填路径；请求头 ≤ 8 条且名称合法；请求体 ≤ 16 KiB；映射路径 ≤ 256 字符且以 `$` 开头。路径规则：`https://…` 为绝对地址，`/xxx` 为站点根相对，`xxx` 相对渠道 Base URL 追加；请求头与请求体模板支持 `${api_key}`（渠道密钥）与 `${token}`（独立令牌，未配置时回退渠道密钥）。内置适配器使用预置路径。独立令牌只以密文保存，接口只返回 `has_token` 与 `token_hint`；删除令牌需显式 `clear_token: true`。
+
+查询响应示例（成功）：
+
+```json
+{
+  "channel_id": "channel-uuid",
+  "adapter": "newapi",
+  "status": "ok",
+  "remaining": 7.5,
+  "currency": "USD",
+  "used": 2.5,
+  "total": 10,
+  "unlimited": false,
+  "label": "默认令牌",
+  "windows": [],
+  "detail": {},
+  "error_kind": null,
+  "status_code": 200,
+  "duration_ms": 142,
+  "checked_at": "2026-08-04T02:00:00Z"
+}
+```
+
+`opencode_go` 的 `windows` 固定按 `5h / 周 / 月` 顺序返回，`remaining_percent = 100 - percent`：
+
+```json
+[{ "label": "5h", "used_percent": 37.5, "remaining_percent": 62.5, "resets_at": "2026-09-11T20:00:00Z" }]
+```
+
+上游失败（401 / 403 / 5xx / 超时 / 传输错误 / 非法 JSON）仍返回 `200`，快照写入 `status:"error"` 与稳定分类 `http_401`、`http_403`、`http_5xx`、`timeout`、`transport_error`、`invalid_payload`（其他非 2xx 状态为 `http_error`）。未配置适配器就手动查询返回 `422 balance_not_configured`，渠道不存在返回 `404`。批量刷新返回：
+
+```json
+{ "items": [], "total": 2, "ok": 1, "failed": 1 }
+```
+
+`failed` 统计的是查询后快照状态为 `error` 的渠道；后台刷新失败只写快照并静默继续，不影响代理路径。
+
 ## 5. 模型发现 API
 
 ### 5.1 面向客户端的模型目录

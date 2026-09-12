@@ -262,6 +262,115 @@ function remoteCompactionBadge(channel) {
   return `<span class="subtle-text">${escapeHtml(status.join(' / '))}</span>`;
 }
 
+const BALANCE_ADAPTERS = [
+  ['newapi', 'New API'],
+  ['sub2api', 'Sub2API'],
+  ['opencode_go', 'OpenCode Go'],
+  ['deepseek', 'DeepSeek'],
+  ['custom', '自定义'],
+];
+
+function balanceAmount(snapshot) {
+  const amount = Number(snapshot.remaining);
+  if (!Number.isFinite(amount)) return '-';
+  const negative = amount < 0;
+  const fixed = Math.abs(amount).toFixed(2);
+  const prefix = negative ? '-' : '';
+  if (snapshot.currency === 'USD') return `${prefix}$${fixed}`;
+  if (snapshot.currency) return `${prefix}${snapshot.currency} ${fixed}`;
+  return `${prefix}${fixed}`;
+}
+
+function balancePercent(value) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return '-';
+  return `${amount.toFixed(Number.isInteger(amount) ? 0 : 1)}%`;
+}
+
+function balanceSnapshotText(snapshot) {
+  if (!snapshot) return '<span class="subtle-text">尚未查询</span>';
+  const when = snapshot.checked_at ? `查询于 ${formatTime(snapshot.checked_at)}` : '';
+  if (snapshot.status === 'error') {
+    return `<span class="balance-error" title="${escapeAttr(snapshot.error_kind || 'error')}">查询失败：${escapeHtml(snapshot.error_kind || 'error')}</span><span class="subtle-text">${escapeHtml(when)}</span>`;
+  }
+  const parts = [];
+  if (snapshot.windows?.length) parts.push(snapshot.windows.map((window) => `${window.label} ${balancePercent(window.remaining_percent)}`).join(' / '));
+  else if (snapshot.remaining !== null && snapshot.remaining !== undefined) parts.push(balanceAmount(snapshot));
+  else if (snapshot.unlimited) parts.push('不限额');
+  if (snapshot.used !== null && snapshot.used !== undefined) parts.push(`已用 ${number(snapshot.used)}`);
+  if (snapshot.total !== null && snapshot.total !== undefined) parts.push(`总额 ${number(snapshot.total)}`);
+  const summary = parts.length ? escapeHtml(parts.join(' · ')) : '-';
+  return `<span class="mono">${summary}</span><span class="subtle-text">${escapeHtml(when)}</span>`;
+}
+
+function balanceCellContent(channel) {
+  const balance = channel.balance || {};
+  if (!balance.configured) return '<span class="subtle-text">未启用</span>';
+  const snapshot = balance.snapshot;
+  if (!snapshot) return '<span class="subtle-text">未查询</span>';
+  if (snapshot.status === 'error') {
+    return `<span class="balance-error" title="${escapeAttr(snapshot.error_kind || 'error')}">查询失败</span>`;
+  }
+  if (snapshot.windows?.length) {
+    const rows = snapshot.windows.map((window) => {
+      const title = window.resets_at ? `重置：${formatTime(window.resets_at)}` : '';
+      return `<span class="balance-window"${title ? ` title="${escapeAttr(title)}"` : ''}><b>${escapeHtml(window.label)}</b><span>${balancePercent(window.remaining_percent)}</span></span>`;
+    }).join('');
+    return `<div class="balance-windows">${rows}</div>`;
+  }
+  // A concrete number always wins: some upstreams set an unlimited flag
+  // while still reporting a usable balance (even a negative/overdrawn one).
+  if (snapshot.remaining !== null && snapshot.remaining !== undefined) {
+    const title = snapshot.checked_at ? `查询于 ${formatTime(snapshot.checked_at)}` : '';
+    const negative = Number(snapshot.remaining) < 0 ? ' is-negative' : '';
+    return `<span class="balance-amount${negative}"${title ? ` title="${escapeAttr(title)}"` : ''}>${escapeHtml(balanceAmount(snapshot))}</span>`;
+  }
+  if (snapshot.unlimited) return '<span class="balance-unlimited">不限额</span>';
+  return '<span class="subtle-text">-</span>';
+}
+
+function balanceCell(channel) {
+  const configured = Boolean(channel.balance?.configured);
+  const refresh = iconButton({
+    action: 'refresh-channel-balance',
+    iconName: 'refresh-cw',
+    label: configured ? '刷新该渠道余额' : '配置余额查询',
+    attrs: `data-channel-id="${escapeAttr(channel.id)}"`,
+  });
+  return `<div class="balance-cell"><div class="balance-cell-value">${balanceCellContent(channel)}</div>${refresh}</div>`;
+}
+
+function balancePayloadFromForm(form) {
+  const adapter = form?.elements?.balance_adapter?.value || '';
+  if (!adapter) return null;
+  const headers = {};
+  String(form.elements.balance_headers?.value || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .forEach((line) => {
+      const index = line.indexOf(':');
+      if (index > 0) headers[line.slice(0, index).trim()] = line.slice(index + 1).trim();
+    });
+  const mapping = {};
+  [['remaining', 'balance_mapping_remaining'], ['currency', 'balance_mapping_currency'], ['used', 'balance_mapping_used'], ['total', 'balance_mapping_total'], ['label', 'balance_mapping_label']].forEach(([key, name]) => {
+    const value = String(form.elements[name]?.value || '').trim();
+    if (value) mapping[key] = value;
+  });
+  return {
+    adapter,
+    enabled: Boolean(form.elements.balance_enabled?.checked),
+    method: form.elements.balance_method?.value || 'GET',
+    path: String(form.elements.balance_path?.value || '').trim() || null,
+    auth: form.elements.balance_auth?.value || 'bearer',
+    headers,
+    body: String(form.elements.balance_body?.value || '').trim() || null,
+    mapping,
+    token: String(form.elements.balance_token?.value || '').trim() || null,
+    clear_token: Boolean(form.elements.balance_clear_token?.checked),
+  };
+}
+
 function channelRows(channels, includeProvider = true) {
   return channels.map((channel) => {
     const health = healthInfo(channel);
@@ -454,6 +563,7 @@ function renderProvidersMarkup() {
       <td><span class="mono">${escapeHtml(channel.api_key_hint || '-')}</span></td>
       <td class="align-right">${number(channel.model_count)}</td>
       <td>${statusDot(health.label, health.statusClass)}</td>
+      <td>${balanceCell(channel)}</td>
       <td><input class="switch-control" type="checkbox" aria-label="启用 ${escapeAttr(channel.name)}" data-channel-toggle data-channel-id="${escapeAttr(channel.id)}" ${channel.manual_enabled ? 'checked' : ''}></td>
       <td class="action-cell"><div class="table-actions">
         ${iconButton({ action: 'edit-channel', iconName: 'pencil', label: '编辑渠道', attrs: `data-channel-id="${escapeAttr(channel.id)}"` })}
@@ -465,9 +575,9 @@ function renderProvidersMarkup() {
     </tr>`;
   }).join('');
   return `<div class="page-stack">
-    ${toolbar('上游资源', '供应商只保存名称与 API 根地址，渠道承载账号和请求格式', `${button({ action: 'refresh-providers', label: '刷新', iconName: 'refresh-cw' })}${button({ action: 'open-provider', label: '添加供应商', iconName: 'plus', primary: true })}${button({ action: 'open-channel', label: '添加渠道', iconName: 'network', disabled: !providers.length })}`)}
+    ${toolbar('上游资源', '供应商只保存名称与 API 根地址，渠道承载账号和请求格式', `${button({ action: 'refresh-providers', label: '刷新', iconName: 'refresh-cw' })}${button({ action: 'refresh-balances', label: '刷新余额', iconName: 'refresh-cw', disabled: !channels.length })}${button({ action: 'open-provider', label: '添加供应商', iconName: 'plus', primary: true })}${button({ action: 'open-channel', label: '添加渠道', iconName: 'network', disabled: !providers.length })}`)}
     ${panel('供应商', '仅保存名称与 Base URL', `<div class="section-body-flush">${providers.length ? `<div class="table-scroll"><table class="data-table provider-table"><thead><tr><th>名称</th><th>Base URL</th><th class="align-right">渠道</th><th class="action-cell">操作</th></tr></thead><tbody>${providerRows}</tbody></table></div>` : emptyState('尚未创建供应商', '添加供应商后即可配置一个或多个渠道。', 'network')}</div>`) }
-    ${panel('账号与渠道', '路由与熔断的最小单位', `<div class="section-body-flush">${channels.length ? `<div class="table-scroll"><table class="data-table channels-table"><thead><tr><th>供应商</th><th>渠道</th><th>请求格式</th><th>远程压缩</th><th>密钥</th><th class="align-right">模型</th><th>健康</th><th>启用</th><th class="action-cell">操作</th></tr></thead><tbody>${channelRowsHtml}</tbody></table></div>` : emptyState('尚未配置渠道', '请在供应商下添加渠道，并选择上游支持的请求格式。', 'network')}</div>`) }
+    ${panel('账号与渠道', '路由与熔断的最小单位', `<div class="section-body-flush">${channels.length ? `<div class="table-scroll"><table class="data-table channels-table"><thead><tr><th>供应商</th><th>渠道</th><th>请求格式</th><th>远程压缩</th><th>密钥</th><th class="align-right">模型</th><th>健康</th><th>余额</th><th>启用</th><th class="action-cell">操作</th></tr></thead><tbody>${channelRowsHtml}</tbody></table></div>` : emptyState('尚未配置渠道', '请在供应商下添加渠道，并选择上游支持的请求格式。', 'network')}</div>`) }
   </div>`;
 }
 
@@ -483,7 +593,52 @@ function providerForm(editing = null) {
   });
 }
 
-function channelForm(providerId = '', editing = null) {
+function channelBalanceSection(editing, balance) {
+  if (!editing) {
+    return `<section class="balance-section"><div class="balance-section-head"><h3>余额查询</h3><span class="subtle-text">默认不查询</span></div><p class="field-help">渠道创建后，编辑渠道即可选择余额适配器并启用查询。</p></section>`;
+  }
+  const configured = Boolean(balance?.configured);
+  const adapter = balance?.adapter || '';
+  const enabled = Boolean(balance?.enabled);
+  const mapping = balance?.mapping || {};
+  const headersText = Object.entries(balance?.headers || {}).map(([name, value]) => `${name}: ${value}`).join('\n');
+  const adapterOptions = BALANCE_ADAPTERS.map(([value, label]) => `<option value="${value}" ${value === adapter ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('');
+  const customHidden = adapter === 'custom' ? '' : ' hidden';
+  return `<section class="balance-section" data-balance-section data-balance-configured="${configured ? '1' : '0'}">
+      <div class="balance-section-head"><h3>余额查询</h3><span class="subtle-text">默认不查询；启用后每小时自动刷新</span></div>
+      <div class="form-grid is-two">
+        <div class="field"><label for="balance-adapter">适配器</label><select class="select" id="balance-adapter" name="balance_adapter"><option value="">请选择</option>${adapterOptions}</select></div>
+        <div class="field"><label for="balance-enabled">启用查询（含每小时自动刷新）</label><input class="switch-control" id="balance-enabled" type="checkbox" name="balance_enabled" ${enabled ? 'checked' : ''}></div>
+      </div>
+      <div class="balance-custom" data-balance-custom${customHidden}>
+        <div class="form-grid is-two">
+          <div class="field"><label for="balance-method">请求方法</label><select class="select" id="balance-method" name="balance_method">${['GET', 'POST', 'PUT'].map((method) => `<option value="${method}" ${method === (balance?.method || 'GET') ? 'selected' : ''}>${method}</option>`).join('')}</select></div>
+          <div class="field"><label for="balance-auth">鉴权</label><select class="select" id="balance-auth" name="balance_auth"><option value="bearer" ${balance?.auth !== 'none' ? 'selected' : ''}>Bearer（渠道密钥或独立令牌）</option><option value="none" ${balance?.auth === 'none' ? 'selected' : ''}>无</option></select></div>
+        </div>
+        <div class="field"><label for="balance-path">路径</label><input class="input" id="balance-path" name="balance_path" placeholder="/v1/usage 或 https://..." value="${escapeAttr(balance?.path || '')}"><span class="field-help">/ 开头为站点根相对；否则相对渠道 Base URL 追加。</span></div>
+        <div class="field"><label for="balance-headers">请求头（每行 Name: Value，可用 ${'${api_key}'} / ${'${token}'}）</label><textarea class="textarea" id="balance-headers" name="balance_headers" placeholder="X-Api-Key: ${'${token}'}">${escapeHtml(headersText)}</textarea></div>
+        <div class="field"><label for="balance-body">请求体模板（GET 忽略）</label><textarea class="textarea" id="balance-body" name="balance_body" placeholder='{"key":"${'${api_key}'}"}'>${escapeHtml(balance?.body || '')}</textarea></div>
+        <div class="form-grid is-two">
+          <div class="field"><label for="balance-mapping-remaining">剩余额度路径</label><input class="input" id="balance-mapping-remaining" name="balance_mapping_remaining" placeholder="$.data.remaining" value="${escapeAttr(mapping.remaining || '')}"></div>
+          <div class="field"><label for="balance-mapping-currency">币种路径</label><input class="input" id="balance-mapping-currency" name="balance_mapping_currency" placeholder="$.data.unit" value="${escapeAttr(mapping.currency || '')}"></div>
+          <div class="field"><label for="balance-mapping-used">已用路径</label><input class="input" id="balance-mapping-used" name="balance_mapping_used" placeholder="$.data.used" value="${escapeAttr(mapping.used || '')}"></div>
+          <div class="field"><label for="balance-mapping-total">总额路径</label><input class="input" id="balance-mapping-total" name="balance_mapping_total" placeholder="$.data.total" value="${escapeAttr(mapping.total || '')}"></div>
+          <div class="field"><label for="balance-mapping-label">标签路径</label><input class="input" id="balance-mapping-label" name="balance_mapping_label" placeholder="$.data.label" value="${escapeAttr(mapping.label || '')}"></div>
+        </div>
+      </div>
+      <div class="form-grid is-two">
+        <div class="field"><label for="balance-token">独立令牌（留空保持不变）</label><input class="input" id="balance-token" type="password" name="balance_token" autocomplete="new-password" placeholder="${escapeAttr(balance?.token_hint || '')}"><span class="field-help">New API（如 CCTQ）：留空时查询该 sk- 令牌额度；填入面板「系统访问令牌 / PAT」后改为查询账户余额。</span></div>
+        <div class="field"><label>&nbsp;</label><label class="checkbox-row"><input type="checkbox" name="balance_clear_token"> 清除已保存的独立令牌</label></div>
+      </div>
+      <div class="balance-snapshot" data-balance-snapshot>${balanceSnapshotText(balance?.snapshot)}</div>
+      <div class="balance-actions">
+        ${button({ action: 'query-balance', label: '立即查询', iconName: 'refresh-cw', attrs: `data-channel-id="${escapeAttr(editing.id)}"` })}
+        ${configured ? button({ action: 'delete-balance-config', label: '删除配置', iconName: 'trash-2', danger: true, attrs: `data-channel-id="${escapeAttr(editing.id)}"` }) : ''}
+      </div>
+  </section>`;
+}
+
+async function channelForm(providerId = '', editing = null) {
   const selected = new Set(editing?.protocols || (editing?.protocol ? [editing.protocol] : ['openai_compatible']));
   const options = state.providers.map((provider) => `<option value="${escapeAttr(provider.id)}" ${provider.id === (editing?.provider_id || providerId) ? 'selected' : ''}>${escapeHtml(provider.name)}</option>`).join('');
   const compactionStatus = editing
@@ -496,16 +651,26 @@ function channelForm(providerId = '', editing = null) {
     ? state.channelModels.filter((model) => model.channel_id === editing.id && model.available && (model.protocols || [model.protocol]).includes(editing.protocol))
     : [];
   const healthModelOptions = healthModels.map((model) => `<option value="${escapeAttr(model.model_id)}" ${model.model_id === editing?.health_check_model_id ? 'selected' : ''}>${escapeHtml(model.model_id)}</option>`).join('');
+  let balance = null;
+  if (editing) {
+    try {
+      balance = await get(`/channels/${editing.id}/balance`);
+    } catch {
+      balance = null;
+    }
+  }
+  const balanceSection = channelBalanceSection(editing, balance);
   openModal({
     title: editing ? '编辑渠道' : '新建渠道',
     mode: editing ? 'channel-edit' : 'channel-create',
-    body: `<form class="form-stack" id="channel-form" data-form="channel" data-channel-id="${escapeAttr(editing?.id || '')}" data-original-protocols="${escapeAttr(JSON.stringify([...selected]))}">
+    body: `<form class="form-stack" id="channel-form" data-form="channel" data-channel-id="${escapeAttr(editing?.id || '')}" data-original-protocols="${escapeAttr(JSON.stringify([...selected]))}" data-balance-configured="${editing && balance?.configured ? '1' : '0'}">
       <div class="field"><label for="channel-provider">供应商</label><select class="select" id="channel-provider" name="provider_id" required ${editing ? 'disabled' : ''}><option value="">请选择供应商</option>${options}</select>${editing ? `<input type="hidden" name="provider_id" value="${escapeAttr(editing.provider_id)}">` : ''}</div>
       <div class="field"><label for="channel-name">渠道名称</label><input class="input" id="channel-name" name="name" required maxlength="120" value="${escapeAttr(editing?.name || '')}" autocomplete="off"></div>
       <fieldset class="protocol-fieldset"><legend class="fieldset-title">支持的请求格式</legend><div class="protocol-options">${protocolOptions().map((protocol) => `<label class="protocol-option"><input type="checkbox" name="protocols" value="${protocol}" ${selected.has(protocol) ? 'checked' : ''}>${escapeHtml(protocol)}</label>`).join('')}</div></fieldset>
       ${compactionField}
       <div class="field"><label for="channel-api-key">${editing ? 'API Key（留空则保持不变）' : 'API Key'}</label><input class="input" id="channel-api-key" name="api_key" type="password" ${editing ? '' : 'required'} autocomplete="new-password" placeholder="${escapeAttr(editing?.api_key_hint || '')}"></div>
       <div class="field"><label for="channel-health-model">健康探测模型</label><select class="select" id="channel-health-model" name="health_check_model_id"><option value="" ${editing?.health_check_model_id ? '' : 'selected'}>自动（模型列表第一个）</option>${healthModelOptions}</select><span class="field-help">熔断到期或手动探测时使用；自动模式选择该渠道模型列表中的第一个可用模型。</span></div>
+      ${balanceSection}
     </form>`,
     footer: `${button({ action: 'close-modal', label: '取消' })}${button({ action: 'submit-channel', label: editing ? '保存' : '创建', iconName: editing ? 'check' : 'plus', primary: true })}`,
   });
@@ -544,6 +709,13 @@ async function saveChannel(form) {
     const apiKey = values.get('api_key').trim();
     if (apiKey) payload.api_key = apiKey;
     await patch(`/channels/${channelId}`, payload);
+    // Balance config is saved together with the channel form. Choosing "请选择"
+    // (empty adapter) removes an existing config, back to default-off.
+    if (form.querySelector('[data-balance-section]')) {
+      const balancePayload = balancePayloadFromForm(form);
+      if (balancePayload) await put(`/channels/${channelId}/balance-config`, balancePayload);
+      else if (form.dataset.balanceConfigured === '1') await remove(`/channels/${channelId}/balance-config`);
+    }
     closeModal();
     toast('渠道已更新');
     if (isCurrent(ctx)) await refreshProviders(ctx.renderVersion);
@@ -606,6 +778,74 @@ async function discoverChannel(channelId, { quiet = false } = {}) {
 async function probeChannel(channelId) {
   await post(`/channels/${channelId}/probe`);
   toast('健康探测已加入队列');
+}
+
+async function queryChannelBalance(channelId) {
+  const version = state.renderVersion;
+  const form = document.getElementById('channel-form');
+  const payload = form ? balancePayloadFromForm(form) : null;
+  if (!payload) {
+    toast('请先选择余额适配器', 'warning');
+    return;
+  }
+  // "Query now" saves the current form first so the request reflects what
+  // the user just edited, then performs the one-off query.
+  await put(`/channels/${channelId}/balance-config`, payload);
+  form.dataset.balanceConfigured = '1';
+  const result = await post(`/channels/${channelId}/balance`);
+  const target = form.querySelector('[data-balance-snapshot]');
+  if (target) target.innerHTML = balanceSnapshotText(result);
+  if (result.status === 'ok') toast('余额查询成功');
+  else toast(`余额查询失败：${result.error_kind || 'error'}`, 'warning');
+  renderIfCurrent(version, renderPage);
+}
+
+async function deleteBalanceConfig(channelId) {
+  const version = state.renderVersion;
+  await remove(`/channels/${channelId}/balance-config`);
+  toast('余额配置已删除');
+  closeModal();
+  renderIfCurrent(version, renderPage);
+}
+
+async function refreshBalances() {
+  const version = state.renderVersion;
+  const result = await post('/balances/refresh');
+  if (!result.total) toast('没有启用余额查询的渠道', 'warning');
+  else if (result.failed) toast(`余额刷新完成：成功 ${result.ok}，失败 ${result.failed}`, 'warning');
+  else toast(`余额刷新完成：成功 ${result.ok} 个渠道`);
+  renderIfCurrent(version, renderPage);
+}
+
+async function refreshChannelBalance(channelId, button) {
+  const version = state.renderVersion;
+  const channel = state.channels.find((item) => item.id === channelId);
+  if (!channel) return;
+  if (!channel.balance?.configured) {
+    toast('该渠道尚未配置余额查询，请先选择适配器', 'warning');
+    return channelForm('', channel);
+  }
+  if (button) {
+    button.disabled = true;
+    button.classList.add('is-loading');
+  }
+  try {
+    // `enabled=0` channels are still queried here: a per-row click is the
+    // same explicit intent as the form's "立即查询".
+    const result = await post(`/channels/${channelId}/balance`);
+    channel.balance = { ...(channel.balance || {}), configured: true, snapshot: result };
+    if (result.status === 'ok') toast(`${channel.name} 余额已刷新`);
+    else toast(`${channel.name} 余额刷新失败：${result.error_kind || 'error'}`, 'warning');
+    renderIfCurrent(version, () => {
+      elements.page.innerHTML = renderProvidersMarkup();
+    });
+  } finally {
+    // The row may have been repainted; only restore a button still in DOM.
+    if (button && document.contains(button)) {
+      button.disabled = false;
+      button.classList.remove('is-loading');
+    }
+  }
 }
 
 function showModels(channelId) {
@@ -1667,6 +1907,10 @@ async function handleAction(target) {
     if (action === 'show-models') return showModels(target.dataset.channelId);
     if (action === 'discover-channel') return discoverChannel(target.dataset.channelId);
     if (action === 'probe-channel') return probeChannel(target.dataset.channelId);
+    if (action === 'query-balance') return queryChannelBalance(target.dataset.channelId);
+    if (action === 'delete-balance-config') return deleteBalanceConfig(target.dataset.channelId);
+    if (action === 'refresh-balances') return refreshBalances();
+    if (action === 'refresh-channel-balance') return refreshChannelBalance(target.dataset.channelId, target);
     if (action === 'delete-provider') return deleteProvider(target.dataset.providerId);
     if (action === 'delete-channel') return deleteChannel(target.dataset.channelId);
     if (action === 'refresh-routes') return renderPage();
@@ -1775,6 +2019,11 @@ function handleChange(event) {
     return;
   }
   if (target.closest('[data-form="caps"]')) refreshCapsPreview();
+  if (target.matches('[name="balance_adapter"]')) {
+    const section = target.closest('[data-balance-section]');
+    const custom = section?.querySelector('[data-balance-custom]');
+    if (custom) custom.hidden = target.value !== 'custom';
+  }
 }
 
 setUnauthorizedHandler(() => { if (!state.recovery) openAuthModal(); });

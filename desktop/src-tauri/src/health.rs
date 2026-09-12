@@ -192,6 +192,7 @@ async fn probe(state: &Context, channel_id: &str, cancel: CancellationToken) -> 
             result = state.http.send(crate::ports::UpstreamRequest {
                 url,
                 headers,
+                method: http::Method::POST,
                 body: Some(bytes::Bytes::from(payload)),
                 connect_timeout: std::time::Duration::from_secs(
                     runtime.connect_timeout_seconds.max(1) as u64,
@@ -477,6 +478,14 @@ mod tests {
             Arc::clone(&limits),
             crate::notification::DesktopNotifier::new(std::time::Duration::from_millis(50)),
         );
+        let balance = crate::balance::BalanceService::new(
+            db.clone(),
+            secrets.clone(),
+            Arc::clone(&http),
+            channels.clone(),
+            Arc::clone(&clock),
+            Arc::clone(&limits),
+        );
         let state = crate::application::Context {
             config: Arc::new(AppConfig::default()),
             db: db.clone(),
@@ -491,6 +500,7 @@ mod tests {
             telemetry,
             background,
             limits,
+            balance,
             admin: crate::admin::AdminService::new(db.clone(), secrets.clone()),
             recovery: crate::auth::RecoverySession::new(),
         };

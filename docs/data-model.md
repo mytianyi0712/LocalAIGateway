@@ -23,6 +23,8 @@ erDiagram
     MODEL_ROUTES ||--o{ ROUTE_CANDIDATES : orders
     CHANNEL_MODELS ||--o{ ROUTE_CANDIDATES : binds
     CHANNELS ||--|| CHANNEL_HEALTH : has
+    CHANNELS ||--o| CHANNEL_BALANCE_CONFIGS : configures
+    CHANNELS ||--o| CHANNEL_BALANCE_SNAPSHOTS : snapshots
     REQUEST_LOGS ||--o{ REQUEST_ATTEMPTS : contains
     CHANNELS ||--o{ REQUEST_ATTEMPTS : serves
     CHANNELS ||--o{ HEALTH_PROBE_LOGS : probes
@@ -57,6 +59,18 @@ erDiagram
       uuid channel_model_id FK
       integer priority
       boolean enabled
+    }
+    CHANNEL_BALANCE_CONFIGS {
+      uuid channel_id PK
+      string adapter
+      boolean enabled
+      text balance_token_encrypted
+    }
+    CHANNEL_BALANCE_SNAPSHOTS {
+      uuid channel_id PK
+      string status
+      real remaining
+      string checked_at
     }
 ```
 
@@ -184,6 +198,47 @@ erDiagram
 - 档案更新：`PUT /capability-profiles/{id}` 会把能力字段同步到所有引用该档案的 `model_caps` 行（成本与 `profile_id` 不变）。
 - 档案删除：引用模型解除绑定（`profile_id` 置空），已应用的能力值保留。
 - 手动保存不带 `profile_id` 的完整替换，或切换 `source=auto`，都会解除绑定。
+
+### 3.7 `channel_balance_configs`
+
+渠道余额查询配置，按渠道一条。**行不存在 = 未启用（默认）**：网关不会为没有该行的渠道发起任何余额请求，也不会在创建渠道时自动探测。保存后由 `enabled` 决定是否参与每小时后台刷新与批量刷新；手动「立即查询」对已保存但 `enabled=0` 的渠道仍执行一次（用户显式意图）。
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `channel_id` | TEXT | PK, FK `channels.id` ON DELETE CASCADE | 所属渠道 |
+| `adapter` | TEXT | NOT NULL | `newapi` / `sub2api` / `opencode_go` / `deepseek` / `custom` |
+| `enabled` | BOOLEAN | NOT NULL, 默认 0 | 手动/后台刷新的唯一开关 |
+| `method` | TEXT | NOT NULL, 默认 `GET` | 仅 `custom` 使用；内置适配器固定 `GET` |
+| `path` | TEXT | NULL | `custom` 必填；内置适配器保存其预置路径 |
+| `auth` | TEXT | NOT NULL, 默认 `bearer` | `bearer` / `none` |
+| `headers_json` | JSON/TEXT | NULL | 自定义请求头模板，最多 8 条 |
+| `body_json` | TEXT | NULL | 自定义请求体模板，最多 16 KiB |
+| `mapping_json` | JSON/TEXT | NULL | `remaining` / `currency` / `used` / `total` / `label` 的 JSON 路径 |
+| `balance_token_encrypted` | BLOB | NULL | 可选的独立令牌密文（Fernet） |
+| `balance_token_hint` | TEXT | NULL | 独立令牌的脱敏提示 |
+| `created_at` / `updated_at` | DATETIME | NOT NULL | 创建 / 更新时间 |
+
+### 3.8 `channel_balance_snapshots`
+
+最近一次余额查询结果，每个渠道只保留一条（`channel_id` 主键），余额是「当前值」语义。快照不保存原始响应正文、请求模板渲染结果或任何令牌，只保存归一化数值、窗口、非敏感附加信息与错误分类。
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `channel_id` | TEXT | PK, FK `channels.id` ON DELETE CASCADE | 所属渠道 |
+| `adapter` | TEXT | NOT NULL | 产生该快照的适配器 |
+| `status` | TEXT | NOT NULL | `ok` / `error` |
+| `remaining` | REAL | NULL | 剩余额度；不限额时为 NULL |
+| `currency` | TEXT | NULL | 币种，如 `USD` / `CNY` |
+| `used` | REAL | NULL | 已用额度 |
+| `total` | REAL | NULL | 总额度 |
+| `unlimited` | BOOLEAN | NOT NULL | 是否不限额 |
+| `label` | TEXT | NULL | 上游令牌名或状态标签 |
+| `windows_json` | JSON/TEXT | NULL | OpenCode Go 的 `[{label,used_percent,remaining_percent,resets_at}]` |
+| `detail_json` | JSON/TEXT | NULL | 今日用量、到期时间等非敏感附加信息 |
+| `error_kind` | TEXT | NULL | `http_401` / `http_403` / `http_5xx` / `http_error` / `transport_error` / `timeout` / `invalid_payload` / `custom_path_missing` |
+| `status_code` | INTEGER | NULL | 上游 HTTP 状态码（若有） |
+| `duration_ms` | INTEGER | NULL | 本次查询耗时 |
+| `checked_at` | DATETIME | NOT NULL | 查询时间 |
 
 ## 4. 健康状态表
 

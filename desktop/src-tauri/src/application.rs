@@ -53,6 +53,9 @@ pub struct Context {
     /// subdomains migrate progressively. Also constructed after the
     /// context.
     pub admin: Arc<crate::admin::AdminService>,
+    /// Channel balance/usage sidecar: default-off per-channel adapter
+    /// queries plus the hourly background refresh.
+    pub balance: Arc<crate::balance::BalanceService>,
     /// Immutable operational limits shared by every supervisor (P2-10).
     pub limits: Arc<RuntimeLimits>,
     /// One-time challenge store for corrupt-key recovery (P1-4).

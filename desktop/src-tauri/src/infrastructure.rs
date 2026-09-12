@@ -63,11 +63,7 @@ impl UpstreamClient for HttpClientPool {
     ) -> futures_util::future::BoxFuture<'static, Result<UpstreamResponse, UpstreamError>> {
         let client = self.for_connect_timeout(request.connect_timeout.as_secs() as i64);
         Box::pin(async move {
-            let method = if request.body.is_some() {
-                reqwest::Method::POST
-            } else {
-                reqwest::Method::GET
-            };
+            let method = request.method;
             let mut builder = client.request(method, request.url).headers(request.headers);
             if let Some(body) = request.body {
                 builder = builder.body(body);

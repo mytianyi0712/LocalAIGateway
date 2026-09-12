@@ -60,8 +60,9 @@ pub(super) async fn channel_json(db: &Database, row: ChannelRow) -> Result<Value
             "probed_at": probed_at,
         });
     }
+    let balance = crate::balance::channel_balance_json(db, &row.id).await?;
     Ok(
-        json!({"id":row.id,"provider_id":row.provider_id,"provider_name":row.provider_name,"name":row.name,"protocol":row.protocol,"protocols":protocols,"manual_enabled":row.manual_enabled,"health_check_model_id":row.health_check_model_id,"has_api_key":!row.api_key_encrypted.is_empty(),"api_key_hint":row.api_key_hint,"health":{"state":row.state.unwrap_or_else(||"active".into()),"consecutive_failures":row.consecutive_failures.unwrap_or(0),"disabled_until":row.disabled_until,"last_success_at":row.last_success_at,"last_failure_at":row.last_failure_at,"last_error_kind":row.last_error_kind,"last_status_code":row.last_status_code},"model_count":row.model_count,"remote_compaction":remote_compaction,"created_at":row.created_at,"updated_at":row.updated_at}),
+        json!({"id":row.id,"provider_id":row.provider_id,"provider_name":row.provider_name,"name":row.name,"protocol":row.protocol,"protocols":protocols,"manual_enabled":row.manual_enabled,"health_check_model_id":row.health_check_model_id,"has_api_key":!row.api_key_encrypted.is_empty(),"api_key_hint":row.api_key_hint,"health":{"state":row.state.unwrap_or_else(||"active".into()),"consecutive_failures":row.consecutive_failures.unwrap_or(0),"disabled_until":row.disabled_until,"last_success_at":row.last_success_at,"last_failure_at":row.last_failure_at,"last_error_kind":row.last_error_kind,"last_status_code":row.last_status_code},"model_count":row.model_count,"remote_compaction":remote_compaction,"balance":balance,"created_at":row.created_at,"updated_at":row.updated_at}),
     )
 }
 #[derive(Deserialize)]

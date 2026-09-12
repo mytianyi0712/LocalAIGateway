@@ -3,6 +3,7 @@ pub mod api_error;
 pub mod application;
 pub mod assets;
 pub mod auth;
+pub mod balance;
 pub mod capabilities;
 pub mod compression;
 pub mod config;

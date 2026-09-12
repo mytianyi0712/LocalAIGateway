@@ -45,7 +45,7 @@ pub async fn build(config: AppConfig) -> Result<GatewayRuntime> {
         db.clone(),
         secrets.clone(),
         Arc::clone(&http),
-        channels_dyn,
+        Arc::clone(&channels_dyn),
         Arc::clone(&clock),
         supervisor.clone(),
         Arc::clone(&limits),
@@ -66,6 +66,14 @@ pub async fn build(config: AppConfig) -> Result<GatewayRuntime> {
     let notifier = crate::notification::DesktopNotifier::new(
         crate::notification::DEFAULT_FLUSH_WINDOW,
     );
+    let balance = crate::balance::BalanceService::new(
+        db.clone(),
+        secrets.clone(),
+        Arc::clone(&http),
+        Arc::clone(&channels_dyn),
+        Arc::clone(&clock),
+        Arc::clone(&limits),
+    );
     let state = Context {
         config: Arc::new(config),
         db,
@@ -78,6 +86,7 @@ pub async fn build(config: AppConfig) -> Result<GatewayRuntime> {
         discovery,
         proxy,
         admin,
+        balance,
         telemetry,
         background: supervisor.clone(),
         limits,

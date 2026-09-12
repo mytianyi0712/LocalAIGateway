@@ -31,6 +31,13 @@ pub struct RuntimeLimits {
     pub maintenance_interval: Duration,
     /// Log cleanup cadence inside the maintenance loop (was 3600 s).
     pub cleanup_interval: Duration,
+    /// Absolute timeout for one channel balance query (upstream exchange
+    /// plus body read); balance queries are a sidecar and must never hold a
+    /// connection for long.
+    pub balance_timeout: Duration,
+    /// Background cadence for refreshing channels with balance queries
+    /// enabled (was 3600 s, i.e. hourly). Tests inject short values.
+    pub balance_interval: Duration,
     /// Non-2xx upstream error body replay cap (was 1 MiB).
     pub error_body_max: usize,
     /// Absolute shutdown deadline: after cancel, this long to drain every
@@ -49,6 +56,8 @@ impl Default for RuntimeLimits {
             discovery_max_pages: 50,
             maintenance_interval: Duration::from_secs(60),
             cleanup_interval: Duration::from_secs(3600),
+            balance_timeout: Duration::from_secs(15),
+            balance_interval: Duration::from_secs(3600),
             error_body_max: 1024 * 1024,
             shutdown_deadline: Duration::from_secs(30),
         }

@@ -3230,6 +3230,7 @@ impl ProxyService {
                 .send(crate::ports::UpstreamRequest {
                     url: target_url,
                     headers: outbound,
+                    method: http::Method::POST,
                     body: Some(converted_body.clone()),
                     connect_timeout: Duration::from_secs(
                         runtime.connect_timeout_seconds.max(1) as u64
@@ -4119,6 +4120,14 @@ mod tests {
             Arc::clone(&limits),
             notifier.clone(),
         );
+        let balance = crate::balance::BalanceService::new(
+            db.clone(),
+            secrets.clone(),
+            Arc::clone(&http),
+            channels.clone(),
+            Arc::clone(&clock),
+            Arc::clone(&limits),
+        );
         let state = crate::application::Context {
             config: Arc::new(AppConfig::default()),
             db: db.clone(),
@@ -4133,6 +4142,7 @@ mod tests {
             telemetry,
             background,
             limits,
+            balance,
             admin: crate::admin::AdminService::new(db.clone(), secrets.clone()),
             recovery: crate::auth::RecoverySession::new(),
         };

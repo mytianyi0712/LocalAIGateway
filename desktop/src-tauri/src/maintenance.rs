@@ -105,6 +105,7 @@ pub async fn run_supervisor(state: Context, cancel: CancellationToken) {
     }
     let discovering: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let mut last_cleanup: Option<Instant> = None;
+    let mut last_balance: Option<Instant> = None;
     let mut interval = tokio::time::interval(state.limits.maintenance_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -116,6 +117,17 @@ pub async fn run_supervisor(state: Context, cancel: CancellationToken) {
                 }
                 if let Err(error) = finalize_stale_pending_requests(&state).await {
                     tracing::warn!(%error, "stale request finalization failed");
+                }
+                // Balance refresh is default-off per channel: with no
+                // enabled config row this resolves to a single local SELECT
+                // and zero upstream requests.
+                let balance_due = last_balance
+                    .is_none_or(|last| last.elapsed() >= state.limits.balance_interval);
+                if balance_due {
+                    if let Err(error) = state.balance.refresh_enabled(&state).await {
+                        tracing::warn!(%error, "balance refresh failed");
+                    }
+                    last_balance = Some(Instant::now());
                 }
                 let due = last_cleanup.is_none_or(|last| last.elapsed() >= state.limits.cleanup_interval);
                 if due {

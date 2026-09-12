@@ -23,6 +23,9 @@ pub enum ErrorCode {
     GatewayTimeout,
     NotImplemented,
     ConfigCorrupted,
+    /// A balance query was requested manually for a channel that has no
+    /// balance adapter configured (default-off semantics).
+    BalanceNotConfigured,
 }
 
 impl ErrorCode {
@@ -42,6 +45,7 @@ impl ErrorCode {
             ErrorCode::GatewayTimeout => "gateway_timeout",
             ErrorCode::NotImplemented => "not_implemented",
             ErrorCode::ConfigCorrupted => "config_corrupted",
+            ErrorCode::BalanceNotConfigured => "balance_not_configured",
         }
     }
 }
@@ -109,6 +113,15 @@ impl ApiError {
     }
     pub fn validation(message: impl Into<String>) -> Self {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, message)
+    }
+    /// Manual balance query without a saved adapter: 422 with a stable code
+    /// so the UI can offer "configure balance" instead of a generic error.
+    pub fn balance_not_configured() -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: ErrorCode::BalanceNotConfigured,
+            message: "balance_not_configured".into(),
+        }
     }
     pub fn not_implemented(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_IMPLEMENTED, message)

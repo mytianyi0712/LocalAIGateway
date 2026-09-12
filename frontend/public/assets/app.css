@@ -291,6 +291,27 @@ button:disabled { cursor: not-allowed; }
 .settings-stack { display: grid; gap: 16px; }
 .settings-panel .section-body { padding: 20px; }
 
+.balance-section { display: grid; gap: 14px; padding: 16px; border: 1px solid var(--line); border-radius: var(--radius-small); background: var(--surface-raised); }
+.balance-section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.balance-section-head h3 { margin: 0; color: var(--text-secondary); font-size: 13px; font-weight: 720; }
+.balance-custom { display: grid; gap: 14px; }
+.balance-cell { display: flex; align-items: center; justify-content: space-between; gap: 6px; min-width: 0; }
+.balance-cell-value { min-width: 0; }
+.balance-cell .icon-button { width: 26px; min-width: 26px; min-height: 26px; border-color: transparent; background: transparent; opacity: 0.7; }
+.balance-cell .icon-button:hover:not(:disabled) { border-color: var(--line); background: var(--surface); opacity: 1; }
+.balance-cell .icon-button.is-loading .icon { animation: balance-spin 0.8s linear infinite; }
+@keyframes balance-spin { to { transform: rotate(360deg); } }
+.balance-windows { display: grid; gap: 2px; font-variant-numeric: tabular-nums; }
+.balance-window { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; white-space: nowrap; font-size: 11.5px; line-height: 1.35; }
+.balance-window b { color: var(--muted); font-weight: 650; }
+.balance-amount { color: var(--text-secondary); font-weight: 650; font-variant-numeric: tabular-nums; }
+.balance-amount.is-negative { color: var(--danger); }
+.balance-unlimited { color: var(--accent-strong); font-weight: 650; }
+.balance-error { color: var(--danger); cursor: help; font-weight: 650; }
+.balance-snapshot { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; font-size: 12px; }
+.balance-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.checkbox-row { display: flex; align-items: center; gap: 8px; color: var(--text-secondary); font-size: 12px; }
+.balance-section .textarea { min-height: 84px; }
 .drawer { position: fixed; inset: 0; z-index: 70; pointer-events: none; }
 .drawer.is-open { pointer-events: auto; }
 .drawer-backdrop { position: absolute; inset: 0; opacity: 0; background: rgba(17, 33, 27, 0.45); transition: opacity 180ms ease-out; }

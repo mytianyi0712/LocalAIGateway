@@ -68,6 +68,7 @@ check_admin_handlers() {
 
 check_admin_handlers src/admin/providers.rs
 check_admin_handlers src/admin/channels.rs
+check_admin_handlers src/admin/balances.rs
 
 # The protocol registry must stay enum-driven: PROTOCOL_ORDER is the only
 # allowed protocol-list constant (everything else derives from ProtocolId).

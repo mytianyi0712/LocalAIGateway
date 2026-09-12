@@ -19,6 +19,7 @@ use sqlx::{FromRow, QueryBuilder, Row};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
+mod balances;
 mod channels;
 mod discovery;
 mod logs;
@@ -29,6 +30,9 @@ mod providers;
 mod routes;
 mod settings;
 mod stats;
+use balances::{
+    delete_balance_config, get_balance, put_balance_config, query_balance, refresh_balances,
+};
 use channels::{
     create_channel, delete_channel, get_channel, list_channels, patch_channel, replace_api_key,
     reset_health,
@@ -75,6 +79,18 @@ pub fn router() -> Router<Context> {
             get(get_channel).patch(patch_channel).delete(delete_channel),
         )
         .route("/api/admin/v1/channels/{id}/api-key", put(replace_api_key))
+        .route(
+            "/api/admin/v1/channels/{id}/balance",
+            get(get_balance).post(query_balance),
+        )
+        .route(
+            "/api/admin/v1/channels/{id}/balance-config",
+            put(put_balance_config).delete(delete_balance_config),
+        )
+        .route(
+            "/api/admin/v1/balances/refresh",
+            post(refresh_balances),
+        )
         .route(
             "/api/admin/v1/channels/{id}/reset-health",
             post(reset_health),
@@ -506,6 +522,14 @@ mod tests {
             Arc::clone(&limits),
             crate::notification::DesktopNotifier::new(std::time::Duration::from_millis(50)),
         );
+        let balance = crate::balance::BalanceService::new(
+            db.clone(),
+            secrets.clone(),
+            Arc::clone(&http),
+            channels.clone(),
+            Arc::clone(&clock),
+            Arc::clone(&limits),
+        );
         let state = crate::application::Context {
             config: Arc::new(AppConfig::default()),
             db: db.clone(),
@@ -520,6 +544,7 @@ mod tests {
             telemetry,
             background,
             limits,
+            balance,
             admin: crate::admin::AdminService::new(db.clone(), secrets.clone()),
             recovery: crate::auth::RecoverySession::new(),
         };
@@ -723,6 +748,175 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(name, "renamed", "pre-validation must not write the name");
+    }
+
+    /// Balance admin flow: PUT config -> POST query -> GET -> POST refresh
+    /// -> DELETE. The upstream is unreachable on purpose: the query must
+    /// still return 200 plus an error snapshot, never break the admin API.
+    #[tokio::test]
+    async fn balance_admin_flow_round_trips_and_survives_upstream_failure() {
+        let (state, _dir) = test_state().await;
+        let time = "2026-08-04T01:00:00+00:00";
+        sqlx::query("INSERT INTO providers(id,name,base_url,created_at,updated_at) VALUES('prov-1','mock','http://127.0.0.1:1',?,?)")
+            .bind(time)
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channels(id,provider_id,name,protocol,api_key_encrypted,api_key_hint,manual_enabled,created_at,updated_at) VALUES('ch-1','prov-1','chan','openai_compatible',?,?,1,?,?)")
+            .bind(state.secrets.encrypt("sk-test"))
+            .bind("sk-...test")
+            .bind(time)
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+
+        let saved = put_balance_config(
+            AdminAuth,
+            State(state.clone()),
+            Path("ch-1".to_owned()),
+            Json(crate::balance::BalanceConfigInput {
+                adapter: "newapi".into(),
+                enabled: true,
+                method: None,
+                path: None,
+                auth: None,
+                headers: std::collections::BTreeMap::new(),
+                body: None,
+                mapping: crate::balance::BalanceMappingInput::default(),
+                token: None,
+                clear_token: false,
+            }),
+        )
+        .await
+        .expect("save must succeed");
+        assert_eq!(saved.status(), StatusCode::OK);
+
+        let queried = query_balance(AdminAuth, State(state.clone()), Path("ch-1".to_owned()))
+            .await
+            .expect("upstream failure must still return 200");
+        assert_eq!(queried.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(queried.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let snapshot: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(snapshot["status"], "error");
+        assert_eq!(snapshot["error_kind"], "transport_error");
+
+        let fetched = get_balance(AdminAuth, State(state.clone()), Path("ch-1".to_owned()))
+            .await
+            .expect("get must succeed");
+        let bytes = axum::body::to_bytes(fetched.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let config: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(config["configured"], true);
+        assert_eq!(config["adapter"], "newapi");
+        assert_eq!(config["snapshot"]["status"], "error");
+
+        let refreshed = refresh_balances(AdminAuth, State(state.clone()))
+            .await
+            .expect("refresh must succeed");
+        let bytes = axum::body::to_bytes(refreshed.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["total"], 1);
+        assert_eq!(result["failed"], 1);
+
+        let deleted =
+            delete_balance_config(AdminAuth, State(state.clone()), Path("ch-1".to_owned()))
+                .await
+                .expect("delete must succeed");
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+
+        // Default-off is restored; a manual query now gets the stable 422.
+        let error = query_balance(AdminAuth, State(state.clone()), Path("ch-1".to_owned()))
+            .await
+            .expect_err("unconfigured manual query must fail");
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.code, ErrorCode::BalanceNotConfigured);
+    }
+
+    /// Route wiring smoke test: the balance endpoints must be reachable
+    /// through the real admin router (extractors + correlation middleware).
+    #[tokio::test]
+    async fn balance_routes_are_wired_through_the_admin_router() {
+        use tower::ServiceExt;
+        let (state, _dir) = test_state().await;
+        let time = "2026-08-04T01:00:00+00:00";
+        sqlx::query("INSERT INTO providers(id,name,base_url,created_at,updated_at) VALUES('prov-1','mock','http://127.0.0.1:1',?,?)")
+            .bind(time)
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channels(id,provider_id,name,protocol,api_key_encrypted,api_key_hint,manual_enabled,created_at,updated_at) VALUES('ch-1','prov-1','chan','openai_compatible',?,?,1,?,?)")
+            .bind(state.secrets.encrypt("sk-test"))
+            .bind("sk-...test")
+            .bind(time)
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+
+        let app = router().with_state(state.clone());
+        let put = axum::http::Request::builder()
+            .method("PUT")
+            .uri("/api/admin/v1/channels/ch-1/balance-config")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({"adapter": "newapi", "enabled": true}).to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(put).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let config: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(config["configured"], true);
+        assert_eq!(config["adapter"], "newapi");
+        assert_eq!(config["enabled"], true);
+
+        let get = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/admin/v1/channels/ch-1/balance")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(get).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let refresh = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/admin/v1/balances/refresh")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(refresh).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["total"], 1);
+        assert_eq!(result["failed"], 1, "unreachable upstream -> error snapshot");
+
+        let delete = axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/api/admin/v1/channels/ch-1/balance-config")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(delete).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let missing = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/admin/v1/channels/missing/balance")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(missing).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     /// P1-4: a failure while propagating a profile update to model_caps

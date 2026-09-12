@@ -507,6 +507,14 @@ mod tests {
             Arc::clone(&limits),
             crate::notification::DesktopNotifier::new(std::time::Duration::from_millis(50)),
         );
+        let balance = crate::balance::BalanceService::new(
+            db.clone(),
+            secrets.clone(),
+            Arc::clone(&http),
+            channels.clone(),
+            Arc::clone(&clock),
+            Arc::clone(&limits),
+        );
         let state = crate::application::Context {
             config: Arc::new(AppConfig::default()),
             db: db.clone(),
@@ -521,6 +529,7 @@ mod tests {
             telemetry,
             background,
             limits,
+            balance,
             admin: crate::admin::AdminService::new(db.clone(), secrets.clone()),
             recovery: crate::auth::RecoverySession::new(),
         };

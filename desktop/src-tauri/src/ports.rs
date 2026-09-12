@@ -28,7 +28,12 @@ pub use crate::routing::{Candidate, MappingTarget, RoutableModel};
 pub struct UpstreamRequest {
     pub url: Url,
     pub headers: HeaderMap,
-    /// `Some` sends POST, `None` sends GET.
+    /// Explicit HTTP method. Existing callers set GET when there is no body
+    /// and POST when there is; the balance sidecar is the first caller that
+    /// needs PUT (custom adapter), so the port carries the method instead of
+    /// inferring it from `body`.
+    pub method: http::Method,
+    /// `Some` sends a request body, `None` sends no body.
     pub body: Option<Bytes>,
     /// Client connect timeout for this exchange.
     pub connect_timeout: Duration,
