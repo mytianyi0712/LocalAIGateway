@@ -26,7 +26,7 @@ pub(super) struct ModelRow {
     last_seen_at: Option<String>,
 }
 pub(super) async fn model_json(state: &Context, row: ModelRow) -> Result<Value, ApiError> {
-    let protocols:Vec<String>=sqlx::query_scalar("SELECT protocol FROM channel_model_protocols WHERE channel_model_id=? ORDER BY CASE protocol WHEN 'openai_compatible' THEN 0 WHEN 'openai_responses' THEN 1 WHEN 'claude' THEN 2 ELSE 3 END").bind(&row.id).fetch_all(state.db.pool()).await?;
+    let protocols:Vec<String>=sqlx::query_scalar("SELECT protocol FROM channel_model_protocols WHERE channel_model_id=? ORDER BY CASE protocol WHEN 'openai_compatible' THEN 0 WHEN 'openai_responses' THEN 1 WHEN 'claude' THEN 2 WHEN 'command_code' THEN 4 ELSE 3 END").bind(&row.id).fetch_all(state.db.pool()).await?;
     Ok(
         json!({"id":row.id,"channel_id":row.channel_id,"channel_name":row.channel_name,"protocol":protocols.first(),"protocols":protocols,"model_id":row.model_id,"display_name":row.display_name,"source":row.source,"available":row.available,"last_seen_at":row.last_seen_at}),
     )

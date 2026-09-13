@@ -728,6 +728,7 @@ mod tests {
             Arc::clone(&clock),
             Arc::clone(&limits),
         );
+        let command_code_login = crate::commandcode_login::CommandCodeLogin::new(std::sync::Arc::clone(&http));
         let state = crate::application::Context {
             config: Arc::new(AppConfig::default()),
             db: db.clone(),
@@ -744,6 +745,7 @@ mod tests {
             limits,
             balance,
             admin: crate::admin::AdminService::new(db.clone(), secrets.clone()),
+            command_code_login,
             recovery: crate::auth::RecoverySession::new(),
         };
         (state, dir)

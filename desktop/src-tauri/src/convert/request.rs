@@ -11,9 +11,15 @@ impl ConversionStrategy {
             ("claude", "openai_compatible") => Some(ClaudeToChat),
             ("claude", "openai_responses") => Some(ClaudeToResponses),
             ("claude", "gemini") => Some(ClaudeToGemini),
+            ("claude", "command_code") => Some(ClaudeToCommandCode),
+            // OpenAI chat entry: identity for the Provider-API companion body,
+            // and silent conversion into Command Code for direct requests.
+            ("openai_compatible", "openai_compatible") => Some(Passthrough),
+            ("openai_compatible", "command_code") => Some(ChatToCommandCode),
             ("openai_responses", "openai_compatible") => Some(ResponsesToChat),
             ("openai_responses", "claude") => Some(ResponsesToClaude),
             ("openai_responses", "gemini") => Some(ResponsesToGemini),
+            ("openai_responses", "command_code") => Some(ResponsesToCommandCode),
             _ => None,
         }
     }
@@ -896,9 +902,14 @@ pub fn convert_request(
         ClaudeToChat => claude_to_chat(upstream_model, &data),
         ClaudeToResponses => claude_to_responses_value(upstream_model, &data),
         ClaudeToGemini => claude_to_gemini(upstream_model, &data),
+        ClaudeToCommandCode => super::commandcode::claude_to_commandcode(upstream_model, &data),
+        ChatToCommandCode => super::commandcode::openai_chat_to_commandcode(upstream_model, &data),
         ResponsesToChat => responses_to_chat(upstream_model, &data),
         ResponsesToClaude => responses_to_claude(upstream_model, &data),
         ResponsesToGemini => responses_to_gemini(upstream_model, &data),
+        ResponsesToCommandCode => {
+            super::commandcode::responses_to_commandcode(upstream_model, &data)
+        }
     };
     Ok(serde_json::to_vec(&converted)?)
 }

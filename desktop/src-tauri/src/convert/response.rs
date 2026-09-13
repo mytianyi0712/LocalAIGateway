@@ -94,6 +94,25 @@ pub(super) fn openai_compatible_to_claude(claude_model: &str, data: &Value) -> V
         .get("cache_write_tokens")
         .or_else(|| prompt_details.get("cached_write_tokens"))
         .and_then(Value::as_i64);
+    let input_tokens = usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
+        .and_then(Value::as_i64);
+    // Hard pit 9: Command Code marks `prompt_tokens` as a total including
+    // cache hits; Anthropic `input_tokens` is the non-cached part. The
+    // marker only exists on Command Code bodies, so other upstreams keep
+    // their existing semantics.
+    let input_tokens = if usage
+        .get(super::commandcode::INPUT_INCLUDES_CACHE)
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        input_tokens.map(|total| {
+            (total - cache_read.unwrap_or(0) - cache_write.unwrap_or(0)).max(0)
+        })
+    } else {
+        input_tokens
+    };
     json!({
         "id": data.get("id").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| new_id("msg")),
         "type": "message",
@@ -105,7 +124,7 @@ pub(super) fn openai_compatible_to_claude(claude_model: &str, data: &Value) -> V
         ),
         "stop_sequence": Value::Null,
         "usage": claude_usage(
-            usage.get("prompt_tokens").or_else(|| usage.get("input_tokens")).and_then(Value::as_i64),
+            input_tokens,
             usage.get("completion_tokens").or_else(|| usage.get("output_tokens")).and_then(Value::as_i64),
             cache_read,
             cache_write,
@@ -900,6 +919,9 @@ pub fn convert_response(
         ClaudeToChat => openai_compatible_to_claude(mapped_model, &data),
         ClaudeToResponses => openai_responses_to_claude(mapped_model, &data),
         ClaudeToGemini => gemini_to_claude(mapped_model, &data),
+        ClaudeToCommandCode | ResponsesToCommandCode | ChatToCommandCode => bail!(
+            "Command Code responses are decoded to openai_compatible before conversion"
+        ),
         ResponsesToChat => openai_compatible_to_responses(mapped_model, &data),
         ResponsesToClaude => claude_to_responses(mapped_model, &data),
         ResponsesToGemini => gemini_to_responses(mapped_model, &data),

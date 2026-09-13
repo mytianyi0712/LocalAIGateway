@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use sqlx::Row;
 use tokio::sync::Mutex;
@@ -106,6 +107,7 @@ pub async fn run_supervisor(state: Context, cancel: CancellationToken) {
     let discovering: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let mut last_cleanup: Option<Instant> = None;
     let mut last_balance: Option<Instant> = None;
+    let mut last_command_code_version: Option<Instant> = None;
     let mut interval = tokio::time::interval(state.limits.maintenance_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -121,8 +123,51 @@ pub async fn run_supervisor(state: Context, cancel: CancellationToken) {
                 // Balance refresh is default-off per channel: with no
                 // enabled config row this resolves to a single local SELECT
                 // and zero upstream requests.
-                let balance_due = last_balance
-                    .is_none_or(|last| last.elapsed() >= state.limits.balance_interval);
+                let runtime = settings::runtime_settings(&state).await.unwrap_or_default();
+                if runtime.command_code_enabled {
+                    let version_due = last_command_code_version.is_none_or(|last| {
+                        last.elapsed()
+                            >= Duration::from_secs(
+                                runtime.command_code_version_check_interval_hours.max(1) as u64
+                                    * 3600,
+                            )
+                    });
+                    if version_due {
+                        match crate::commandcode::refresh_cli_version(
+                            &state.db,
+                            state.http.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(Some(version)) => {
+                                if crate::commandcode::version_drift(&version) {
+                                    tracing::warn!(
+                                        version,
+                                        baseline = crate::commandcode::DEFAULT_CLI_VERSION,
+                                        "command code CLI version drifted from the verified protocol baseline"
+                                    );
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                tracing::debug!(%error, "command code version check skipped");
+                            }
+                        }
+                        last_command_code_version = Some(Instant::now());
+                    }
+                }
+                // Command Code quota windows (5h) reset faster than the
+                // hourly balance cadence, so the configured quota interval
+                // shortens it while the integration is enabled.
+                let balance_interval = if runtime.command_code_enabled {
+                    state.limits.balance_interval.min(Duration::from_secs(
+                        runtime.command_code_quota_interval_minutes.max(1) as u64 * 60,
+                    ))
+                } else {
+                    state.limits.balance_interval
+                };
+                let balance_due =
+                    last_balance.is_none_or(|last| last.elapsed() >= balance_interval);
                 if balance_due {
                     if let Err(error) = state.balance.refresh_enabled(&state).await {
                         tracing::warn!(%error, "balance refresh failed");

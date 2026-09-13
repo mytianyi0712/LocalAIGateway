@@ -13,7 +13,9 @@ use axum::{
     routing::{delete, get, patch, post, put},
 };
 use chrono::Utc;
-use providers::{ProviderInput, ProviderPatch, ProviderRow, load_provider, provider_json};
+use providers::{
+    ProviderInput, ProviderPatch, ProviderRow, load_provider, provider_json, validate_provider_kind,
+};
 use serde_json::{Map, Value, json};
 use sqlx::{FromRow, QueryBuilder, Row};
 use std::collections::{HashMap, HashSet};
@@ -21,10 +23,12 @@ use std::sync::Arc;
 use uuid::Uuid;
 mod balances;
 mod channels;
+mod commandcode;
 mod discovery;
 mod logs;
 mod mappings;
 mod models;
+mod presets;
 mod profiles;
 mod providers;
 mod routes;
@@ -37,6 +41,10 @@ use channels::{
     create_channel, delete_channel, get_channel, list_channels, patch_channel, replace_api_key,
     reset_health,
 };
+use commandcode::{
+    command_code_login_begin, command_code_login_cancel, command_code_login_import_cli,
+    command_code_login_status,
+};
 use discovery::{discover_models, get_discovery_run, list_discovery_runs, manual_probe};
 use logs::{clear_logs, get_request, list_health_probes, list_requests};
 use mappings::{
@@ -45,6 +53,7 @@ use mappings::{
     patch_claude_mapping, patch_codex_mapping, refresh_claude_presets, refresh_codex_presets,
 };
 use models::{create_manual_model, delete_channel_model, list_channel_models, patch_channel_model};
+use presets::list_provider_presets;
 use profiles::{
     create_profile, delete_profile, detect_capabilities, get_capabilities, get_profile,
     list_profiles, put_capabilities, update_profile,
@@ -52,7 +61,7 @@ use profiles::{
 use providers::{create_provider, delete_provider, get_provider, list_providers, patch_provider};
 use routes::{create_route, delete_route, list_routes, patch_route, replace_candidates};
 use settings::{
-    generate_access_keys, get_settings, patch_settings, recovery_key_status,
+    command_code_status, generate_access_keys, get_settings, patch_settings, recovery_key_status,
     recovery_repair_settings, system_protocols, system_status,
 };
 use stats::{stats_cache, stats_channels, stats_models, stats_summary, stats_timeseries};
@@ -69,6 +78,24 @@ pub fn router() -> Router<Context> {
             get(get_provider)
                 .patch(patch_provider)
                 .delete(delete_provider),
+        )
+        .route(
+            "/api/admin/v1/provider-presets",
+            get(list_provider_presets),
+        )
+        .route(
+            "/api/admin/v1/command-code/status",
+            get(command_code_status),
+        )
+        .route(
+            "/api/admin/v1/command-code/login",
+            get(command_code_login_status)
+                .post(command_code_login_begin)
+                .delete(command_code_login_cancel),
+        )
+        .route(
+            "/api/admin/v1/command-code/import-cli",
+            post(command_code_login_import_cli),
         )
         .route(
             "/api/admin/v1/channels",
@@ -231,7 +258,7 @@ pub struct AdminService {
 }
 impl AdminService {
     pub async fn list_providers(&self) -> ApiResult {
-        let rows = sqlx::query_as::<_, ProviderRow>("SELECT p.id,p.name,p.base_url,p.created_at,p.updated_at,COUNT(c.id) channel_count FROM providers p LEFT JOIN channels c ON c.provider_id=p.id GROUP BY p.id ORDER BY p.name")
+        let rows = sqlx::query_as::<_, ProviderRow>("SELECT p.id,p.name,p.base_url,p.kind,p.created_at,p.updated_at,COUNT(c.id) channel_count FROM providers p LEFT JOIN channels c ON c.provider_id=p.id GROUP BY p.id ORDER BY p.name")
             .fetch_all(self.db.pool()).await?;
         let items: Vec<_> = rows.into_iter().map(provider_json).collect();
         Ok(ok(
@@ -242,14 +269,16 @@ impl AdminService {
         validate_text(&input.name, "name", 120)?;
         let base_url = normalize_base_url(&input.base_url)
             .map_err(|error| ApiError::validation(error.to_string()))?;
+        let kind = validate_provider_kind(input.kind.as_deref())?;
         let row_id = id();
         let time = now();
         sqlx::query(
-            "INSERT INTO providers(id,name,base_url,created_at,updated_at) VALUES(?,?,?,?,?)",
+            "INSERT INTO providers(id,name,base_url,kind,created_at,updated_at) VALUES(?,?,?,?,?,?)",
         )
         .bind(&row_id)
         .bind(input.name.trim())
         .bind(base_url)
+        .bind(kind.as_deref())
         .bind(&time)
         .bind(&time)
         .execute(self.db.pool())
@@ -279,7 +308,14 @@ impl AdminService {
             ),
             None => None,
         };
-        if name.is_none() && base_url.is_none() {
+        let kind = match &input.kind {
+            Some(value) => validate_provider_kind(Some(value))?,
+            None => None,
+        };
+        // P1-4 continuation: `kind` uses the same all-or-nothing update as
+        // name/base_url.
+        let kind_present = input.kind.is_some();
+        if name.is_none() && base_url.is_none() && !kind_present {
             return self.get_provider(row_id).await;
         }
         let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM providers WHERE id=?")
@@ -301,6 +337,13 @@ impl AdminService {
                 builder.push(",");
             }
             builder.push(" base_url=").push_bind(url);
+            comma = true;
+        }
+        if kind_present {
+            if comma {
+                builder.push(",");
+            }
+            builder.push(" kind=").push_bind(kind);
             comma = true;
         }
         if comma {
@@ -530,6 +573,7 @@ mod tests {
             Arc::clone(&clock),
             Arc::clone(&limits),
         );
+        let command_code_login = crate::commandcode_login::CommandCodeLogin::new(std::sync::Arc::clone(&http));
         let state = crate::application::Context {
             config: Arc::new(AppConfig::default()),
             db: db.clone(),
@@ -546,6 +590,7 @@ mod tests {
             limits,
             balance,
             admin: crate::admin::AdminService::new(db.clone(), secrets.clone()),
+            command_code_login,
             recovery: crate::auth::RecoverySession::new(),
         };
         (state, dir)
@@ -675,6 +720,7 @@ mod tests {
             Json(ProviderPatch {
                 name: Some("renamed".into()),
                 base_url: Some("http://127.0.0.1:2".into()),
+                kind: None,
             }),
         )
         .await
@@ -696,6 +742,70 @@ mod tests {
         );
     }
 
+    /// `providers.kind` (migration 0005) is explicit and validated: only
+    /// `command_code` is accepted, unknown values are rejected before any
+    /// write, and an empty string clears the marker.
+    #[tokio::test]
+    async fn provider_kind_round_trips_and_rejects_unknown_values() {
+        let (state, _dir) = test_state().await;
+        let response = create_provider(
+            AdminAuth,
+            State(state.clone()),
+            Json(ProviderInput {
+                name: "cc".into(),
+                base_url: "https://api.commandcode.ai".into(),
+                kind: Some("command_code".into()),
+            }),
+        )
+        .await
+        .expect("create must succeed");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let (id, kind): (String, Option<String>) =
+            sqlx::query_as("SELECT id, kind FROM providers WHERE name='cc'")
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(kind.as_deref(), Some("command_code"));
+
+        let error = create_provider(
+            AdminAuth,
+            State(state.clone()),
+            Json(ProviderInput {
+                name: "bad".into(),
+                base_url: "https://example.com".into(),
+                kind: Some("bogus".into()),
+            }),
+        )
+        .await
+        .expect_err("unknown kind must be rejected");
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM providers WHERE name='bad'")
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "rejected input must not be persisted");
+
+        let response = patch_provider(
+            AdminAuth,
+            State(state.clone()),
+            Path(id.clone()),
+            Json(ProviderPatch {
+                name: None,
+                base_url: None,
+                kind: Some(String::new()),
+            }),
+        )
+        .await
+        .expect("clearing kind must succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+        let kind: Option<String> = sqlx::query_scalar("SELECT kind FROM providers WHERE id=?")
+            .bind(&id)
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap();
+        assert!(kind.is_none());
+    }
+
     /// P1-4: a successful provider PATCH writes name + base_url in one
     /// statement, so the row carries a single consistent updated_at.
     #[tokio::test]
@@ -715,6 +825,7 @@ mod tests {
             Json(ProviderPatch {
                 name: Some("renamed".into()),
                 base_url: Some("http://127.0.0.1:2".into()),
+                kind: None,
             }),
         )
         .await
@@ -737,6 +848,7 @@ mod tests {
             Json(ProviderPatch {
                 name: Some("renamed-again".into()),
                 base_url: Some("not a url".into()),
+                kind: None,
             }),
         )
         .await
@@ -1655,6 +1767,7 @@ mod tests {
                 protocol: None,
                 protocols: vec!["openai_compatible".into(), "claude".into()],
                 api_key: "k".into(),
+                login_id: None,
                 manual_enabled: true,
                 health_check_model_id: Some("A".into()),
             }),
@@ -2084,4 +2197,212 @@ mod tests {
         assert!(ids.contains(&"channel-model-x".into()), "responses-capable models feed codex presets");
         assert!(!ids.contains(&"claude-opus-5".into()), "claude defaults do not leak into codex presets");
     }
+    /// `GET /command-code/status` surfaces the switch, the verified protocol
+    /// baseline and version drift; it must not leak any credential material.
+    #[tokio::test]
+    async fn command_code_status_reports_switch_baseline_and_drift() {
+        let (state, _dir) = test_state().await;
+        let response = command_code_status(AdminAuth, State(state.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body.get("enabled").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            body.get("verified_baseline").and_then(Value::as_str),
+            Some(crate::commandcode::DEFAULT_CLI_VERSION)
+        );
+        assert_eq!(body.get("drift").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            body.get("channel_count").and_then(Value::as_i64),
+            Some(0)
+        );
+        assert!(
+            body.get("warning")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("403 upgrade_required")
+        );
+        assert!(!body.to_string().contains("api_key"));
+
+        // A probed CLI version that differs from the fixture baseline is
+        // reported as drift.
+        sqlx::query(
+            "INSERT INTO settings(key,value_json,updated_at) VALUES('command_code_cli_version','\"1.99.0\"',?)",
+        )
+        .bind("2026-08-04T01:00:00+00:00")
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+        let response = command_code_status(AdminAuth, State(state.clone()))
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body.get("cli_version").and_then(Value::as_str),
+            Some("1.99.0")
+        );
+        assert_eq!(body.get("drift").and_then(Value::as_bool), Some(true));
+    }
+
+    /// The static preset catalog leads with the Command Code Go preset and
+    /// carries the mandatory risk warning the UI must confirm.
+    #[tokio::test]
+    async fn provider_presets_lead_with_command_code_go() {
+        let response = list_provider_presets(AdminAuth).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let items = body.get("items").and_then(Value::as_array).unwrap();
+        let first = &items[0];
+        assert_eq!(first.get("id").and_then(Value::as_str), Some("command_code_go"));
+        assert_eq!(
+            first.get("base_url").and_then(Value::as_str),
+            Some("https://api.commandcode.ai")
+        );
+        assert_eq!(
+            first.get("protocol").and_then(Value::as_str),
+            Some("command_code")
+        );
+        assert_eq!(
+            first.get("kind").and_then(Value::as_str),
+            Some("command_code")
+        );
+        assert_eq!(
+            first.get("auth").and_then(Value::as_str),
+            Some("browser_login"),
+            "Go 套餐必须在预设里声明网页登录授权"
+        );
+        let warning = first
+            .get("warning")
+            .and_then(Value::as_str)
+            .expect("preset warning");
+        assert!(warning.contains("403 upgrade_required"));
+        assert!(warning.contains("账号封禁"));
+        // Generic presets must not carry a warning or a kind.
+        assert!(items[1..].iter().all(|item| item.get("warning").is_none_or(Value::is_null)));
+    }
+
+    /// Command Code 网页登录的一次性交接：管理端只拿到 `login_id`，密钥由
+    /// 服务端取走并加密入库；句柄单次有效，重放与未知句柄都必须被拒绝。
+    #[tokio::test]
+    async fn channel_creation_consumes_a_command_code_login_handoff() {
+        let (state, _dir) = test_state().await;
+        sqlx::query("INSERT INTO providers(id,name,base_url,kind,created_at,updated_at) VALUES('prov-cc','cc','https://api.commandcode.ai','command_code',?,?)")
+            .bind("2026-08-04T01:00:00+00:00")
+            .bind("2026-08-04T01:00:00+00:00")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        let status = state.command_code_login.store_validated_key(
+            "user_handoff".to_owned(),
+            "alice".to_owned(),
+            "cli".to_owned(),
+        );
+        let login_id = match status {
+            crate::commandcode_login::LoginStatus::Success { login_id, .. } => login_id,
+            other => panic!("expected success status, got {other:?}"),
+        };
+        let input = |provider_id: &str, name: &str, login_id: Option<String>| ChannelInput {
+            provider_id: provider_id.into(),
+            name: name.into(),
+            protocol: None,
+            protocols: vec!["command_code".into()],
+            api_key: String::new(),
+            login_id,
+            manual_enabled: true,
+            health_check_model_id: None,
+        };
+
+        // 失败的创建（provider 不存在）不得消耗交接：凭据仍可重试。
+        let error = create_channel(
+            AdminAuth,
+            State(state.clone()),
+            Json(input("missing-provider", "cc-chan", Some(login_id.clone()))),
+        )
+        .await
+        .expect_err("unknown provider must fail");
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            state.command_code_login.peek_key(&login_id).as_deref(),
+            Some("user_handoff"),
+            "a failed create must not burn the one-time handoff"
+        );
+
+        let response = create_channel(
+            AdminAuth,
+            State(state.clone()),
+            Json(input("prov-cc", "cc-chan", Some(login_id.clone()))),
+        )
+        .await
+        .expect("handoff must create the channel");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let encrypted: Vec<u8> =
+            sqlx::query_scalar("SELECT api_key_encrypted FROM channels WHERE name='cc-chan'")
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            state.secrets.decrypt(&encrypted).unwrap(),
+            "user_handoff",
+            "the Studio key lands encrypted in the channel row"
+        );
+
+        // Single use: replaying the same login_id is rejected and creates nothing.
+        let error = create_channel(
+            AdminAuth,
+            State(state.clone()),
+            Json(input("prov-cc", "cc-chan-2", Some(login_id))),
+        )
+        .await
+        .expect_err("replayed handoff must be rejected");
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM channels")
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "no second channel may be created");
+
+        // Unknown handle is rejected too.
+        let error = create_channel(
+            AdminAuth,
+            State(state.clone()),
+            Json(input("prov-cc", "cc-chan-3", Some("missing-login".into()))),
+        )
+        .await
+        .expect_err("unknown handle must be rejected");
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// 登录状态端点透出状态机且永不包含密钥本身。
+    #[tokio::test]
+    async fn command_code_login_status_never_exposes_the_key() {
+        let (state, _dir) = test_state().await;
+        let response = command_code_login_status(AdminAuth, State(state.clone()))
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body.pointer("/login/state").and_then(Value::as_str),
+            Some("idle")
+        );
+        assert_eq!(
+            body.get("cli_key_available").and_then(Value::as_bool),
+            Some(state.command_code_login.cli_key_available())
+        );
+        assert!(!body.to_string().contains("apiKey"));
+        assert!(!body.to_string().contains("api_key"));
+    }
+
 }

@@ -26,6 +26,20 @@ pub struct RuntimeSettings {
     pub max_buffered_upstream_body_mb: i64,
     pub model_discovery_interval_hours: i64,
     pub log_retention_days: i64,
+    /// Command Code integration master switch (default off: zero upstream
+    /// Command Code requests while disabled).
+    pub command_code_enabled: bool,
+    /// Idle timeout for the Command Code NDJSON stream (silent
+    /// `tool-input-*` windows included).
+    pub command_code_idle_timeout_seconds: i64,
+    /// Fingerprint/lifecycle re-init throttle (community baseline: 8h).
+    pub command_code_init_interval_hours: i64,
+    /// npm `latest` drift check cadence.
+    pub command_code_version_check_interval_hours: i64,
+    /// Command Code quota (balance) refresh cadence.
+    pub command_code_quota_interval_minutes: i64,
+    /// Max in-flight `/alpha/generate` requests per channel (one account).
+    pub command_code_max_concurrency: i64,
 }
 
 impl Default for RuntimeSettings {
@@ -44,6 +58,12 @@ impl Default for RuntimeSettings {
             max_buffered_upstream_body_mb: 64,
             model_discovery_interval_hours: 24,
             log_retention_days: 30,
+            command_code_enabled: false,
+            command_code_idle_timeout_seconds: 120,
+            command_code_init_interval_hours: 8,
+            command_code_version_check_interval_hours: 24,
+            command_code_quota_interval_minutes: 15,
+            command_code_max_concurrency: 2,
         }
     }
 }
@@ -71,6 +91,12 @@ const RUNTIME_SETTING_KEYS: &[&str] = &[
     "max_buffered_upstream_body_mb",
     "model_discovery_interval_hours",
     "log_retention_days",
+    "command_code_enabled",
+    "command_code_idle_timeout_seconds",
+    "command_code_init_interval_hours",
+    "command_code_version_check_interval_hours",
+    "command_code_quota_interval_minutes",
+    "command_code_max_concurrency",
 ];
 
 /// Raised when a stored runtime setting row cannot be decoded exactly (bad
@@ -102,6 +128,11 @@ fn setting_ranges() -> HashMap<&'static str, (i64, i64)> {
         ("max_buffered_upstream_body_mb", (1, 1024)),
         ("model_discovery_interval_hours", (1, 168)),
         ("log_retention_days", (1, 365)),
+        ("command_code_idle_timeout_seconds", (10, 3600)),
+        ("command_code_init_interval_hours", (1, 168)),
+        ("command_code_version_check_interval_hours", (1, 720)),
+        ("command_code_quota_interval_minutes", (1, 1440)),
+        ("command_code_max_concurrency", (1, 32)),
     ])
 }
 
@@ -113,7 +144,7 @@ fn setting_ranges() -> HashMap<&'static str, (i64, i64)> {
 /// gateway at startup. `trust_local_network` in particular can never
 /// silently degrade to `true` (P1-3).
 fn strict_setting_check(key: &str, parsed: &Value) -> Result<(), ConfigCorrupted> {
-    if key == "trust_local_network" {
+    if matches!(key, "trust_local_network" | "command_code_enabled") {
         if !parsed.is_boolean() {
             return Err(ConfigCorrupted(format!("{key}: expected boolean")));
         }
@@ -341,9 +372,9 @@ pub fn validate_updates(value: &Value) -> Result<()> {
         if matches!(key.as_str(), "admin_access_key" | "gateway_access_key") {
             continue;
         }
-        if key == "trust_local_network" {
+        if matches!(key.as_str(), "trust_local_network" | "command_code_enabled") {
             if !value.is_boolean() {
-                bail!("trust_local_network 必须是布尔值");
+                bail!("{key} 必须是布尔值");
             }
             continue;
         }
@@ -515,6 +546,7 @@ mod tests {
             Arc::clone(&clock),
             Arc::clone(&limits),
         );
+        let command_code_login = crate::commandcode_login::CommandCodeLogin::new(std::sync::Arc::clone(&http));
         let state = crate::application::Context {
             config: Arc::new(AppConfig::default()),
             db: db.clone(),
@@ -531,6 +563,7 @@ mod tests {
             limits,
             balance,
             admin: crate::admin::AdminService::new(db.clone(), secrets.clone()),
+            command_code_login,
             recovery: crate::auth::RecoverySession::new(),
         };
         (state, dir)

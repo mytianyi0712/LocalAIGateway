@@ -67,6 +67,8 @@ check_admin_handlers() {
 }
 
 check_admin_handlers src/admin/providers.rs
+check_admin_handlers src/admin/presets.rs
+check_admin_handlers src/admin/commandcode.rs
 check_admin_handlers src/admin/channels.rs
 check_admin_handlers src/admin/balances.rs
 

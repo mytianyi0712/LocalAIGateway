@@ -128,7 +128,7 @@ impl RouteRepository for SqliteRouteRepository {
         Box::pin(async move {
             Ok(sqlx::query_as::<_, Candidate>(
             "SELECT rc.id AS candidate_id, c.id AS channel_id, c.name AS channel_name, \
-                    rc.priority, p.base_url, c.api_key_encrypted, cm.model_id, \
+                    rc.priority, p.base_url, p.kind, c.api_key_encrypted, cm.model_id, \
                     COALESCE(cp.remote_compaction_v1_support, 0) AS remote_compaction_v1_support, \
                     COALESCE(cp.remote_compaction_v2_support, 0) AS remote_compaction_v2_support \
              FROM route_candidates rc \
@@ -167,7 +167,7 @@ impl RouteRepository for SqliteRouteRepository {
         };
         let sql = format!(
             "SELECT rc.id AS candidate_id, c.id AS channel_id, c.name AS channel_name, \
-                    rc.priority, p.base_url, c.api_key_encrypted, cm.model_id, \
+                    rc.priority, p.base_url, p.kind, c.api_key_encrypted, cm.model_id, \
                     COALESCE(cp.remote_compaction_v1_support, 0) AS remote_compaction_v1_support, \
                     COALESCE(cp.remote_compaction_v2_support, 0) AS remote_compaction_v2_support \
              FROM route_candidates rc \
@@ -274,7 +274,7 @@ impl RouteRepository for SqliteRouteRepository {
                  WHERE rc.route_id = mr.id AND rc.enabled = 1 AND cm.available = 1 \
                    AND c.manual_enabled = 1 AND ch.state = 'active') \
              ORDER BY CASE mr.protocol WHEN 'openai_compatible' THEN 0 \
-               WHEN 'openai_responses' THEN 1 WHEN 'claude' THEN 2 ELSE 3 END",
+               WHEN 'openai_responses' THEN 1 WHEN 'claude' THEN 2 WHEN 'command_code' THEN 4 ELSE 3 END",
         )
         .bind(model_id.as_str())
         .fetch_all(db.pool())
@@ -339,7 +339,7 @@ impl ChannelRepository for SqliteChannelRepository {
         let channel_id = channel_id.to_owned();
         Box::pin(async move {
             let row = sqlx::query(
-            "SELECT c.id, c.name, c.protocol, c.health_check_model_id, c.api_key_encrypted, p.base_url, c.manual_enabled \
+            "SELECT c.id, c.name, c.protocol, c.health_check_model_id, c.api_key_encrypted, p.base_url, p.kind, c.manual_enabled \
              FROM channels c JOIN providers p ON p.id=c.provider_id WHERE c.id=?",
         )
         .bind(channel_id)
@@ -349,6 +349,7 @@ impl ChannelRepository for SqliteChannelRepository {
                 id: row.get("id"),
                 name: row.get("name"),
                 protocol: row.get("protocol"),
+                kind: row.get("kind"),
                 health_check_model_id: row.get("health_check_model_id"),
                 api_key_encrypted: row.get("api_key_encrypted"),
                 base_url: row.get("base_url"),

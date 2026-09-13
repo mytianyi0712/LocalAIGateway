@@ -19,6 +19,8 @@ pub struct Candidate {
     pub channel_name: String,
     pub priority: i64,
     pub base_url: String,
+    /// `providers.kind`: `command_code` opts into CLI identity headers.
+    pub kind: Option<String>,
     pub api_key_encrypted: Vec<u8>,
     pub model_id: String,
     /// Raw `channel_protocols.remote_compaction_v1_support`:
@@ -49,12 +51,15 @@ pub struct RoutableModel {
 /// Primary proxy entrypoint per protocol, as advertised in the model catalog.
 /// OpenAI Compatible only advertises `/v1/chat/completions` — embeddings and
 /// completions are deliberately not guessed (see requirements.md 3.7).
+/// Command Code is upstream-only (reached through claude/codex mappings), so
+/// it has no entry endpoint and is dropped from the catalog.
 pub fn protocol_main_endpoint(protocol: &str, model_id: &str) -> Option<String> {
     match protocol {
         "openai_compatible" => Some("/v1/chat/completions".to_owned()),
         "openai_responses" => Some("/v1/responses".to_owned()),
         "claude" => Some("/v1/messages".to_owned()),
         "gemini" => Some(format!("/v1beta/models/{model_id}:generateContent")),
+        "command_code" => None,
         _ => None,
     }
 }

@@ -7,13 +7,14 @@ use axum::extract::{Query, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-pub(super) const CACHE_PROVIDER_PROTOCOLS: [(&str, &str); 4] = [
+pub(super) const CACHE_PROVIDER_PROTOCOLS: [(&str, &str); 5] = [
     ("openai_compatible", "OpenAI"),
     ("openai_responses", "OpenAI"),
     ("claude", "Claude"),
     ("gemini", "Gemini"),
+    ("command_code", "Command Code"),
 ];
-pub(super) const CACHE_PROVIDER_ORDER: [&str; 3] = ["OpenAI", "Claude", "Gemini"];
+pub(super) const CACHE_PROVIDER_ORDER: [&str; 4] = ["OpenAI", "Claude", "Gemini", "Command Code"];
 
 pub(super) fn cache_provider(protocol: &str) -> String {
     CACHE_PROVIDER_PROTOCOLS

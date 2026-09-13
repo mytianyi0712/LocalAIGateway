@@ -112,7 +112,20 @@ async fn probe(state: &Context, channel_id: &str, cancel: CancellationToken) -> 
     let mut successes = 0usize;
     let mut probed = 0usize;
     let mut first_failure: Option<(bool, Option<i64>, Option<String>)> = None;
+    // 渠道只配置了 Command Code 且集成被关闭：这不是模型缺失，而是功能未启用，
+    // 直接给出稳定原因，避免 UI 显示“没有可用探测模型”。
+    if !runtime.command_code_enabled
+        && !protocols.is_empty()
+        && protocols.iter().all(|value| value == "command_code")
+    {
+        first_failure = Some((false, None, Some("command_code_disabled".into())));
+    }
     for protocol_name in &protocols {
+        // Plan phase 7: with the integration disabled the gateway performs
+        // zero Command Code upstream requests, probes included.
+        if protocol_name == "command_code" && !runtime.command_code_enabled {
+            continue;
+        }
         let model = match &global_model {
             Some(model) => {
                 let supported: i64 = sqlx::query_scalar(
@@ -154,7 +167,7 @@ async fn probe(state: &Context, channel_id: &str, cancel: CancellationToken) -> 
             // failing the whole channel (P1-9 fallback semantics).
             continue;
         }
-        let Some((path, body)) = protocol::health_probe(protocol_name, &model) else {
+        let Some(probe) = protocol::health_probe(protocol_name, &model) else {
             if first_failure.is_none() {
                 first_failure = Some((
                     false,
@@ -164,23 +177,34 @@ async fn probe(state: &Context, channel_id: &str, cancel: CancellationToken) -> 
             }
             continue;
         };
-        let url = protocol::upstream_url(&base, &path, None, protocol_name)?;
+        let url = protocol::upstream_url(&base, &probe.path, None, protocol_name)?;
         let mut headers =
             protocol::outbound_headers(&axum::http::HeaderMap::new(), protocol_name, &key)?;
         if protocol::requires_opencode_session(&base) {
             let session_id = settings::opencode_session_id(&state.db).await;
             protocol::apply_opencode_session(&mut headers, &base, &session_id)?;
         }
+        if protocol_name == "command_code"
+            && protocol::requires_command_code_identity(row.kind.as_deref())
+        {
+            // Command Code probes /alpha/whoami with the same identity
+            // headers the CLI sends; session/version are read per channel.
+            let identity = crate::commandcode::identity_for_probe(&state.db, channel_id).await;
+            protocol::apply_command_code_identity(&mut headers, &identity)?;
+        }
         // Probes originate a JSON body without inbound headers to copy;
         // several upstreams (e.g. opencode.ai) reject the request with a 500
         // when Content-Type is missing.
-        if !headers.contains_key(axum::http::header::CONTENT_TYPE) {
+        if probe.body.is_some() && !headers.contains_key(axum::http::header::CONTENT_TYPE) {
             headers.insert(
                 axum::http::header::CONTENT_TYPE,
                 axum::http::HeaderValue::from_static("application/json"),
             );
         }
-        let payload = serde_json::to_vec(&body)?;
+        let payload = match &probe.body {
+            Some(body) => Some(bytes::Bytes::from(serde_json::to_vec(body)?)),
+            None => None,
+        };
         probed += 1;
         let started = Instant::now();
         // P2-1: probes go through the upstream port; the port applies the
@@ -192,8 +216,8 @@ async fn probe(state: &Context, channel_id: &str, cancel: CancellationToken) -> 
             result = state.http.send(crate::ports::UpstreamRequest {
                 url,
                 headers,
-                method: http::Method::POST,
-                body: Some(bytes::Bytes::from(payload)),
+                method: probe.method,
+                body: payload,
                 connect_timeout: std::time::Duration::from_secs(
                     runtime.connect_timeout_seconds.max(1) as u64,
                 ),
@@ -486,6 +510,7 @@ mod tests {
             Arc::clone(&clock),
             Arc::clone(&limits),
         );
+        let command_code_login = crate::commandcode_login::CommandCodeLogin::new(std::sync::Arc::clone(&http));
         let state = crate::application::Context {
             config: Arc::new(AppConfig::default()),
             db: db.clone(),
@@ -502,6 +527,7 @@ mod tests {
             limits,
             balance,
             admin: crate::admin::AdminService::new(db.clone(), secrets.clone()),
+            command_code_login,
             recovery: crate::auth::RecoverySession::new(),
         };
         let time = "2026-08-04T01:00:00+00:00";
@@ -541,6 +567,111 @@ mod tests {
             .await
             .unwrap();
         (state, dir)
+    }
+
+
+    /// Command Code probe mock: answers every request with a `whoami` account
+    /// body and records the request head.
+    async fn spawn_command_code_probe_upstream() -> (
+        u16,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let n = match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        buf.extend_from_slice(&chunk[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+                    let body = r#"{"org":{"id":"org_1","login":"me"},"user":{"userName":"u"}}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (port, rx)
+    }
+
+    /// Command Code health is a read-only `GET /alpha/whoami` carrying the
+    /// CLI identity headers; a healthy verdict activates the channel.
+    #[tokio::test]
+    async fn command_code_probe_uses_whoami_with_identity_and_activates() {
+        let (port, mut heads) = spawn_command_code_probe_upstream().await;
+        let (state, _dir) = test_state(port).await;
+        let time = "2026-08-04T01:00:00+00:00";
+        sqlx::query("UPDATE providers SET kind='command_code' WHERE id='prov-1'")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE channels SET protocol='command_code' WHERE id='ch-1'")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM channel_protocols WHERE channel_id='ch-1'")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channel_protocols(channel_id,protocol) VALUES('ch-1','command_code')")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM channel_model_protocols WHERE channel_model_id='cm-1'")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channel_model_protocols(channel_model_id,protocol) VALUES('cm-1','command_code')")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO settings(key,value_json,updated_at) VALUES('command_code_enabled','true',?)")
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+
+        let ok = probe(&state, "ch-1", CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(ok, "whoami 200 must mark the channel healthy");
+
+        let head = tokio::time::timeout(Duration::from_secs(5), heads.recv())
+            .await
+            .expect("probe request timed out")
+            .expect("probe request missing");
+        assert!(head.starts_with("GET /alpha/whoami"), "{head}");
+        let lower = head.to_ascii_lowercase();
+        assert!(lower.contains("x-cli-environment: production"), "{head}");
+        assert!(lower.contains("x-command-code-version:"), "{head}");
+        assert!(lower.contains("x-session-id:"), "{head}");
+        assert!(lower.contains("authorization: bearer test-key"), "{head}");
+        assert!(!lower.contains("content-length: "), "whoami carries no body");
+
+        let (health,): (String,) =
+            sqlx::query_as("SELECT state FROM channel_health WHERE channel_id='ch-1'")
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(health, "active");
     }
 
     /// P2-7: health is credential-level — both configured protocols must

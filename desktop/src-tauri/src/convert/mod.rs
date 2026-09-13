@@ -32,9 +32,27 @@ pub enum ConversionStrategy {
     ClaudeToChat,
     ClaudeToResponses,
     ClaudeToGemini,
+    /// Entry → Command Code `/alpha/generate` body (upstream-only protocol).
+    ClaudeToCommandCode,
+    /// OpenAI chat entry → Command Code `/alpha/generate` body (silent
+    /// conversion for direct `/v1/chat/completions` requests; no mapping).
+    ChatToCommandCode,
     ResponsesToChat,
     ResponsesToClaude,
     ResponsesToGemini,
+    /// Entry → Command Code `/alpha/generate` body (upstream-only protocol).
+    ResponsesToCommandCode,
+}
+
+/// Upstream protocol a client entry may silently fall back to when it has no
+/// route of its own. Today this is OpenAI chat → Command Code: the request and
+/// stream converters exist, so `/v1/chat/completions` can drive a
+/// `command_code` route without a Claude/Codex mapping.
+pub fn fallback_upstream_protocol(entry: &str) -> Option<&'static str> {
+    match entry {
+        "openai_compatible" => Some("command_code"),
+        _ => None,
+    }
 }
 
 fn new_id(prefix: &str) -> String {
@@ -199,11 +217,13 @@ fn image_data_url(source: &Value, default_media_type: &str) -> String {
 // Claude entry -> upstream request conversion
 // ---------------------------------------------------------------------------
 
+mod commandcode;
 mod error;
 mod request;
 mod response;
 mod scan;
 mod stream;
+pub use commandcode::{CommandCodeDecoder, ndjson_to_chat_completion};
 pub use error::chunk_has_content;
 pub use error::convert_error;
 pub use request::convert_request;

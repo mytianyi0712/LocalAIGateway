@@ -99,12 +99,23 @@ pub(super) struct UsageAcc {
     cache_read: Option<i64>,
     cache_write: Option<i64>,
     reasoning: Option<i64>,
+    /// True when `input_tokens` is the TOTAL including cache hits (Command
+    /// Code emits `prompt_tokens_includes_cache`). Anthropic `input_tokens`
+    /// must then be the non-cached part (hard pit 9).
+    input_includes_cache: bool,
 }
 
 impl UsageAcc {
     fn merge_openai(&mut self, usage: &Value) {
         if let Some(value) = usage.get("prompt_tokens").and_then(Value::as_i64) {
             self.input_tokens = Some(value);
+        }
+        if usage
+            .get(super::commandcode::INPUT_INCLUDES_CACHE)
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            self.input_includes_cache = true;
         }
         if let Some(value) = usage.get("completion_tokens").and_then(Value::as_i64) {
             self.output_tokens = Some(value);
@@ -215,6 +226,8 @@ pub(super) enum ConverterKind {
     ClaudeResponses,
     ClaudeGemini,
     ClaudePassthrough,
+    /// OpenAI chat entry passthrough (Command Code silent conversion target).
+    ChatPassthrough,
     ResponsesOpenai,
     ResponsesClaude,
     ResponsesGemini,
@@ -266,6 +279,10 @@ pub struct MappedStreamConverter {
     tool_key_index: i64,
     open_block_types: HashMap<i64, String>,
     function_key_by_block: HashMap<i64, String>,
+    /// Accumulated thinking text per open block, used to synthesize the
+    /// Anthropic `signature_delta` when the upstream provides no signature
+    /// (Command Code / OpenAI-compatible reasoning paths, hard pit 8).
+    thinking_text: HashMap<i64, String>,
     // DSML state
     dsml_text_buffer: String,
     dsml_start_marker: Option<String>,
@@ -280,11 +297,17 @@ impl MappedStreamConverter {
             Some(ClaudeToChat) => ConverterKind::ClaudeOpenai,
             Some(ClaudeToResponses) => ConverterKind::ClaudeResponses,
             Some(Passthrough) if entry == "claude" => ConverterKind::ClaudePassthrough,
+            Some(Passthrough) if entry == "openai_compatible" => ConverterKind::ChatPassthrough,
             Some(ClaudeToGemini) => ConverterKind::ClaudeGemini,
             Some(ResponsesToChat) => ConverterKind::ResponsesOpenai,
             Some(Passthrough) => ConverterKind::ResponsesPassthrough,
             Some(ResponsesToClaude) => ConverterKind::ResponsesClaude,
             Some(ResponsesToGemini) => ConverterKind::ResponsesGemini,
+            Some(ClaudeToCommandCode)
+            | Some(ResponsesToCommandCode)
+            | Some(ChatToCommandCode) => bail!(
+                "Command Code streams are decoded to openai_compatible before conversion"
+            ),
             None => bail!("Unsupported upstream protocol: {upstream_protocol}"),
         };
         Ok(Self {
@@ -317,6 +340,7 @@ impl MappedStreamConverter {
             tool_key_index: 0,
             open_block_types: HashMap::new(),
             function_key_by_block: HashMap::new(),
+            thinking_text: HashMap::new(),
             dsml_text_buffer: String::new(),
             dsml_start_marker: None,
             dsml_end_marker: None,
@@ -343,7 +367,9 @@ impl MappedStreamConverter {
         }
         let passthrough = matches!(
             self.kind,
-            ConverterKind::ClaudePassthrough | ConverterKind::ResponsesPassthrough
+            ConverterKind::ClaudePassthrough
+                | ConverterKind::ChatPassthrough
+                | ConverterKind::ResponsesPassthrough
         );
         if passthrough {
             // Same-protocol mapped streams forward the raw bytes untouched,
@@ -367,6 +393,7 @@ impl MappedStreamConverter {
                         .get("message")
                         .and_then(|message| message.get("usage"))
                         .or_else(|| value.get("usage")),
+                    ConverterKind::ChatPassthrough => value.get("usage"),
                     _ => value
                         .get("usage")
                         .or_else(|| value.get("response").and_then(|item| item.get("usage"))),
@@ -374,6 +401,7 @@ impl MappedStreamConverter {
                 if let Some(usage) = usage.filter(|item| item.is_object()) {
                     match self.kind {
                         ConverterKind::ClaudePassthrough => self.usage.merge_claude(usage),
+                        ConverterKind::ChatPassthrough => self.usage.merge_openai(usage),
                         _ => self.usage.merge_responses(usage),
                     }
                 }
@@ -447,7 +475,9 @@ impl MappedStreamConverter {
             ConverterKind::ResponsesClaude | ConverterKind::ResponsesGemini => {
                 self.finish_responses(self.status.clone())
             }
-            ConverterKind::ClaudePassthrough | ConverterKind::ResponsesPassthrough => Vec::new(),
+            ConverterKind::ClaudePassthrough
+            | ConverterKind::ChatPassthrough
+            | ConverterKind::ResponsesPassthrough => Vec::new(),
         }
     }
 
@@ -469,6 +499,19 @@ impl MappedStreamConverter {
                 })));
                 self.finished = true;
                 output
+            }
+            ConverterKind::ChatPassthrough => {
+                self.finished = true;
+                sse(
+                    "error",
+                    &json!({
+                        "error": {
+                            "type": GATEWAY_ERROR_TYPE,
+                            "code": "gateway_error",
+                            "message": message,
+                        }
+                    }),
+                )
             }
             ConverterKind::ResponsesOpenai => {
                 let mut output = self.drain_dsml_text(None, true);
@@ -554,11 +597,69 @@ impl MappedStreamConverter {
         if !self.open_blocks.contains_key(&index) {
             return Vec::new();
         }
-        self.open_blocks.remove(&index);
-        sse(
+        let block_type = self
+            .open_blocks
+            .remove(&index)
+            .unwrap_or_else(|| "text".to_owned());
+        let mut output = Vec::new();
+        if block_type == "thinking" {
+            // Hard pit 8: the upstream reasoning feed carries no signature,
+            // but Anthropic clients expect a `signature_delta` before the
+            // thinking block closes. Synthesize a deterministic placeholder
+            // over the accumulated thinking text (never a secret).
+            use base64::Engine as _;
+            use sha2::{Digest, Sha256};
+            let text = self.thinking_text.remove(&index).unwrap_or_default();
+            let mut hasher = Sha256::new();
+            hasher.update(text.as_bytes());
+            hasher.update(index.to_le_bytes());
+            let signature = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+            output.extend(self.delta(
+                index,
+                &json!({"type": "signature_delta", "signature": signature}),
+            ));
+        }
+        output.extend(sse(
             "content_block_stop",
             &json!({"type": "content_block_stop", "index": index}),
+        ));
+        output
+    }
+
+    /// 追加一段 thinking：同一段思考必须复用同一个 content block。上游每个
+    /// delta 都开一个新 block 会让 Claude 客户端看到 N 段独立的思考（真实
+    /// 观测：每个 token 一个 `content_block_start`）。
+    fn thinking_delta(&mut self, text: &str) -> Vec<u8> {
+        let index = match self.current_block_of_type("thinking") {
+            Some(index) => index,
+            None => {
+                let index = self.next_block_index();
+                let mut output =
+                    self.start_block(index, &json!({"type": "thinking", "thinking": ""}));
+                output.extend(self.emit_thinking_delta(index, text));
+                return output;
+            }
+        };
+        self.emit_thinking_delta(index, text)
+    }
+
+    fn emit_thinking_delta(&mut self, index: i64, text: &str) -> Vec<u8> {
+        self.thinking_text
+            .entry(index)
+            .or_default()
+            .push_str(text);
+        self.delta(
+            index,
+            &json!({"type": "thinking_delta", "thinking": text}),
         )
+    }
+
+    /// Claude 的 content block 必须顺序开闭：非 thinking 内容开始前先关闭
+    /// 打开中的 thinking block（`stop_block` 会补上 signature_delta）。
+    fn close_thinking(&mut self) -> Vec<u8> {
+        self.current_block_of_type("thinking")
+            .map(|index| self.stop_block(index))
+            .unwrap_or_default()
     }
 
     fn current_block_of_type(&self, block_type: &str) -> Option<i64> {
@@ -568,11 +669,30 @@ impl MappedStreamConverter {
             .map(|(index, _)| *index)
     }
 
+    /// 单调递增，且**不复用**已关闭块的 index：Anthropic 客户端按 index
+    /// 累积 content，thinking 关闭后若 text 又用回 0，会让文本覆盖思考块。
     fn next_block_index(&mut self) -> i64 {
         while self.open_blocks.contains_key(&self.next_index) {
             self.next_index += 1;
         }
-        self.next_index
+        let index = self.next_index;
+        self.next_index += 1;
+        index
+    }
+
+    fn anthropic_input_tokens(&self) -> Option<i64> {
+        if self.usage.input_includes_cache {
+            // Hard pit 9: OpenAI/CC `prompt_tokens` is a total; Anthropic
+            // wants the non-cached part only.
+            self.usage.input_tokens.map(|total| {
+                (total
+                    - self.usage.cache_read.unwrap_or(0)
+                    - self.usage.cache_write.unwrap_or(0))
+                .max(0)
+            })
+        } else {
+            self.usage.input_tokens
+        }
     }
 
     fn finish_claude(&mut self, stop_reason: &str) -> Vec<u8> {
@@ -590,7 +710,7 @@ impl MappedStreamConverter {
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": Value::Null},
                 "usage": claude_usage(
-                    self.usage.input_tokens,
+                    self.anthropic_input_tokens(),
                     self.usage.output_tokens,
                     self.usage.cache_read,
                     self.usage.cache_write,
@@ -1006,7 +1126,9 @@ impl MappedStreamConverter {
             ConverterKind::ResponsesOpenai => self.consume_responses_openai(event),
             ConverterKind::ResponsesClaude => self.consume_responses_claude(event),
             ConverterKind::ResponsesGemini => self.consume_gemini_to_responses(event),
-            ConverterKind::ClaudePassthrough | ConverterKind::ResponsesPassthrough => Vec::new(),
+            ConverterKind::ClaudePassthrough
+            | ConverterKind::ChatPassthrough
+            | ConverterKind::ResponsesPassthrough => Vec::new(),
         }
     }
 
@@ -1030,18 +1152,14 @@ impl MappedStreamConverter {
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
         {
-            let index = self.next_block_index();
-            output.extend(self.start_block(index, &json!({"type": "thinking", "thinking": ""})));
-            output.extend(self.delta(
-                index,
-                &json!({"type": "thinking_delta", "thinking": reasoning}),
-            ));
+            output.extend(self.thinking_delta(reasoning));
         }
         let text = chat_message_text(delta.get("content").unwrap_or(&Value::Null));
         if !text.is_empty() {
             let index = match self.current_block_of_type("text") {
                 Some(index) => index,
                 None => {
+                    output.extend(self.close_thinking());
                     let index = self.next_block_index();
                     output.extend(self.start_block(index, &json!({"type": "text", "text": ""})));
                     index
@@ -1063,6 +1181,7 @@ impl MappedStreamConverter {
                     match index {
                         Some(index) => index,
                         None => {
+                            output.extend(self.close_thinking());
                             let index = self.next_block_index();
                             if let Some(tool_id) = tool_id {
                                 self.tool_index_by_id.insert(tool_id.to_owned(), index);
@@ -1206,17 +1325,12 @@ impl MappedStreamConverter {
             .unwrap_or_default();
         for part in &parts {
             if let Some(thought) = part.get("thought").filter(|value| !value.is_null()) {
-                let index = self.next_block_index();
-                output
-                    .extend(self.start_block(index, &json!({"type": "thinking", "thinking": ""})));
-                output.extend(self.delta(
-                    index,
-                    &json!({"type": "thinking_delta", "thinking": thought}),
-                ));
+                output.extend(self.thinking_delta(thought.as_str().unwrap_or_default()));
             } else if part.get("text").is_some() {
                 let index = match self.current_block_of_type("text") {
                     Some(index) => index,
                     None => {
+                        output.extend(self.close_thinking());
                         let index = self.next_block_index();
                         output
                             .extend(self.start_block(index, &json!({"type": "text", "text": ""})));

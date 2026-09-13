@@ -66,6 +66,8 @@ pub mod error_kind {
     pub const TIMEOUT: &str = "timeout";
     pub const INVALID_PAYLOAD: &str = "invalid_payload";
     pub const CUSTOM_PATH_MISSING: &str = "custom_path_missing";
+    /// Command Code integration is globally disabled (`command_code_enabled`).
+    pub const DISABLED: &str = "disabled";
 }
 
 /// Stable service-level failures for admin handlers.
@@ -139,6 +141,10 @@ pub enum BalanceAdapter {
     OpencodeGo,
     #[serde(rename = "deepseek")]
     DeepSeek,
+    /// Command Code Go: `whoami` → `billing/credits` → `usage/summary`
+    /// (three read-only GETs, no generation).
+    #[serde(rename = "command_code")]
+    CommandCode,
     #[serde(rename = "custom")]
     Custom,
 }
@@ -150,6 +156,7 @@ impl BalanceAdapter {
             "sub2api" => Ok(BalanceAdapter::Sub2Api),
             "opencode_go" => Ok(BalanceAdapter::OpencodeGo),
             "deepseek" => Ok(BalanceAdapter::DeepSeek),
+            "command_code" => Ok(BalanceAdapter::CommandCode),
             "custom" => Ok(BalanceAdapter::Custom),
             other => Err(BalanceError::Invalid(format!(
                 "不支持的余额适配器：{other}"
@@ -163,6 +170,7 @@ impl BalanceAdapter {
             BalanceAdapter::Sub2Api => "sub2api",
             BalanceAdapter::OpencodeGo => "opencode_go",
             BalanceAdapter::DeepSeek => "deepseek",
+            BalanceAdapter::CommandCode => "command_code",
             BalanceAdapter::Custom => "custom",
         }
     }
@@ -174,6 +182,9 @@ impl BalanceAdapter {
             BalanceAdapter::Sub2Api => Some("/v1/usage"),
             BalanceAdapter::OpencodeGo => Some("v1/usage"),
             BalanceAdapter::DeepSeek => Some("/user/balance"),
+            // Multi-step (whoami → credits → summary); the stored path is
+            // unused for this adapter.
+            BalanceAdapter::CommandCode => None,
             BalanceAdapter::Custom => None,
         }
     }
@@ -558,9 +569,13 @@ impl BalanceService {
         };
         let checked_at = self.clock.now_utc().to_rfc3339();
         let started = Instant::now();
-        let outcome = match self.prepare(state, &channel, &config, adapter).await {
-            Ok(prepared) => self.exchange(prepared).await,
-            Err(failure) => Err(failure),
+        let outcome = if adapter == BalanceAdapter::CommandCode {
+            self.command_code_reading(state, &channel, &config).await
+        } else {
+            match self.prepare(state, &channel, &config, adapter).await {
+                Ok(prepared) => self.exchange(prepared).await,
+                Err(failure) => Err(failure),
+            }
         };
         let duration_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
         let snapshot = match outcome {
@@ -845,6 +860,136 @@ impl BalanceService {
                 kind: error_kind::INVALID_PAYLOAD,
                 status_code: Some(status_code),
             })
+    }
+
+    /// Command Code quota: `whoami` → `billing/credits` → `usage/summary`.
+    /// All three are read-only GETs (no generation, no token spend) and
+    /// gated by the global `command_code_enabled` switch.
+    async fn command_code_reading(
+        &self,
+        state: &Context,
+        channel: &ChannelRow,
+        _config: &BalanceConfig,
+    ) -> Result<(i64, BalanceReading), BalanceFailure> {
+        let runtime = crate::settings::runtime_settings(state)
+            .await
+            .unwrap_or_default();
+        if !runtime.command_code_enabled {
+            return Err(BalanceFailure::Classified {
+                kind: error_kind::DISABLED,
+                status_code: None,
+            });
+        }
+        let api_key = self
+            .secrets
+            .decrypt(&channel.api_key_encrypted)
+            .map_err(BalanceFailure::Fatal)?;
+        let deadline = self.limits.balance_timeout;
+        let (_, whoami) = self
+            .command_code_get(&channel.base_url, "/alpha/whoami", &api_key, deadline)
+            .await?;
+        // 账号可能没有 org（whoami 的 `org` 为 null，个人 key）。此时官方
+        // 语义是**省略 orgId 参数**（拼成 `?orgId=` 会得到 400 Invalid UUID）；
+        // patlux 的 buildUrl 同样会丢掉 undefined 参数。
+        let org_id = command_code_org_id(&whoami);
+        let with_org = |path: &str| match &org_id {
+            Some(org_id) => format!("{path}?orgId={org_id}"),
+            None => path.to_owned(),
+        };
+        let credits_path = with_org("/alpha/billing/credits");
+        let (credits_status, credits) = self
+            .command_code_get(&channel.base_url, &credits_path, &api_key, deadline)
+            .await?;
+        // Usage summary is optional: a failure there still yields the
+        // credits/window reading rather than no balance at all.
+        let summary_path = with_org("/alpha/usage/summary");
+        let summary = match self
+            .command_code_get(&channel.base_url, &summary_path, &api_key, deadline)
+            .await
+        {
+            Ok((_, body)) => Some(body),
+            Err(_error) => {
+                tracing::debug!("command code usage summary unavailable");
+                None
+            }
+        };
+        // 订阅信息用于展示 planId/状态，并作为 windowLimits 之外的计划来源；
+        // 查询失败不影响额度读数。
+        let subscriptions_path = with_org("/alpha/billing/subscriptions");
+        let subscription = match self
+            .command_code_get(&channel.base_url, &subscriptions_path, &api_key, deadline)
+            .await
+        {
+            Ok((_, body)) => Some(body),
+            Err(_error) => {
+                tracing::debug!("command code subscriptions unavailable");
+                None
+            }
+        };
+        let reading = parse_command_code(
+            &whoami,
+            &credits,
+            summary.as_deref(),
+            subscription.as_deref(),
+            org_id.as_deref().unwrap_or_default(),
+        )
+        .map_err(|_| BalanceFailure::Classified {
+            kind: error_kind::INVALID_PAYLOAD,
+            status_code: Some(credits_status),
+        })?;
+        Ok((credits_status, reading))
+    }
+
+    async fn command_code_get(
+        &self,
+        base_url: &str,
+        path: &str,
+        api_key: &str,
+        deadline: Duration,
+    ) -> Result<(i64, Vec<u8>), BalanceFailure> {
+        let url = crate::protocol::upstream_url(base_url, path, None, "command_code")
+            .map_err(|_| BalanceFailure::Classified {
+                kind: error_kind::INVALID_PAYLOAD,
+                status_code: None,
+            })?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|_| {
+                BalanceFailure::Classified {
+                    kind: error_kind::INVALID_PAYLOAD,
+                    status_code: None,
+                }
+            })?,
+        );
+        headers.insert(
+            axum::http::header::ACCEPT,
+            HeaderValue::from_static("application/json"),
+        );
+        let response = self
+            .http
+            .send(UpstreamRequest {
+                url,
+                headers,
+                method: Method::GET,
+                body: None,
+                connect_timeout: Duration::from_secs(10),
+                deadline,
+            })
+            .await
+            .map_err(|_| BalanceFailure::Classified {
+                kind: error_kind::TRANSPORT_ERROR,
+                status_code: None,
+            })?;
+        let status_code = response.status.as_u16() as i64;
+        let (body, _truncated) = response.body.read_capped(BALANCE_BODY_MAX).await;
+        if !response.status.is_success() {
+            return Err(BalanceFailure::Classified {
+                kind: status_error_kind(response.status.as_u16()),
+                status_code: Some(status_code),
+            });
+        }
+        Ok((status_code, body))
     }
 
     async fn store_snapshot(&self, snapshot: &BalanceSnapshot) -> Result<(), BalanceError> {
@@ -1343,6 +1488,9 @@ fn parse_reading(adapter: BalanceAdapter, body: &[u8]) -> Result<BalanceReading,
         BalanceAdapter::Sub2Api => parse_sub2api(body),
         BalanceAdapter::OpencodeGo => parse_opencode_go(body),
         BalanceAdapter::DeepSeek => parse_deepseek(body),
+        BalanceAdapter::CommandCode => Err(BalanceError::Invalid(
+            "command_code uses a multi-step query".into(),
+        )),
         BalanceAdapter::Custom => Err(BalanceError::Invalid("custom needs a mapping".into())),
     }
 }
@@ -1556,6 +1704,183 @@ pub fn parse_opencode_go(body: &[u8]) -> Result<BalanceReading, BalanceError> {
     Ok(BalanceReading {
         windows,
         ..BalanceReading::default()
+    })
+}
+
+/// Command Code `whoami`: `org.id`, `orgId` or `org.orgId`.
+pub fn command_code_org_id(whoami: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(whoami).ok()?;
+    // 官方 CLI 读取 `data.org.id`（`/alpha/whoami` 的 usage 包装），社区实现
+    // 读取顶层 `org.id`；两种形状都必须兼容。
+    [
+        value.pointer("/data/org/id"),
+        value.pointer("/data/orgId"),
+        value.pointer("/data/org_id"),
+        value.pointer("/org/id"),
+        value.get("orgId"),
+        value.pointer("/org/orgId"),
+        value.get("org_id"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|value| value.as_str().map(str::to_owned).filter(|id| !id.is_empty()))
+}
+
+/// Command Code 账号名（whoami 顶层 `user`/`data.user` 两种形状）。
+pub fn command_code_account_name(whoami: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(whoami).ok()?;
+    [
+        value.pointer("/user/userName"),
+        value.pointer("/user/name"),
+        value.pointer("/data/user/userName"),
+        value.pointer("/data/user/name"),
+        value.pointer("/org/login"),
+        value.pointer("/data/org/login"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|value| value.as_str().map(str::to_owned).filter(|name| !name.is_empty()))
+}
+
+/// 把窗口重置时间统一成 RFC3339（秒/毫秒时间戳或 ISO 字符串）。
+fn quota_reset_at(value: &Value) -> Option<String> {
+    // `resetAt: 0`（以及负数）表示“窗口尚未消耗、没有待重置时间”，不能
+    // 当成 1970 年展示。
+    let normalize = |epoch: i64| {
+        if epoch <= 0 {
+            return None;
+        }
+        let (seconds, nanos) = if epoch > 1_000_000_000_000 {
+            (epoch / 1000, ((epoch % 1000) * 1_000_000) as u32)
+        } else {
+            (epoch, 0)
+        };
+        chrono::DateTime::from_timestamp(seconds, nanos).map(|value| value.to_rfc3339())
+    };
+    match value {
+        Value::String(text) => {
+            let text = text.trim();
+            if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(text) {
+                let parsed = parsed.with_timezone(&chrono::Utc);
+                return (parsed.timestamp() > 0).then(|| parsed.to_rfc3339());
+            }
+            let epoch = text.parse::<i64>().ok()?;
+            normalize(epoch)
+        }
+        Value::Number(number) => normalize(number.as_i64()?),
+        _ => None,
+    }
+}
+
+/// Command Code 额度：credits + 5h/周窗口 + 可选用量汇总/订阅。
+///
+/// Go 套餐的 `monthlyCredits/purchasedCredits/freeCredits` 可能全为 0，额度体现
+/// 在 `windowLimits.fiveHour/weekly`；因此**零 credits 不是无效负载**。
+///
+/// - `remaining = monthlyCredits + purchasedCredits + freeCredits`（>0 才展示）
+/// - `used = summary.totalCost`
+/// - `total = remaining + used`（credits 未知时为 None，由窗口展示）
+/// - `fiveHour` / `weekly` → `QuotaWindow{label:"5h"/"周"}`，
+///   `used_percent = used/cap * 100`，`resets_at` 统一为 RFC3339。
+pub fn parse_command_code(
+    whoami: &[u8],
+    credits: &[u8],
+    summary: Option<&[u8]>,
+    subscription: Option<&[u8]>,
+    org_id: &str,
+) -> Result<BalanceReading, BalanceError> {
+    let value: Value = serde_json::from_slice(credits).map_err(|_| invalid_payload())?;
+    let credits_object = value.get("credits").filter(|value| value.is_object());
+    let monthly = credits_object
+        .and_then(|value| value.get("monthlyCredits"))
+        .and_then(number)
+        .unwrap_or(0.0);
+    let purchased = credits_object
+        .and_then(|value| value.get("purchasedCredits"))
+        .and_then(number)
+        .unwrap_or(0.0);
+    let free = credits_object
+        .and_then(|value| value.get("freeCredits"))
+        .and_then(number)
+        .unwrap_or(0.0);
+    // 兼容 windowLimits 嵌套与顶层两种形状。
+    let limits = value
+        .get("windowLimits")
+        .filter(|value| value.is_object())
+        .or_else(|| Some(&value));
+    let mut windows: Vec<QuotaWindow> = Vec::new();
+    if let Some(limits) = limits {
+        for (key, label) in [("fiveHour", "5h"), ("weekly", "周")] {
+            let Some(window) = limits.get(key).filter(|value| value.is_object()) else {
+                continue;
+            };
+            let used = window.get("used").and_then(number).unwrap_or(0.0);
+            let cap = window.get("cap").and_then(number).unwrap_or(0.0);
+            if cap <= 0.0 {
+                continue;
+            }
+            let used_percent = (used / cap * 100.0).clamp(0.0, 100.0);
+            windows.push(QuotaWindow {
+                label: label.to_owned(),
+                used_percent,
+                remaining_percent: 100.0 - used_percent,
+                resets_at: window.get("resetAt").and_then(quota_reset_at),
+            });
+        }
+    }
+    let summary_value: Option<Value> =
+        summary.and_then(|body| serde_json::from_slice::<Value>(body).ok());
+    let subscription_value: Option<Value> =
+        subscription.and_then(|body| serde_json::from_slice::<Value>(body).ok());
+    let used = summary_value
+        .as_ref()
+        .and_then(|value| value.get("totalCost"))
+        .and_then(number);
+    let plan_id = value
+        .get("planId")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            subscription_value
+                .as_ref()
+                .and_then(|value| value.pointer("/data/planId"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    let plan_status = subscription_value
+        .as_ref()
+        .and_then(|value| value.pointer("/data/status"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    // 只有“既没有 credits 结构、也没有窗口、没有汇总/订阅”才视为无效负载：
+    // 单个账号 credits 全为 0 是完全合法的 Go 套餐。
+    if credits_object.is_none() && windows.is_empty() && summary_value.is_none() {
+        return Err(invalid_payload());
+    }
+    let credits_total = monthly + purchased + free;
+    let remaining = (credits_total > 0.0).then_some(credits_total);
+    Ok(BalanceReading {
+        remaining,
+        currency: None,
+        used,
+        total: remaining.map(|value| value + used.unwrap_or(0.0)),
+        unlimited: false,
+        label: remaining.map(|_| "Credits".to_owned()),
+        windows,
+        detail: json!({
+            "orgId": org_id,
+            "account": command_code_account_name(whoami),
+            "planId": plan_id,
+            "planStatus": plan_status,
+            "monthlyCredits": monthly,
+            "purchasedCredits": purchased,
+            "freeCredits": free,
+            "totalCost": used,
+            "totalCount": summary_value
+                .as_ref()
+                .and_then(|value| value.get("totalCount"))
+                .and_then(number),
+        }),
     })
 }
 
@@ -1990,6 +2315,7 @@ mod tests {
             Arc::clone(&limits),
         );
         let admin = crate::admin::AdminService::new(db.clone(), secrets.clone());
+        let command_code_login = crate::commandcode_login::CommandCodeLogin::new(std::sync::Arc::clone(&mock));
         let state = Context {
             config: Arc::new(AppConfig::default()),
             db: db.clone(),
@@ -2006,6 +2332,7 @@ mod tests {
             limits,
             admin,
             balance,
+            command_code_login,
             recovery: crate::auth::RecoverySession::new(),
         };
         (state, dir)
@@ -2612,4 +2939,250 @@ mod tests {
         let stored = state.balance.snapshot("ch-1").await.unwrap().unwrap();
         assert_eq!(stored.status, "ok");
     }
+    #[test]
+    fn command_code_quota_parses_credits_windows_and_summary() {
+        let whoami = br#"{"org":{"id":"org_1","login":"me"}}"#;
+        let credits = br#"{"credits":{"monthlyCredits":10,"purchasedCredits":5,"freeCredits":1},
+            "windowLimits":{"fiveHour":{"used":3,"cap":6,"resetAt":"2026-09-12T10:00:00Z"},
+                            "weekly":{"used":40,"cap":100,"resetAt":1789207200}}}"#;
+        let summary = br#"{"totalCost":2.5,"totalCount":3,"totalTokens":100}"#;
+        let reading =
+            parse_command_code(whoami, credits, Some(summary), None, "org_1").unwrap();
+        assert_eq!(reading.remaining, Some(16.0));
+        assert_eq!(reading.used, Some(2.5));
+        assert_eq!(reading.total, Some(18.5));
+        assert_eq!(reading.label.as_deref(), Some("Credits"));
+        assert_eq!(reading.windows.len(), 2);
+        assert_eq!(reading.windows[0].label, "5h");
+        assert!((reading.windows[0].used_percent - 50.0).abs() < 1e-9);
+        assert_eq!(
+            reading.windows[0].resets_at.as_deref(),
+            Some("2026-09-12T10:00:00+00:00")
+        );
+        assert_eq!(reading.windows[1].label, "周");
+        assert_eq!(reading.windows[1].used_percent, 40.0);
+        assert_eq!(reading.windows[1].remaining_percent, 60.0);
+        // 秒级时间戳统一成 RFC3339，前端 formatTime 才能正确显示。
+        assert_eq!(
+            reading.windows[1].resets_at.as_deref(),
+            Some("2026-09-12T10:00:00+00:00")
+        );
+        assert_eq!(command_code_org_id(whoami).as_deref(), Some("org_1"));
+        assert_eq!(
+            command_code_org_id(br#"{"orgId":"org_2"}"#).as_deref(),
+            Some("org_2")
+        );
+        // 官方 CLI 的 usage 包装形状：data.org.id。
+        assert_eq!(
+            command_code_org_id(br#"{"data":{"org":{"id":"org_3"}}}"#).as_deref(),
+            Some("org_3")
+        );
+        assert!(command_code_org_id(br#"{"user":{"userName":"x"}}"#).is_none());
+        // The usage summary is optional: credits/windows still parse.
+        let fallback = parse_command_code(whoami, credits, None, None, "org_1").unwrap();
+        assert_eq!(fallback.used, None);
+        assert_eq!(fallback.total, Some(16.0));
+
+        // Go 套餐：credits 全为 0，额度只在 5h/周窗口里 —— 必须解析成功而不是
+        // invalid_payload（历史 bug）。
+        let go_credits = br#"{"credits":{"monthlyCredits":0,"purchasedCredits":0,"freeCredits":0},
+            "windowLimits":{"fiveHour":{"used":10,"cap":60,"resetAt":1789210700},
+                            "weekly":{"used":20,"cap":200,"resetAt":"2026-09-19T10:00:00Z"}},
+            "planId":"go"}"#;
+        let go = parse_command_code(
+            br#"{"user":{"userName":"alice"},"org":{"id":"org_1"}}"#,
+            go_credits,
+            Some(summary),
+            Some(br#"{"data":{"planId":"go","status":"active"}}"#),
+            "org_1",
+        )
+        .unwrap();
+        assert_eq!(go.remaining, None, "zero credits must not be shown as 0.00");
+        assert_eq!(go.used, Some(2.5));
+        assert_eq!(go.total, None);
+        assert_eq!(go.windows.len(), 2);
+        assert!((go.windows[0].used_percent - (10.0 / 60.0 * 100.0)).abs() < 1e-9);
+        assert_eq!(go.detail["planId"], "go");
+        assert_eq!(go.detail["planStatus"], "active");
+        assert_eq!(go.detail["account"], "alice");
+
+        // 既没有 credits 结构、也没有窗口/汇总才是无效负载。
+        assert!(parse_command_code(whoami, b"{}", None, None, "org_1").is_err());
+    }
+
+    /// Command Code quota is a three-step read-only flow: whoami → credits →
+    /// usage summary, all with the channel API key.
+    #[tokio::test]
+    async fn command_code_balance_queries_whoami_credits_and_summary() {
+        let mock = MockUpstream::new(|request| {
+            if request.url.contains("/alpha/whoami") {
+                MockReply::Json(200, r#"{"org":{"id":"org_9","login":"me"}}"#.into())
+            } else if request.url.contains("/alpha/billing/credits") {
+                MockReply::Json(
+                    200,
+                    r#"{"credits":{"monthlyCredits":10,"purchasedCredits":5,"freeCredits":1},
+                        "windowLimits":{"fiveHour":{"used":3,"cap":6,"resetAt":"2096-09-12T10:00:00Z"},
+                                        "weekly":{"used":40,"cap":100,"resetAt":1789207200}}}"#
+                        .into(),
+                )
+            } else if request.url.contains("/alpha/usage/summary") {
+                MockReply::Json(200, r#"{"totalCost":2.5,"totalCount":3,"totalTokens":100}"#.into())
+            } else if request.url.contains("/alpha/billing/subscriptions") {
+                MockReply::Json(200, r#"{"data":{"planId":"go","status":"active"}}"#.into())
+            } else {
+                MockReply::Json(404, "{}".into())
+            }
+        });
+        let (state, _dir) = test_state(mock.clone(), RuntimeLimits::default()).await;
+        sqlx::query(
+            "INSERT INTO settings(key,value_json,updated_at) VALUES('command_code_enabled','true',?)",
+        )
+        .bind("2026-08-04T01:00:00+00:00")
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+        seed_channel(&state, "https://api.commandcode.ai").await;
+        save_balance(&state, "command_code", true).await;
+
+        let snapshot = state.balance.query(&state, "ch-1").await.unwrap();
+        assert_eq!(snapshot.status, "ok");
+        assert_eq!(snapshot.remaining, Some(16.0));
+        assert_eq!(snapshot.used, Some(2.5));
+        assert_eq!(snapshot.total, Some(18.5));
+        assert_eq!(snapshot.label.as_deref(), Some("Credits"));
+        assert_eq!(snapshot.windows.len(), 2);
+        assert_eq!(snapshot.windows[0].label, "5h");
+        assert!((snapshot.windows[0].used_percent - 50.0).abs() < 1e-9);
+        assert_eq!(
+            snapshot.windows[0].resets_at.as_deref(),
+            Some("2096-09-12T10:00:00+00:00")
+        );
+        assert_eq!(snapshot.windows[1].label, "周");
+        assert_eq!(snapshot.windows[1].used_percent, 40.0);
+
+        assert_eq!(snapshot.detail["planId"], "go");
+        assert_eq!(snapshot.detail["planStatus"], "active");
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 4, "whoami + credits + summary + subscriptions");
+        assert!(requests[0].url.ends_with("/alpha/whoami"));
+        assert!(
+            requests[1]
+                .url
+                .contains("/alpha/billing/credits?orgId=org_9"),
+            "query must be a real query string, got {}",
+            requests[1].url
+        );
+        assert!(
+            requests[2]
+                .url
+                .contains("/alpha/usage/summary?orgId=org_9"),
+            "query must be a real query string, got {}",
+            requests[2].url
+        );
+        assert!(
+            requests[3]
+                .url
+                .contains("/alpha/billing/subscriptions?orgId=org_9"),
+            "query must be a real query string, got {}",
+            requests[3].url
+        );
+        for request in &requests {
+            assert_eq!(request.method, Method::GET);
+            let authorization = request
+                .headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            assert_eq!(authorization, "Bearer sk-channel-secret");
+        }
+    }
+
+
+    /// 无 org 的个人账号（whoami `org:null`，真实 Go 套餐形状）：billing 系列
+    /// 必须**省略 orgId**（不能拼 `?orgId=`），credits 的 5h/周窗口与
+    /// `resetAt:0`（无待重置）要正确呈现。
+    #[tokio::test]
+    async fn command_code_balance_without_org_uses_paramless_billing_requests() {
+        let mock = MockUpstream::new(|request| {
+            if request.url.contains("/alpha/whoami") {
+                MockReply::Json(
+                    200,
+                    r#"{"success":true,"user":{"id":"u-1","userName":"alice"},"org":null}"#.into(),
+                )
+            } else if request.url.contains("/alpha/billing/credits") {
+                MockReply::Json(
+                    200,
+                    r#"{"credits":{"monthlyCredits":10,"purchasedCredits":0,"freeCredits":0},
+                        "windowLimits":{"limited":true,"fiveHour":{"used":0,"cap":3,"resetAt":0},
+                                        "weekly":{"used":0,"cap":6,"resetAt":0}}}"#
+                        .into(),
+                )
+            } else if request.url.contains("/alpha/usage/summary") {
+                MockReply::Json(
+                    200,
+                    r#"{"totalCost":0,"totalCount":0,"totalTokens":0}"#.into(),
+                )
+            } else {
+                MockReply::Json(404, "{}".into())
+            }
+        });
+        let (state, _dir) = test_state(mock.clone(), RuntimeLimits::default()).await;
+        sqlx::query(
+            "INSERT INTO settings(key,value_json,updated_at) VALUES('command_code_enabled','true',?)",
+        )
+        .bind("2026-08-04T01:00:00+00:00")
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+        seed_channel(&state, "https://api.commandcode.ai").await;
+        save_balance(&state, "command_code", true).await;
+
+        let snapshot = state.balance.query(&state, "ch-1").await.unwrap();
+        assert_eq!(snapshot.status, "ok", "{snapshot:?}");
+        assert_eq!(snapshot.remaining, Some(10.0));
+        assert_eq!(snapshot.label.as_deref(), Some("Credits"));
+        assert_eq!(snapshot.windows.len(), 2);
+        assert_eq!(snapshot.windows[0].label, "5h");
+        assert_eq!(snapshot.windows[0].used_percent, 0.0);
+        assert_eq!(snapshot.windows[0].remaining_percent, 100.0);
+        assert_eq!(
+            snapshot.windows[0].resets_at, None,
+            "resetAt:0 means no scheduled reset"
+        );
+        assert_eq!(snapshot.windows[1].label, "周");
+        assert_eq!(snapshot.detail["account"], "alice");
+        assert_eq!(snapshot.detail["orgId"], "");
+
+        let requests = mock.requests();
+        for request in &requests {
+            if request.url.contains("/alpha/billing/") || request.url.contains("/alpha/usage/") {
+                assert!(
+                    !request.url.contains("orgId"),
+                    "org-less accounts must omit the parameter, got {}",
+                    request.url
+                );
+            }
+        }
+        assert!(requests.iter().any(|r| r.url.ends_with("/alpha/billing/credits")));
+    }
+
+    /// The global Command Code switch gates the balance sidecar too: while
+    /// disabled the query is classified and performs zero upstream requests.
+    #[tokio::test]
+    async fn command_code_balance_is_blocked_while_disabled() {
+        let mock = MockUpstream::always(200, "{}");
+        let (state, _dir) = test_state(mock.clone(), RuntimeLimits::default()).await;
+        seed_channel(&state, "https://api.commandcode.ai").await;
+        save_balance(&state, "command_code", true).await;
+
+        let snapshot = state.balance.query(&state, "ch-1").await.unwrap();
+        assert_eq!(snapshot.status, "error");
+        assert_eq!(snapshot.error_kind.as_deref(), Some("disabled"));
+        assert_eq!(
+            mock.calls(),
+            0,
+            "disabled integration must not touch the upstream"
+        );
+    }
+
 }

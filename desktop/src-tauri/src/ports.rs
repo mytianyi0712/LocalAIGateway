@@ -174,6 +174,8 @@ pub struct ChannelRow {
     pub id: String,
     pub name: String,
     pub protocol: String,
+    /// `providers.kind`: identity marker (e.g. `command_code`).
+    pub kind: Option<String>,
     pub api_key_encrypted: Vec<u8>,
     pub base_url: String,
     pub manual_enabled: bool,

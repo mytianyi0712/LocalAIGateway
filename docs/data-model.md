@@ -83,8 +83,13 @@ erDiagram
 | `id` | TEXT | PK | UUID |
 | `name` | TEXT | NOT NULL, UNIQUE | 供应商显示名 |
 | `base_url` | TEXT | NOT NULL | API 根地址，不包含密钥 |
+| `kind` | TEXT NULL | 见下 | 显式身份标记（迁移 `0005`） |
 | `created_at` | DATETIME | NOT NULL | 创建时间 |
 | `updated_at` | DATETIME | NOT NULL | 更新时间 |
+
+`kind` 是**显式**身份标记，目前唯一取值 `command_code`（`idx_providers_kind` 索引）。只有该值的供应商
+会在 Command Code CLI 兼容路径上收到身份头（会话/指纹/版本）；网关**从不**用 `base_url` 嗅探身份，
+因此自建桥或第三方上游不会被误注入指纹。既有供应商 `kind=NULL`，行为与迁移前完全一致。
 
 删除供应商时默认拒绝存在渠道的情况；管理端必须先显式删除渠道，避免误删日志关联。
 
@@ -370,7 +375,29 @@ erDiagram
 | `value_json` | JSON/TEXT | 类型化设置值 |
 | `updated_at` | DATETIME | 更新时间 |
 
-可管理设置包括局域网信任开关、加密保存的管理/代理访问密钥、失败阈值、熔断秒数、最大尝试次数、各类超时、模型探测周期、日志保留时间和请求体大小限制。启动端口、监听地址、数据库路径和主密钥路径只允许通过启动配置设置。
+可管理设置包括局域网信任开关、加密保存的管理/代理访问密钥、失败阈值、熔断秒数、最大尝试次数、各类超时、模型探测周期、日志保留时间、请求体大小限制，以及 Command Code 集成参数
+（`command_code_enabled` 默认 `false`；`command_code_idle_timeout_seconds`、`command_code_init_interval_hours`、
+`command_code_version_check_interval_hours`、`command_code_quota_interval_minutes`、
+`command_code_max_concurrency` 默认 2）。启动端口、监听地址、
+数据库路径和主密钥路径只允许通过启动配置设置。
+
+Command Code 的身份与运行状态同样以 KV 形式存放（无需迁移）：
+
+| 键 | 说明 |
+| --- | --- |
+| `command_code_cli_version` | 探测到的最新 CLI 版本（npm `latest`），也是 `x-command-code-version` 的值 |
+| `command_code_cli_version_checked_at` | 上次版本探测时间 |
+| `command_code_zdr` | 可选 ZDR 开关（默认关闭） |
+| `command_code_fingerprint_<channel_id>` | 每渠道（每 API Key）独立的机器指纹（含 `thumbmark`） |
+| `command_code_session_<channel_id>` | 每渠道粘滞会话 `{id, expires_at}`（12h + 抖动） |
+| `command_code_init_at_<channel_id>` | 指纹/生命周期上报节流（首次 + 每 8h + 抖动） |
+| `command_code_transport_<channel_id>` | transport router 记忆：`unknown` / `provider` / `generate` |
+
+Command Code 网页登录（`docs/command-code-protocol.md` §13）不落库：回环回调、状态机与一次性
+`login_id` 交接都在进程内存中，密钥只在被渠道创建/改写取走时写入 `channels.api_key_encrypted`
+（Fernet 加密），渠道 `api_key_hint` 只保留脱敏前缀。
+
+`command_code_*_<channel_id>` 键在渠道删除后作为无主 KV 保留（不影响行为），可由设置维护流程清理。
 
 ### 6.2 `discovery_runs`
 
@@ -402,3 +429,5 @@ erDiagram
 - 启动时检查版本，开发模式可自动升级，正式运行脚本显式执行升级。
 - 破坏性迁移前自动备份 SQLite 文件。
 - 业务代码只依赖当前 schema，不在运行时动态创建缺失列。
+- `0005_command_code.sql`：`ALTER TABLE providers ADD COLUMN kind TEXT` + `idx_providers_kind`；
+  Command Code 的其余状态全部落在 `settings` KV，因此没有别的 schema 变更。

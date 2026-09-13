@@ -40,7 +40,7 @@ pub(super) async fn route_ids_for_model(
     state: &Context,
     model_id: &str,
 ) -> Result<Vec<(String, String, bool, String, String)>, ApiError> {
-    Ok(sqlx::query_as::<_,(String,String,bool,String,String)>("SELECT id,protocol,enabled,requested_model_id,created_at FROM model_routes WHERE requested_model_id=? ORDER BY CASE protocol WHEN 'openai_compatible' THEN 0 WHEN 'openai_responses' THEN 1 WHEN 'claude' THEN 2 ELSE 3 END").bind(model_id).fetch_all(state.db.pool()).await?)
+    Ok(sqlx::query_as::<_,(String,String,bool,String,String)>("SELECT id,protocol,enabled,requested_model_id,created_at FROM model_routes WHERE requested_model_id=? ORDER BY CASE protocol WHEN 'openai_compatible' THEN 0 WHEN 'openai_responses' THEN 1 WHEN 'claude' THEN 2 WHEN 'command_code' THEN 4 ELSE 3 END").bind(model_id).fetch_all(state.db.pool()).await?)
 }
 pub(super) async fn route_bundle(state: &Context, model_id: &str) -> Result<Value, ApiError> {
     let rows = route_ids_for_model(state, model_id).await?;

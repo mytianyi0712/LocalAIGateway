@@ -28,6 +28,11 @@ pub(super) fn error_payload(entry: &str, upstream_protocol: &str, body: &[u8]) -
             message = raw;
         }
     }
+    // Text-expressed context overflow gets a stable classification while
+    // the upstream text stays in the message (plan §2.8).
+    if is_context_overflow(&message) {
+        error_type = "context_length_exceeded".to_owned();
+    }
     if entry == "claude" {
         serde_json::to_vec(&json!({
             "type": "error",
@@ -45,6 +50,65 @@ pub(super) fn error_payload(entry: &str, upstream_protocol: &str, body: &[u8]) -
 /// Entry-agnostic error conversion (convert_mapped_error_response).
 pub fn convert_error(entry: &str, upstream_protocol: &str, body: &[u8]) -> Vec<u8> {
     error_payload(entry, upstream_protocol, body)
+}
+
+/// Text-expressed context overflow (Command Code and several compatible
+/// upstreams carry no stable error code — plan §2.8). The pattern set
+/// mirrors the community `overflow.ts` implementation: a positive
+/// context/prompt/input-exceeds pattern that is NOT a rate-limit /
+/// capacity / availability error.
+pub fn is_context_overflow(message: &str) -> bool {
+    const NON_OVERFLOW: &[&str] = &[
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "capacity",
+        "quota",
+        "throttl",
+        "concurren",
+        "overloaded",
+        "service unavailable",
+        "temporarily unavailable",
+        "status 429",
+        "status: 429",
+        "status_code: 429",
+        "\"status\":429",
+    ];
+    let lower = message.to_ascii_lowercase();
+    if NON_OVERFLOW.iter().any(|pattern| lower.contains(pattern)) {
+        return false;
+    }
+    let exceeds = [
+        "exceed",
+        "overflow",
+        "too long",
+        "too large",
+        "limit reached",
+        "limit hit",
+        "limit exceeded",
+        "maximum",
+        "max tokens",
+        "max_tokens",
+        "max output",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern));
+    if !exceeds {
+        return false;
+    }
+    if lower.contains("context") {
+        return true;
+    }
+    if lower.contains("prompt") || lower.contains("input") {
+        return lower.contains("token")
+            || lower.contains("length")
+            || lower.contains("size")
+            || lower.contains("long")
+            || lower.contains("large")
+            || lower.contains("limit")
+            || lower.contains("maximum");
+    }
+    lower.contains("token") && lower.contains("limit")
 }
 
 // ---------------------------------------------------------------------------
@@ -163,6 +227,51 @@ fn responses_chunk_has_content(value: &Value) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn context_overflow_matches_text_patterns_and_rejects_rate_limits() {
+        // Positive patterns from docs/command-code-protocol.md §9.
+        for message in [
+            "Prompt is too long: context length exceeded (requested 300000 tokens)",
+            "The model context window has been exceeded",
+            "maximum allowed context length is 128k",
+            "Input tokens limit exceeded",
+            "input length too large for this model",
+            "context overflow detected",
+        ] {
+            assert!(is_context_overflow(message), "{message}");
+        }
+        // Rate-limit / capacity text must never be classified as overflow.
+        for message in [
+            "Rate limit exceeded, retry later",
+            "too many requests",
+            "service temporarily unavailable",
+            "concurrency limit reached",
+            "status: 429",
+            "quota exceeded for this org",
+        ] {
+            assert!(!is_context_overflow(message), "{message}");
+        }
+        assert!(!is_context_overflow("tool call failed"));
+    }
+
+    #[test]
+    fn error_payload_classifies_overflow_without_losing_the_message() {
+        let body = br#"{"error":{"message":"Prompt is too long: context length exceeded"}}"#;
+        let converted = error_payload("claude", "command_code", body);
+        let value: Value = serde_json::from_slice(&converted).unwrap();
+        assert_eq!(
+            value.pointer("/error/type").and_then(Value::as_str),
+            Some("context_length_exceeded")
+        );
+        assert!(
+            value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap()
+                .contains("context length exceeded")
+        );
+    }
 
     #[test]
     fn openai_chat_string_content_still_counts() {

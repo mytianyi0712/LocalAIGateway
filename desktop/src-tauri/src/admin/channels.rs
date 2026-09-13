@@ -17,6 +17,7 @@ pub(super) struct ChannelRow {
     id: String,
     provider_id: String,
     provider_name: String,
+    provider_kind: Option<String>,
     name: String,
     protocol: String,
     api_key_encrypted: Vec<u8>,
@@ -35,11 +36,11 @@ pub(super) struct ChannelRow {
     model_count: i64,
 }
 pub(super) async fn load_channel(db: &Database, row_id: &str) -> Result<ChannelRow, ApiError> {
-    sqlx::query_as::<_,ChannelRow>("SELECT c.id,c.provider_id,p.name provider_name,c.name,c.protocol,c.api_key_encrypted,c.api_key_hint,c.manual_enabled,c.health_check_model_id,c.created_at,c.updated_at,h.state,h.consecutive_failures,h.disabled_until,h.last_success_at,h.last_failure_at,h.last_error_kind,h.last_status_code,COUNT(DISTINCT cm.id) model_count FROM channels c JOIN providers p ON p.id=c.provider_id LEFT JOIN channel_health h ON h.channel_id=c.id LEFT JOIN channel_models cm ON cm.channel_id=c.id WHERE c.id=? GROUP BY c.id")
+    sqlx::query_as::<_,ChannelRow>("SELECT c.id,c.provider_id,p.name provider_name,p.kind provider_kind,c.name,c.protocol,c.api_key_encrypted,c.api_key_hint,c.manual_enabled,c.health_check_model_id,c.created_at,c.updated_at,h.state,h.consecutive_failures,h.disabled_until,h.last_success_at,h.last_failure_at,h.last_error_kind,h.last_status_code,COUNT(DISTINCT cm.id) model_count FROM channels c JOIN providers p ON p.id=c.provider_id LEFT JOIN channel_health h ON h.channel_id=c.id LEFT JOIN channel_models cm ON cm.channel_id=c.id WHERE c.id=? GROUP BY c.id")
         .bind(row_id).fetch_optional(db.pool()).await?.ok_or_else(||ApiError::not_found("Channel not found"))
 }
 pub(super) async fn channel_json(db: &Database, row: ChannelRow) -> Result<Value, ApiError> {
-    let protocols:Vec<String>=sqlx::query_scalar("SELECT protocol FROM channel_protocols WHERE channel_id=? ORDER BY CASE protocol WHEN 'openai_compatible' THEN 0 WHEN 'openai_responses' THEN 1 WHEN 'claude' THEN 2 ELSE 3 END").bind(&row.id).fetch_all(db.pool()).await?;
+    let protocols:Vec<String>=sqlx::query_scalar("SELECT protocol FROM channel_protocols WHERE channel_id=? ORDER BY CASE protocol WHEN 'openai_compatible' THEN 0 WHEN 'openai_responses' THEN 1 WHEN 'claude' THEN 2 WHEN 'command_code' THEN 4 ELSE 3 END").bind(&row.id).fetch_all(db.pool()).await?;
     let mut remote_compaction = json!({});
     let compaction_rows: Vec<(String, i64, i64, Option<String>)> = sqlx::query_as(
         "SELECT protocol, remote_compaction_v1_support, remote_compaction_v2_support, remote_compaction_probed_at \
@@ -62,7 +63,7 @@ pub(super) async fn channel_json(db: &Database, row: ChannelRow) -> Result<Value
     }
     let balance = crate::balance::channel_balance_json(db, &row.id).await?;
     Ok(
-        json!({"id":row.id,"provider_id":row.provider_id,"provider_name":row.provider_name,"name":row.name,"protocol":row.protocol,"protocols":protocols,"manual_enabled":row.manual_enabled,"health_check_model_id":row.health_check_model_id,"has_api_key":!row.api_key_encrypted.is_empty(),"api_key_hint":row.api_key_hint,"health":{"state":row.state.unwrap_or_else(||"active".into()),"consecutive_failures":row.consecutive_failures.unwrap_or(0),"disabled_until":row.disabled_until,"last_success_at":row.last_success_at,"last_failure_at":row.last_failure_at,"last_error_kind":row.last_error_kind,"last_status_code":row.last_status_code},"model_count":row.model_count,"remote_compaction":remote_compaction,"balance":balance,"created_at":row.created_at,"updated_at":row.updated_at}),
+        json!({"id":row.id,"provider_id":row.provider_id,"provider_name":row.provider_name,"provider_kind":row.provider_kind,"name":row.name,"protocol":row.protocol,"protocols":protocols,"manual_enabled":row.manual_enabled,"health_check_model_id":row.health_check_model_id,"has_api_key":!row.api_key_encrypted.is_empty(),"api_key_hint":row.api_key_hint,"health":{"state":row.state.unwrap_or_else(||"active".into()),"consecutive_failures":row.consecutive_failures.unwrap_or(0),"disabled_until":row.disabled_until,"last_success_at":row.last_success_at,"last_failure_at":row.last_failure_at,"last_error_kind":row.last_error_kind,"last_status_code":row.last_status_code},"model_count":row.model_count,"remote_compaction":remote_compaction,"balance":balance,"created_at":row.created_at,"updated_at":row.updated_at}),
     )
 }
 #[derive(Deserialize)]
@@ -72,7 +73,13 @@ pub struct ChannelInput {
     pub protocol: Option<String>,
     #[serde(default)]
     pub protocols: Vec<String>,
+    /// 手动粘贴的 API Key；使用 `login_id` 时可留空。
+    #[serde(default)]
     pub api_key: String,
+    /// Command Code 网页登录的一次性交接句柄（`POST /command-code/login`
+    /// 成功后返回）。服务端用它取走已校验的密钥，密钥绝不经过浏览器。
+    #[serde(default)]
+    pub login_id: Option<String>,
     #[serde(default = "yes")]
     pub manual_enabled: bool,
     pub health_check_model_id: Option<String>,
@@ -91,6 +98,9 @@ pub struct ChannelPatch {
     /// half-way (fields saved, key rejected). Omitted or `null` = keep.
     #[serde(default, deserialize_with = "patch_optional_string")]
     api_key: Option<Option<String>>,
+    /// 同上：网页登录成功后的密钥交接（与显式 api_key 二选一）。
+    #[serde(default)]
+    login_id: Option<String>,
     /// P1-6: three states — `None` (omitted) leaves the value untouched,
     /// `Some(None)` (JSON `null`) clears it back to automatic, and
     /// `Some(Some(model))` sets it after validating membership. Plain
@@ -162,9 +172,27 @@ pub(super) async fn list_channels(
 pub(super) async fn create_channel(
     _: AdminAuth,
     State(state): State<Context>,
-    Json(input): Json<ChannelInput>,
+    Json(mut input): Json<ChannelInput>,
 ) -> ApiResult {
-    state.admin.create_channel(input).await
+    let login_id = input.login_id.take();
+    if let Some(login_id) = &login_id {
+        // 先 peek：创建失败（重名、校验错误……）不消耗交接，用户可直接重试。
+        input.api_key = peek_login_key(&state, login_id)?;
+    }
+    let result = state.admin.create_channel(input).await;
+    if result.is_ok()
+        && let Some(login_id) = &login_id
+    {
+        state.command_code_login.consume_key(login_id);
+    }
+    result
+}
+
+/// 一次性交接：登录流程已通过 `/alpha/whoami` 校验的密钥在此进入加密库。
+fn peek_login_key(state: &Context, login_id: &str) -> Result<String, ApiError> {
+    state.command_code_login.peek_key(login_id).ok_or_else(|| {
+        ApiError::validation("Command Code 登录已失效或已被使用，请重新发起网页登录")
+    })
 }
 pub(super) async fn get_channel(
     _: AdminAuth,
@@ -177,9 +205,19 @@ pub(super) async fn patch_channel(
     _: AdminAuth,
     State(state): State<Context>,
     Path(row_id): Path<String>,
-    Json(input): Json<ChannelPatch>,
+    Json(mut input): Json<ChannelPatch>,
 ) -> ApiResult {
-    state.admin.patch_channel(&row_id, input).await
+    let login_id = input.login_id.take();
+    if let Some(login_id) = &login_id {
+        input.api_key = Some(Some(peek_login_key(&state, login_id)?));
+    }
+    let result = state.admin.patch_channel(&row_id, input).await;
+    if result.is_ok()
+        && let Some(login_id) = &login_id
+    {
+        state.command_code_login.consume_key(login_id);
+    }
+    result
 }
 pub(super) async fn replace_api_key(
     _: AdminAuth,

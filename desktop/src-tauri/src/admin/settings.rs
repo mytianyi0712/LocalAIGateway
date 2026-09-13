@@ -264,3 +264,35 @@ pub(super) async fn system_protocols(_: AdminAuth) -> ApiResult {
         .collect::<Vec<_>>();
     Ok(ok(json!({"items":items})))
 }
+
+/// Command Code integration status: global switch, version drift against the
+/// verified protocol baseline (plan phase 4/7), and the transport policy.
+pub(super) async fn command_code_status(
+    _: AdminAuth,
+    State(state): State<Context>,
+) -> ApiResult {
+    let runtime = crate::settings::runtime_settings(&state).await?;
+    let cli_version = crate::commandcode::cli_version(&state.db).await;
+    let checked_at: Option<String> = sqlx::query_scalar::<_, String>(
+        "SELECT CAST(value_json AS TEXT) FROM settings WHERE key='command_code_cli_version_checked_at'",
+    )
+    .fetch_optional(state.db.pool())
+    .await?
+    .and_then(|raw| serde_json::from_str::<String>(&raw).ok());
+    let channels: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM channels c JOIN providers p ON p.id=c.provider_id \
+         WHERE p.kind='command_code' OR c.protocol='command_code'",
+    )
+    .fetch_one(state.db.pool())
+    .await?;
+    Ok(ok(json!({
+        "enabled": runtime.command_code_enabled,
+        "cli_version": cli_version,
+        "verified_baseline": crate::commandcode::DEFAULT_CLI_VERSION,
+        "drift": crate::commandcode::version_drift(&cli_version),
+        "version_checked_at": checked_at,
+        "channel_count": channels,
+        "transport_policy": "provider_first_then_generate_on_403_upgrade_required",
+        "warning": "Go 套餐没有官方 API 访问：服务端以 403 upgrade_required 拒绝后，网关仅对该账号降级到 CLI 兼容路径，并使用 CLI 身份头。这是对服务端明确拒绝路径的绕过，可能违反服务条款并导致账号封禁；开启即表示已知晓并自行承担全部风险。",
+    })))
+}

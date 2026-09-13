@@ -100,17 +100,26 @@ Authorization: Bearer <admin_token>
 | `GET` | `/providers` | 分页查询供应商 |
 | `POST` | `/providers` | 创建供应商 |
 | `GET` | `/providers/{provider_id}` | 查询详情 |
-| `PATCH` | `/providers/{provider_id}` | 修改名称或 Base URL |
+| `PATCH` | `/providers/{provider_id}` | 修改名称、Base URL 或 `kind` |
 | `DELETE` | `/providers/{provider_id}` | 删除无渠道的供应商 |
+| `GET` | `/provider-presets` | 静态供应商预设目录（新建供应商表单数据源） |
 
 创建请求：
 
 ```json
 {
-  "name": "OpenAI Official",
-  "base_url": "https://api.openai.com"
+  "name": "Command Code Go",
+  "base_url": "https://api.commandcode.ai",
+  "kind": "command_code"
 }
 ```
+
+`kind` 是显式身份标记（可为 `null`）。目前唯一取值 `command_code`：只有该类型的供应商会在
+CLI 兼容路径上收到 Command Code 身份头（会话/指纹/版本），网关**从不**用 `base_url` 嗅探身份，
+自建桥或第三方上游因此不会被误注入指纹。`GET /provider-presets` 返回
+`{id,name,base_url,protocol,kind,auth,docs_url,warning}`；`command_code_go` 首项携带
+`auth="browser_login"`（该套餐无法在面板创建 API Key，必须走网页登录授权）与强制风险提示，
+前端必须显示并要求二次确认后才能创建。
 
 Base URL 保存前执行语法校验，并移除尾部 `/`、`/v1` 或 `/v1beta`，不主动访问网络。修改 Base URL 不自动触发模型探测。
 
@@ -304,6 +313,26 @@ New API 有两种取数模式：只配置渠道 API Key（`sk-`）时查询 `/ap
 
 探测状态：`queued`、`running`、`succeeded`、`failed`。失败响应只保存标准错误分类和上游状态码，不保存上游错误正文。
 
+Command Code 渠道的探测端点是 `GET /provider/v1/models`。Go 套餐下官方 Provider API 会以
+`403 upgrade_required` 拒绝，探测因此失败且不写入任何模型；此时请用 `POST /channels/{id}/models`
+手工登记上游模型（网关不内置厂商模型目录副本，避免许可证与漂移问题）。
+
+渠道创建/改写支持 Command Code 网页登录的一次性交接：
+
+```json
+{
+  "provider_id": "prov-cc",
+  "name": "Command Code Go",
+  "protocols": ["command_code"],
+  "api_key": "",
+  "login_id": "1f0c…（POST /command-code/login 成功返回，5 分钟单次有效）"
+}
+```
+
+`login_id` 与 `api_key` 二选一；提供 `login_id` 时网关在服务端取走已通过 `/alpha/whoami`
+校验的密钥并加密入库，浏览器/管理端前端永远不会看到密钥。`PATCH /channels/{id}` 同样接受
+`login_id`（用于重新授权）。
+
 手动添加模型：
 
 ```json
@@ -465,6 +494,50 @@ DELETE /api/admin/v1/logs?before=2026-07-01T00:00:00Z&confirm=true
 | `POST` | `/settings/access-keys/generate` | 随机生成并加密保存管理与代理密钥；明文只返回一次（损坏时需携带 nonce） |
 | `GET` | `/system/status` | 数据库、日志队列和后台任务状态 |
 | `GET` | `/system/protocols` | 返回协议枚举和支持的入口 |
+| `GET` | `/command-code/status` | Command Code 集成状态：开关、CLI 版本漂移、渠道数、风险提示 |
+| `POST` | `/command-code/login` | 开始（或加入）浏览器登录授权，返回 Studio `auth_url` |
+| `GET` | `/command-code/login` | 查询登录状态（`idle`/`waiting`/`success`/`failed`） |
+| `DELETE` | `/command-code/login` | 取消等待中的登录 |
+| `POST` | `/command-code/import-cli` | 从官方 CLI 凭据（`~/.commandcode/auth.json` / 环境变量）导入并校验 |
+
+浏览器登录授权（等价官方 `cmd login` 的 loopback 流程，详见
+`docs/command-code-protocol.md` §13）：
+
+```json
+// POST /command-code/login  { "api_base": "https://api.commandcode.ai" }
+{
+  "login": { "state": "waiting", "auth_url": "https://commandcode.ai/studio/auth/cli?callback=…&state=…", "port": 5959 },
+  "cli_key_available": false
+}
+// GET /command-code/login（授权成功，密钥只留在服务端）
+{
+  "login": { "state": "success", "login_id": "1f0c…", "user_name": "alice", "key_name": "cli" },
+  "cli_key_available": false
+}
+// 失败
+{ "login": { "state": "failed", "reason": "timeout", "message": "等待浏览器回调超时（120 秒）" } }
+```
+
+`reason` 取值：`denied` / `timeout` / `invalid-key` / `network` / `error` / `cancelled`。
+这两个端点不接受、也不返回 API Key；`login_id` 是 5 分钟单次有效的交接句柄。
+
+`GET /command-code/status`：
+
+```json
+{
+  "enabled": false,
+  "cli_version": "1.53.1",
+  "verified_baseline": "1.53.1",
+  "drift": false,
+  "version_checked_at": "2026-09-12T10:00:00+00:00",
+  "channel_count": 0,
+  "transport_policy": "provider_first_then_generate_on_403_upgrade_required",
+  "warning": "Go 套餐没有官方 API 访问：……"
+}
+```
+
+`drift=true` 表示探测到的 npm `command-code` 版本已偏离网关的协议夹具基准（见
+`docs/command-code-protocol.md`），线协议可能已静默变更；UI 必须显示告警。
 
 ### 9.1 密钥损坏恢复流程（P1-4）
 
@@ -490,9 +563,21 @@ DELETE /api/admin/v1/logs?before=2026-07-01T00:00:00Z&confirm=true
   "stream_idle_timeout_seconds": 300,
   "non_stream_total_timeout_seconds": 600,
   "model_discovery_interval_hours": 24,
-  "log_retention_days": 30
+  "log_retention_days": 30,
+  "command_code_enabled": false,
+  "command_code_idle_timeout_seconds": 120,
+  "command_code_init_interval_hours": 8,
+  "command_code_version_check_interval_hours": 24,
+  "command_code_quota_interval_minutes": 15,
+  "command_code_max_concurrency": 2
 }
 ```
+
+`command_code_enabled` 默认 `false`：关闭时网关对 Command Code 的请求、健康探测、模型发现与额度查询
+全部短路，零上游请求。开启（或修改）它必须经过风险确认（UI 复选框；API 层只校验类型与范围）。
+`command_code_max_concurrency`（默认 2，范围 1–32）限制单渠道（=单账号/单 API Key）在途的
+`/alpha/generate` 请求数：许可绑定在上游响应体上，直到响应被完整消费才释放，超限请求在
+`first_byte_timeout_seconds` 内等待，超时按 `concurrency_limit` 失败并故障转移。
 
 设置更新只影响更新后开始的请求。
 
@@ -587,6 +672,34 @@ Gemini：
 ```
 
 生成错误只包含稳定错误码和内部请求 ID，不暴露 Base URL、API Key、堆栈或上游错误正文。
+
+### 10.5 Command Code 上游（映射入口专用）
+
+`command_code` 没有客户端入口，只作为 Claude / Codex 模型映射的 `upstream_protocol`：
+
+- 请求方向：入口请求先转成 canonical OpenAI Chat（官网 Provider API 用），再转成
+  `/alpha/generate` 的 CLI 请求体（`{config,memory,taste,skills,permissionMode,params}`）；
+  角色仅 `user/assistant/tool`，`system`/`developer` 提升为 `params.system`（空提示用空格占位），
+  会话中途的 `developer` 降级为 `user`，thinking 必须回传为 `reasoning` 且排在最前，
+  缺失的 tool result 自动合成 `error-text`。
+- transport router：首次请求打 `POST {base}/provider/v1/chat/completions`；仅当响应是
+  `403` 且 `error.code == "upgrade_required"` 时，把该渠道记为 `generate` 并对同一候选重试
+  `POST {base}/alpha/generate`；成功或普通业务错误则记为 `provider`，不再降级。
+- 身份头：仅 `providers.kind='command_code'` 时注入 `x-cli-environment`、`x-command-code-version`、
+  `x-session-id`、`x-project-slug`、`x-co-flag`、`x-taste-learning`、`traceparent`（可选 `x-cmd-zdr`）；
+  Provider API 路径不注入任何 CLI 身份头。
+- 响应方向：`/alpha/generate` 的 NDJSON（`text-delta` / `reasoning-delta` / `tool-call` /
+  `finish-step` / `finish` / `error` / 未知事件）先解码为 canonical OpenAI SSE，再复用既有
+  `(entry, openai_compatible)` 转换；`error` 事件只产出错误事件，**绝不**产出 finish_reason。
+  非流式入口聚合为单个 OpenAI Chat completion 后再转换。
+- usage：CC 的 `inputTokens` 是含缓存命中的总数；流式为 Anthropic 入口合成
+  `signature_delta`，并按 `inputTokenDetails.noCacheTokens`（或减法）换算 Anthropic
+  `input_tokens`，`cachedInputTokens` 映射为 `cache_read_input_tokens`。
+- 额度：`GET /alpha/whoami` → `orgId` → `GET /alpha/billing/credits`（credits + 5h/周窗口）
+  → `GET /alpha/usage/summary`；402/429 会把渠道 `disabled_until` 设到窗口重置时间。
+- 上下文溢出：上游以错误文本表达（无稳定错误码），`convert/error.rs` 按
+  `docs/command-code-protocol.md` §9 的模式集把错误类型归一为 `context_length_exceeded`（消息原文保留），
+  rate-limit / capacity 类文本绝不误判。
 
 ## 11. 前端页面与 API 对应关系
 

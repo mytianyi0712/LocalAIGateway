@@ -23,6 +23,31 @@ use crate::{
     settings,
 };
 
+/// 模型目录的 HTTP 失败（保留状态码，供 Command Code 决定是否启用兜底目录）。
+#[derive(Debug)]
+struct CatalogHttpError {
+    status: u16,
+    message: String,
+}
+
+impl std::fmt::Display for CatalogHttpError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.message)
+    }
+}
+impl std::error::Error for CatalogHttpError {}
+
+/// Command Code 的静态兜底目录：`id -> item`。
+fn bundled_catalog_map() -> HashMap<String, Value> {
+    crate::commandcode::bundled_catalog_items()
+        .into_iter()
+        .filter_map(|item| {
+            let id = item.get("id").and_then(Value::as_str)?.to_owned();
+            Some((id, item))
+        })
+        .collect()
+}
+
 /// Immutable outcome of the network phase (P2-5): nothing is written to the
 /// DB while upstreams are being called. The caller applies the snapshot to
 /// the catalog — models, bindings, `available` recomputation and the run
@@ -220,6 +245,8 @@ impl DiscoveryService {
         base_url: &str,
         protocol_name: &str,
         api_key: &str,
+        channel_id: &str,
+        provider_kind: Option<&str>,
     ) -> Result<(HashMap<String, Value>, i64)> {
         let mut models: HashMap<String, Value> = HashMap::new();
         let runtime = settings::runtime_settings(state).await?;
@@ -246,6 +273,13 @@ impl DiscoveryService {
             if let Some(session_id) = &opencode_session {
                 protocol::apply_opencode_session(&mut headers, base_url, session_id)?;
             }
+            if protocol_name == "command_code"
+                && protocol::requires_command_code_identity(provider_kind)
+            {
+                let identity =
+                    crate::commandcode::identity_for_probe(&state.db, channel_id).await;
+                protocol::apply_command_code_identity(&mut headers, &identity)?;
+            }
             let response = state
                 .http
                 .send(crate::ports::UpstreamRequest {
@@ -264,7 +298,10 @@ impl DiscoveryService {
                 })?;
             status_code = response.status.as_u16() as i64;
             if !response.status.is_success() {
-                bail!("{protocol_name} discovery returned {status_code}");
+                return Err(anyhow::Error::new(CatalogHttpError {
+                    status: response.status.as_u16(),
+                    message: format!("{protocol_name} discovery returned {status_code}"),
+                }));
             }
             // Catalogs are bounded like upstream responses (P1-1).
             let (body, truncated) = response
@@ -306,6 +343,25 @@ impl DiscoveryService {
         } else {
             configured
         };
+        // Plan phase 7: a disabled integration performs zero upstream
+        // requests, so Command Code discovery is skipped entirely.
+        let command_code_enabled = settings::runtime_settings(state)
+            .await
+            .map(|runtime| runtime.command_code_enabled)
+            .unwrap_or(false);
+        let protocols: Vec<String> = if command_code_enabled {
+            protocols
+        } else {
+            protocols
+                .into_iter()
+                .filter(|protocol| protocol != "command_code")
+                .collect()
+        };
+        if protocols.is_empty() {
+            // 唯一协议被全局开关关掉：给出明确原因，而不是一次“成功但零模型”
+            // 的空探测（用户看到的就是“无法探测模型”）。
+            anyhow::bail!("command_code_disabled");
+        }
         let api_key = self.secrets.decrypt(&channel.api_key_encrypted)?;
         let base_url = channel.base_url;
 
@@ -329,6 +385,12 @@ impl DiscoveryService {
             if let Some(session_id) = &opencode_session {
                 protocol::apply_opencode_session(&mut headers, &base_url, session_id)?;
             }
+            if protocol_name == "command_code"
+                && protocol::requires_command_code_identity(channel.kind.as_deref())
+            {
+                let identity = crate::commandcode::identity_for_probe(&state.db, channel_id).await;
+                protocol::apply_command_code_identity(&mut headers, &identity)?;
+            }
             let mut header_key = String::new();
             for (name, value) in headers.iter() {
                 header_key.push_str(&format!("{}:{};", name, value.to_str().unwrap_or("")));
@@ -346,31 +408,89 @@ impl DiscoveryService {
         let mut failed: Vec<String> = Vec::new();
         let mut seen_by_protocol: HashMap<String, HashMap<String, Value>> = HashMap::new();
         let mut last_status_code: Option<i64> = None;
+        // `/provider/v1/models` 对 Go 套餐稳定返回 403，而官方权威目录其实在
+        // CLI 包内的 models.md；实时探测失败时退回静态 Go 目录，保证模型可用。
+        let mut bundled_catalog = false;
         for (_, _, group_protocols) in &groups {
             let primary_protocol = &group_protocols[0];
             match timeout(
                 Duration::from_secs(120),
-                self.fetch_models(state, &base_url, primary_protocol, &api_key),
+                self.fetch_models(
+                    state,
+                    &base_url,
+                    primary_protocol,
+                    &api_key,
+                    channel_id,
+                    channel.kind.as_deref(),
+                ),
             )
             .await
             {
                 Ok(Ok((models, status_code))) => {
                     last_status_code = Some(status_code);
-                    for protocol_name in group_protocols {
-                        succeeded.insert(protocol_name.clone());
-                        seen_by_protocol.insert(protocol_name.clone(), models.clone());
+                    if primary_protocol == "command_code" && models.is_empty() {
+                        tracing::warn!(
+                            channel_id,
+                            "command code live catalog was empty; using bundled Go catalog"
+                        );
+                        bundled_catalog = true;
+                        for protocol_name in group_protocols {
+                            succeeded.insert(protocol_name.clone());
+                            seen_by_protocol
+                                .insert(protocol_name.clone(), bundled_catalog_map());
+                        }
+                    } else {
+                        for protocol_name in group_protocols {
+                            succeeded.insert(protocol_name.clone());
+                            seen_by_protocol.insert(protocol_name.clone(), models.clone());
+                        }
                     }
                 }
                 Ok(Err(error)) => {
-                    tracing::warn!(channel_id, %error, "model discovery failed");
-                    for protocol_name in group_protocols {
-                        failed.push(protocol_name.clone());
+                    // 401 说明凭据本身不可用，绝不静默换成静态目录；其余失败
+                    // （403 upgrade_required、网络、5xx、目录格式）都可以兜底。
+                    let status = error
+                        .downcast_ref::<CatalogHttpError>()
+                        .map(|value| value.status);
+                    if primary_protocol == "command_code" && status != Some(401) {
+                        tracing::warn!(
+                            channel_id,
+                            status,
+                            %error,
+                            "command code live catalog unavailable; using bundled Go catalog"
+                        );
+                        last_status_code = Some(status.unwrap_or(0) as i64);
+                        bundled_catalog = true;
+                        for protocol_name in group_protocols {
+                            succeeded.insert(protocol_name.clone());
+                            seen_by_protocol
+                                .insert(protocol_name.clone(), bundled_catalog_map());
+                        }
+                    } else {
+                        tracing::warn!(channel_id, %error, "model discovery failed");
+                        for protocol_name in group_protocols {
+                            failed.push(protocol_name.clone());
+                        }
                     }
                 }
                 Err(_) => {
-                    tracing::warn!(channel_id, "model discovery timed out");
-                    for protocol_name in group_protocols {
-                        failed.push(protocol_name.clone());
+                    if primary_protocol == "command_code" {
+                        tracing::warn!(
+                            channel_id,
+                            "command code discovery timed out; using bundled Go catalog"
+                        );
+                        last_status_code = Some(0);
+                        bundled_catalog = true;
+                        for protocol_name in group_protocols {
+                            succeeded.insert(protocol_name.clone());
+                            seen_by_protocol
+                                .insert(protocol_name.clone(), bundled_catalog_map());
+                        }
+                    } else {
+                        tracing::warn!(channel_id, "model discovery timed out");
+                        for protocol_name in group_protocols {
+                            failed.push(protocol_name.clone());
+                        }
                     }
                 }
             }
@@ -402,6 +522,14 @@ impl DiscoveryService {
         } else {
             Some(format!("protocol_discovery_failed:{}", failed.join(",")))
         };
+        if bundled_catalog {
+            // 成功但带诊断：UI/日志可提示目录来自包内快照而非实时目录。
+            let diagnostic = "command_code_bundled_catalog".to_owned();
+            error_kind = Some(match error_kind.take() {
+                Some(prefix) => format!("{prefix};{diagnostic}"),
+                None => diagnostic,
+            });
+        }
         if let Some(probe) = &remote_compaction_probe {
             let mut diagnostics = Vec::new();
             if let ProbeVerdict::Inconclusive(reason) = &probe.v1 {
@@ -686,7 +814,11 @@ impl DiscoveryService {
                 let display_name = item
                     .get("display_name")
                     .or_else(|| item.get("displayName"))
+                    // Provider API 的条目字段是 `name`（如 "Claude Sonnet 5"）；
+                    // 只认 display_name 会让 UI 退化成裸模型 id。
+                    .or_else(|| item.get("name"))
                     .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
                     .map(str::to_owned)
                     .unwrap_or_else(|| model_id.clone());
                 let metadata_json = serde_json::to_string(&Value::Object(metadata))?;
@@ -874,6 +1006,7 @@ impl DiscoveryService {
 #[cfg(test)]
 mod tests {
     use crate::{application::Context, config::AppConfig, db::Database};
+    use serde_json::Value;
     use std::sync::Arc;
 
     async fn test_state(upstream_port: u16) -> (Context, std::path::PathBuf) {
@@ -951,6 +1084,7 @@ mod tests {
             Arc::clone(&clock),
             Arc::clone(&limits),
         );
+        let command_code_login = crate::commandcode_login::CommandCodeLogin::new(std::sync::Arc::clone(&http));
         let state = Context {
             config: Arc::new(AppConfig::default()),
             db: db.clone(),
@@ -967,6 +1101,7 @@ mod tests {
             limits,
             balance,
             admin: crate::admin::AdminService::new(db.clone(), secrets.clone()),
+            command_code_login,
             recovery: crate::auth::RecoverySession::new(),
         };
         (state, dir)
@@ -1001,6 +1136,275 @@ mod tests {
             }
         });
         port
+    }
+
+
+    /// Command Code catalog mock: serves `GET /provider/v1/models` and
+    /// records every request head for header assertions.
+    async fn spawn_command_code_catalog_upstream() -> (
+        u16,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let n = match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        buf.extend_from_slice(&chunk[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+                    let body = r#"{"data":[{"id":"deepseek/deepseek-v4-flash"},{"id":"cc-model"}]}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (port, rx)
+    }
+
+    /// Command Code discovery hits the Provider API catalog path with the CLI
+    /// identity headers (only because the provider carries
+    /// `kind='command_code'`), and parses OpenAI-shaped catalog items.
+    #[tokio::test]
+    async fn command_code_discovery_uses_provider_catalog_with_identity() {
+        let (port, mut heads) = spawn_command_code_catalog_upstream().await;
+        let (state, _dir) = test_state(port).await;
+        let time = "2026-08-04T01:00:00+00:00";
+        sqlx::query("UPDATE providers SET kind='command_code' WHERE id='prov-1'")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE channels SET protocol='command_code' WHERE id='ch-1'")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM channel_protocols WHERE channel_id='ch-1'")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channel_protocols(channel_id,protocol) VALUES('ch-1','command_code')")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO settings(key,value_json,updated_at) VALUES('command_code_enabled','true',?)")
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+
+        let snapshot = state.discovery.discover(&state, "ch-1").await.unwrap();
+        assert_eq!(snapshot.model_count, 2);
+        assert!(snapshot.error_kind.is_none());
+
+        let head = tokio::time::timeout(std::time::Duration::from_secs(5), heads.recv())
+            .await
+            .expect("catalog request timed out")
+            .expect("catalog request missing");
+        assert!(head.starts_with("GET /provider/v1/models"), "{head}");
+        let lower = head.to_ascii_lowercase();
+        for needle in [
+            "x-cli-environment: production",
+            "x-command-code-version:",
+            "x-session-id:",
+            "x-co-flag: false",
+            "traceparent:",
+        ] {
+            assert!(lower.contains(needle), "{needle} missing in {head}");
+        }
+    }
+
+
+    /// Catalog mock answering every request with one HTTP status.
+    async fn spawn_status_catalog_upstream(status: u16) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let mut total = 0usize;
+                    loop {
+                        match stream.read(&mut buf[total..]).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                total += n;
+                                if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let body = format!(r#"{{"error":{{"message":"catalog {status}"}}}}"#);
+                    let response = format!(
+                        "HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        port
+    }
+
+
+    /// 真实 `/provider/v1/models` 的条目字段是 `name`/`context_length`（没有
+    /// `display_name`）：显示名必须取 `name`，否则 UI 退化成裸模型 id。
+    #[tokio::test]
+    async fn real_provider_catalog_name_becomes_the_display_name() {
+        async fn spawn_upstream() -> u16 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let mut total = 0usize;
+                    loop {
+                        match stream.read(&mut buf[total..]).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                total += n;
+                                if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let body = r#"{"object":"list","data":[{"id":"m1","object":"model","owned_by":"command-code","name":"Model One","context_length":1000000}]}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                }
+            });
+            port
+        }
+        let port = spawn_upstream().await;
+        let (state, _dir) = test_state(port).await;
+        let snapshot = state.discovery.discover(&state, "ch-1").await.unwrap();
+        assert!(snapshot.succeeded.contains("openai_compatible"));
+        state
+            .discovery
+            .apply_discovery("ch-1", &snapshot, "run-1", "2026-08-04T02:00:00+00:00")
+            .await
+            .unwrap();
+        let (display_name, metadata): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT display_name, metadata_json FROM channel_models WHERE channel_id='ch-1' AND model_id='m1'",
+        )
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(display_name.as_deref(), Some("Model One"));
+        let metadata: Value = serde_json::from_str(&metadata.unwrap()).unwrap();
+        assert_eq!(
+            metadata
+                .pointer("/openai_compatible/context_length")
+                .and_then(Value::as_i64),
+            Some(1_000_000)
+        );
+    }
+
+    /// Switch the seeded channel/provider to the Command Code protocol.
+    async fn switch_to_command_code(state: &Context) {
+        let time = "2026-08-04T01:00:00+00:00";
+        sqlx::query("UPDATE providers SET kind='command_code' WHERE id='prov-1'")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE channels SET protocol='command_code' WHERE id='ch-1'")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM channel_protocols WHERE channel_id='ch-1'")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channel_protocols(channel_id,protocol) VALUES('ch-1','command_code')")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO settings(key,value_json,updated_at) VALUES('command_code_enabled','true',?)")
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+    }
+
+    /// Go 套餐的 `/provider/v1/models` 返回 403：必须退回官方 CLI 包内的
+    /// Go 目录，目录可用且带 `command_code_bundled_catalog` 诊断。
+    #[tokio::test]
+    async fn command_code_discovery_falls_back_to_bundled_catalog_on_403() {
+        let port = spawn_status_catalog_upstream(403).await;
+        let (state, _dir) = test_state(port).await;
+        switch_to_command_code(&state).await;
+        let snapshot = state.discovery.discover(&state, "ch-1").await.unwrap();
+        assert!(
+            snapshot.succeeded.contains("command_code"),
+            "fallback catalog must count as a fetched protocol"
+        );
+        assert!(
+            snapshot.model_count >= 40,
+            "expected the bundled Go catalog, got {}",
+            snapshot.model_count
+        );
+        let models = snapshot
+            .seen_by_protocol
+            .get("command_code")
+            .expect("bundled models");
+        let flash = models
+            .get("deepseek/deepseek-v4-flash")
+            .expect("a Go-eligible model is present");
+        assert_eq!(
+            flash.get("command_code_bundled").and_then(Value::as_bool),
+            Some(true)
+        );
+        let error_kind = snapshot.error_kind.clone().unwrap_or_default();
+        assert!(
+            error_kind.contains("command_code_bundled_catalog"),
+            "diagnostic missing: {error_kind}"
+        );
+        // Not a Pro/Max-only model.
+        assert!(!models.contains_key("claude-opus-5"));
+    }
+
+    /// 401 是凭据问题，绝不能静默换成静态目录。
+    #[tokio::test]
+    async fn command_code_discovery_401_is_not_masked_by_the_fallback() {
+        let port = spawn_status_catalog_upstream(401).await;
+        let (state, _dir) = test_state(port).await;
+        switch_to_command_code(&state).await;
+        let snapshot = state.discovery.discover(&state, "ch-1").await.unwrap();
+        assert!(!snapshot.succeeded.contains("command_code"));
+        assert!(snapshot.seen_by_protocol.get("command_code").is_none());
+        let error_kind = snapshot.error_kind.clone().unwrap_or_default();
+        assert!(
+            error_kind.contains("protocol_discovery_failed"),
+            "{error_kind}"
+        );
     }
 
     /// P2-5: a successful discovery applies models, bindings and the run

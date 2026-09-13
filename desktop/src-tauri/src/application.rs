@@ -60,4 +60,7 @@ pub struct Context {
     pub limits: Arc<RuntimeLimits>,
     /// One-time challenge store for corrupt-key recovery (P1-4).
     pub recovery: Arc<RecoverySession>,
+    /// Command Code 网页登录授权流程（等价 `cmd login` 的 loopback 回调；
+    /// 每 Context 一份，密钥只在服务端内存与加密库之间流转）。
+    pub command_code_login: Arc<crate::commandcode_login::CommandCodeLogin>,
 }

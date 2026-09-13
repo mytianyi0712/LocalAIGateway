@@ -5,6 +5,8 @@ pub mod assets;
 pub mod auth;
 pub mod balance;
 pub mod capabilities;
+pub mod commandcode;
+pub mod commandcode_login;
 pub mod compression;
 pub mod config;
 pub mod controller;

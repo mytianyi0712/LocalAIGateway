@@ -89,6 +89,11 @@ impl Database {
              SELECT cm.id, c.protocol FROM channel_models cm JOIN channels c ON c.id = cm.channel_id \
              WHERE NOT EXISTS (SELECT 1 FROM channel_model_protocols cmp WHERE cmp.channel_model_id = cm.id)"
         ).execute(&mut *tx).await?;
+        // Legacy alias: a model that supports either OpenAI protocol gets
+        // both bindings so catalog/route queries stay interchangeable.
+        // Command Code is deliberately NOT included: it is an upstream-only
+        // protocol with its own wire format (NDJSON / CLI identity), so it
+        // must never inherit OpenAI-family bindings.
         sqlx::query(
             "INSERT OR IGNORE INTO channel_model_protocols(channel_model_id, protocol) \
              SELECT cm.id, cp.protocol FROM channel_models cm \

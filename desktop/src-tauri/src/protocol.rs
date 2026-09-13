@@ -5,6 +5,24 @@ use url::Url;
 
 use crate::telemetry::Usage;
 
+/// One health probe request: method, upstream path and optional JSON body.
+/// Most protocols probe with a tiny POST; Command Code probes its read-only
+/// `GET /alpha/whoami` (authentication only — no token spend, no generation).
+#[derive(Debug, Clone)]
+pub struct HealthProbe {
+    pub method: http::Method,
+    pub path: String,
+    pub body: Option<Value>,
+}
+
+fn post_probe(path: String, body: Value) -> HealthProbe {
+    HealthProbe {
+        method: http::Method::POST,
+        path,
+        body: Some(body),
+    }
+}
+
 /// Per-protocol behavior bundle (P2-3): authentication, entry parsing,
 /// discovery, health probes, usage observation and the public error shape.
 /// One implementation per protocol, obtained from [`ProtocolId::adapter`];
@@ -25,8 +43,8 @@ pub trait ProtocolAdapter {
     fn discovery_path(&self) -> &'static str;
     /// Parse one catalog page; returns (items, optional next-page URL).
     fn parse_catalog(&self, body: &[u8], current_url: &Url) -> Result<(Vec<Value>, Option<Url>)>;
-    /// Minimal health-probe request (path + JSON body) for `model`.
-    fn health_probe(&self, model: &str) -> (String, Value);
+    /// Minimal health-probe request for `model`.
+    fn health_probe(&self, model: &str) -> HealthProbe;
     /// Whether a probe response body counts as healthy.
     fn probe_body_ok(&self, body: &[u8]) -> bool;
     /// Raw usage object inside a streamed event or response root.
@@ -123,8 +141,8 @@ impl ProtocolAdapter for OpenaiChatAdapter {
     fn parse_catalog(&self, body: &[u8], _current_url: &Url) -> Result<(Vec<Value>, Option<Url>)> {
         parse_openai_catalog(body)
     }
-    fn health_probe(&self, model: &str) -> (String, Value) {
-        (
+    fn health_probe(&self, model: &str) -> HealthProbe {
+        post_probe(
             "/v1/chat/completions".to_owned(),
             json!({"model": model, "messages": [{"role": "user", "content": "Reply only OK"}], "max_tokens": 2}),
         )
@@ -180,8 +198,8 @@ impl ProtocolAdapter for OpenaiResponsesAdapter {
     fn parse_catalog(&self, body: &[u8], _current_url: &Url) -> Result<(Vec<Value>, Option<Url>)> {
         parse_openai_catalog(body)
     }
-    fn health_probe(&self, model: &str) -> (String, Value) {
-        (
+    fn health_probe(&self, model: &str) -> HealthProbe {
+        post_probe(
             "/v1/responses".to_owned(),
             json!({"model": model, "input": "Reply only OK", "max_output_tokens": 2}),
         )
@@ -269,8 +287,8 @@ impl ProtocolAdapter for ClaudeAdapter {
         };
         Ok((parsed, next))
     }
-    fn health_probe(&self, model: &str) -> (String, Value) {
-        (
+    fn health_probe(&self, model: &str) -> HealthProbe {
+        post_probe(
             "/v1/messages".to_owned(),
             json!({"model": model, "max_tokens": 2, "messages": [{"role": "user", "content": "Reply only OK"}]}),
         )
@@ -387,8 +405,8 @@ impl ProtocolAdapter for GeminiAdapter {
             });
         Ok((parsed, next))
     }
-    fn health_probe(&self, model: &str) -> (String, Value) {
-        (
+    fn health_probe(&self, model: &str) -> HealthProbe {
+        post_probe(
             format!("/v1beta/models/{model}:generateContent"),
             json!({"contents": [{"parts": [{"text": "Reply only OK"}]}], "generationConfig": {"maxOutputTokens": 2}}),
         )
@@ -433,6 +451,120 @@ impl ProtocolAdapter for GeminiAdapter {
     }
 }
 
+/// Command Code CLI upstream: `/alpha/generate` (NDJSON) on the reverse
+/// path, official Provider API for paid plans. Upstream-only protocol — it
+/// has no client-facing entry endpoints, so `endpoints()` is empty and the
+/// model catalog never advertises it.
+pub struct CommandCodeAdapter;
+
+impl ProtocolAdapter for CommandCodeAdapter {
+    fn inspect_request(
+        &self,
+        _path: &str,
+        _query: Option<&str>,
+        body: &[u8],
+    ) -> (Option<String>, bool) {
+        let Ok(value) = serde_json::from_slice::<Value>(body) else {
+            return (None, false);
+        };
+        // `/alpha/generate` bodies nest the fields under `params`; the
+        // provider API body is plain OpenAI chat (`model` / `stream`). Accept
+        // both so one adapter serves the transport router.
+        let model = value
+            .pointer("/params/model")
+            .or_else(|| value.get("model"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let stream = value
+            .pointer("/params/stream")
+            .or_else(|| value.get("stream"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        (model, stream)
+    }
+    /// Official Provider API catalog (OpenAI shape).
+    fn discovery_path(&self) -> &'static str {
+        "/provider/v1/models"
+    }
+    fn parse_catalog(&self, body: &[u8], _current_url: &Url) -> Result<(Vec<Value>, Option<Url>)> {
+        parse_openai_catalog(body)
+    }
+    /// Read-only account probe: authentication only, no token spend and no
+    /// generation request (plan decision 5).
+    fn health_probe(&self, _model: &str) -> HealthProbe {
+        HealthProbe {
+            method: http::Method::GET,
+            path: "/alpha/whoami".to_owned(),
+            body: None,
+        }
+    }
+    fn probe_body_ok(&self, body: &[u8]) -> bool {
+        let Ok(value) = serde_json::from_slice::<Value>(body) else {
+            return false;
+        };
+        value.is_object()
+            && (value.get("user").is_some()
+                || value.get("org").is_some()
+                || value.get("orgId").is_some())
+    }
+    fn usage_value(&self, value: &Value) -> Option<Value> {
+        // Raw CC usage lives in `finish.totalUsage` / `finish-step.usage`;
+        // the stream decoder converts it to OpenAI usage before conversion,
+        // but accept the raw shape for non-stream observability.
+        value
+            .get("totalUsage")
+            .or_else(|| value.get("usage"))
+            .cloned()
+    }
+    fn normalize_usage(&self, usage: &Value) -> Usage {
+        commandcode_usage(usage)
+    }
+    fn error_shape(
+        &self,
+        status: StatusCode,
+        code: &str,
+        message: &str,
+        request_id: &str,
+    ) -> Value {
+        openai_error_shape(status, code, message, request_id)
+    }
+}
+
+/// Normalize a raw Command Code usage object. `inputTokens` is the TOTAL
+/// (cache hits included); the Anthropic/cache accounting needs the
+/// non-cached part (`inputTokenDetails.noCacheTokens`, or a subtraction).
+pub fn commandcode_usage(usage: &Value) -> Usage {
+    let details = usage.get("inputTokenDetails");
+    let total_input = usage.get("inputTokens").and_then(Value::as_i64);
+    let cache_read = usage
+        .get("cachedInputTokens")
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            details
+                .and_then(|value| value.get("cacheReadTokens"))
+                .and_then(Value::as_i64)
+        });
+    let cache_write = details
+        .and_then(|value| value.get("cacheWriteTokens"))
+        .and_then(Value::as_i64);
+    let miss = details
+        .and_then(|value| value.get("noCacheTokens"))
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            total_input.map(|total| {
+                (total - cache_read.unwrap_or(0) - cache_write.unwrap_or(0)).max(0)
+            })
+        });
+    Usage {
+        input_tokens: total_input,
+        cache_read_tokens: cache_read,
+        cache_write_tokens: cache_write,
+        cache_miss_input_tokens: miss,
+        output_tokens: usage.get("outputTokens").and_then(Value::as_i64),
+        raw: Some(usage.clone()),
+    }
+}
+
 fn parse_openai_catalog(body: &[u8]) -> Result<(Vec<Value>, Option<Url>)> {
     let value: Value = serde_json::from_slice(body).context("模型目录 JSON 无效")?;
     let items = value
@@ -455,6 +587,7 @@ impl ProtocolId {
             ProtocolId::OpenaiResponses => &OpenaiResponsesAdapter,
             ProtocolId::Claude => &ClaudeAdapter,
             ProtocolId::Gemini => &GeminiAdapter,
+            ProtocolId::CommandCode => &CommandCodeAdapter,
         }
     }
 }
@@ -470,14 +603,17 @@ pub enum ProtocolId {
     OpenaiResponses,
     Claude,
     Gemini,
+    /// Upstream-only: Command Code CLI reverse path / official Provider API.
+    CommandCode,
 }
 
 impl ProtocolId {
-    pub const ALL: [ProtocolId; 4] = [
+    pub const ALL: [ProtocolId; 5] = [
         ProtocolId::OpenaiCompatible,
         ProtocolId::OpenaiResponses,
         ProtocolId::Claude,
         ProtocolId::Gemini,
+        ProtocolId::CommandCode,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -486,6 +622,7 @@ impl ProtocolId {
             ProtocolId::OpenaiResponses => "openai_responses",
             ProtocolId::Claude => "claude",
             ProtocolId::Gemini => "gemini",
+            ProtocolId::CommandCode => "command_code",
         }
     }
 
@@ -495,6 +632,7 @@ impl ProtocolId {
             "openai_responses" => Some(Self::OpenaiResponses),
             "claude" => Some(Self::Claude),
             "gemini" => Some(Self::Gemini),
+            "command_code" => Some(Self::CommandCode),
             _ => None,
         }
     }
@@ -511,6 +649,9 @@ impl ProtocolId {
                 "/v1beta/models/{model}:generateContent",
                 "/v1beta/models/{model}:streamGenerateContent",
             ],
+            // Upstream-only: reachable through claude/codex model mappings,
+            // never as a client entry endpoint.
+            ProtocolId::CommandCode => &[],
         }
     }
 
@@ -524,7 +665,13 @@ impl ProtocolId {
 /// Ordered string view of the supported protocols, kept for call sites that
 /// serialize the list (system status/protocols endpoints). Literals mirror
 /// [`ProtocolId::as_str`] — the enum is the single source of additions.
-pub const PROTOCOL_ORDER: [&str; 4] = ["openai_compatible", "openai_responses", "claude", "gemini"];
+pub const PROTOCOL_ORDER: [&str; 5] = [
+    "openai_compatible",
+    "openai_responses",
+    "claude",
+    "gemini",
+    "command_code",
+];
 
 const HOP_BY_HOP: &[&str] = &[
     "connection",
@@ -569,6 +716,18 @@ pub fn upstream_url(
     protocol: &str,
 ) -> Result<Url> {
     let mut base = Url::parse(base_url)?;
+    // 路径里内联的查询串必须拆出来交给 `set_query`：`set_path` 会把 `?`
+    // 百分号转义（/x?orgId=1 → /x%3ForgId=1），把请求打到错误路径上。
+    let (path, inline_query) = match path.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (path, None),
+    };
+    let raw_query = match (raw_query.filter(|query| !query.is_empty()), inline_query) {
+        (Some(raw), Some(inline)) if !inline.is_empty() => Some(format!("{raw}&{inline}")),
+        (Some(raw), _) => Some(raw.to_owned()),
+        (None, Some(inline)) if !inline.is_empty() => Some(inline.to_owned()),
+        (None, _) => None,
+    };
     let base_path = base.path().trim_end_matches('/');
     let suffix = format!("/{}", path.trim_start_matches('/'));
     let joined = if !base_path.is_empty()
@@ -579,7 +738,7 @@ pub fn upstream_url(
         format!("{base_path}{suffix}")
     };
     base.set_path(&joined);
-    base.set_query(raw_query.filter(|query| !query.is_empty()));
+    base.set_query(raw_query.as_deref());
     if protocol == "gemini" {
         let retained = base
             .query_pairs()
@@ -628,6 +787,16 @@ pub fn outbound_headers(inbound: &HeaderMap, protocol: &str, api_key: &str) -> R
             headers.insert(
                 HeaderName::from_static("x-goog-api-key"),
                 HeaderValue::from_str(api_key)?,
+            );
+        }
+        // Command Code keys are `user_...` bearer tokens. Identity headers
+        // (session/fingerprint/version) are injected separately by
+        // `apply_command_code_identity`, only for `kind='command_code'`
+        // providers (plan decision 2).
+        "command_code" => {
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {api_key}"))?,
             );
         }
         _ => bail!("不支持的协议 {protocol}"),
@@ -685,6 +854,104 @@ pub fn apply_opencode_session(
     Ok(())
 }
 
+/// Headers the Command Code CLI sends on every request. Injected ONLY for
+/// providers whose `kind = 'command_code'` (plan decision 2) — base_url is
+/// never sniffed, so a self-hosted bridge can never receive a fingerprint by
+/// accident.
+pub struct CommandCodeIdentity {
+    pub cli_version: String,
+    pub session_id: String,
+    pub project_slug: String,
+    /// ZDR opt-in (`x-cmd-zdr: 1`).
+    pub zdr: bool,
+}
+
+/// Whether a provider row opts into Command Code identity headers.
+pub fn requires_command_code_identity(provider_kind: Option<&str>) -> bool {
+    provider_kind == Some("command_code")
+}
+
+/// Applies the CLI identity headers. The caller has already set
+/// `Authorization` via [`outbound_headers`].
+pub fn apply_command_code_identity(
+    headers: &mut HeaderMap,
+    identity: &CommandCodeIdentity,
+) -> Result<()> {
+    headers.insert(
+        HeaderName::from_static("x-cli-environment"),
+        HeaderValue::from_static("production"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-command-code-version"),
+        HeaderValue::from_str(&identity.cli_version)?,
+    );
+    if !identity.session_id.is_empty() {
+        headers.insert(
+            HeaderName::from_static("x-session-id"),
+            HeaderValue::from_str(&identity.session_id)?,
+        );
+    }
+    if !identity.project_slug.is_empty() {
+        headers.insert(
+            HeaderName::from_static("x-project-slug"),
+            HeaderValue::from_str(&identity.project_slug)?,
+        );
+    }
+    headers.insert(
+        HeaderName::from_static("x-co-flag"),
+        HeaderValue::from_static("false"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-taste-learning"),
+        HeaderValue::from_static("false"),
+    );
+    headers.insert(
+        HeaderName::from_static("traceparent"),
+        HeaderValue::from_str(&generate_traceparent())?,
+    );
+    if identity.zdr {
+        headers.insert(HeaderName::from_static("x-cmd-zdr"), HeaderValue::from_static("1"));
+    }
+    Ok(())
+}
+
+/// One W3C trace context per request: `00-<32hex trace-id>-<16hex span>-01`.
+pub fn generate_traceparent() -> String {
+    let trace = uuid::Uuid::new_v4().simple().to_string();
+    let span = &uuid::Uuid::new_v4().simple().to_string()[..16];
+    format!("00-{trace}-{span}-01")
+}
+
+/// Deterministic `x-project-slug` derived from the session id (plan §2.4):
+/// hex session ids are parsed for an index, anything else falls back to a
+/// stable character hash. Never reveals the raw session id.
+pub fn derive_project_slug(session_id: &str) -> String {
+    let hex_index = session_id
+        .trim_start_matches("sess_")
+        .chars()
+        .take(8)
+        .all(|value| value.is_ascii_hexdigit())
+        .then(|| {
+            u64::from_str_radix(&session_id.trim_start_matches("sess_")[..8], 16).unwrap_or(0)
+        });
+    let slug = match hex_index {
+        Some(index) => {
+            const WORDS: [&str; 8] = ["sable", "ember", "quartz", "willow", "harbor", "cypress", "onyx", "delta"];
+            format!("{}-{}", WORDS[(index as usize) % WORDS.len()], index % 9973)
+        }
+        None => {
+            // FNV-1a over the session id: stable, cheap, non-reversible.
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+            for byte in session_id.as_bytes() {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            format!("ws-{:x}", hash & 0xffff_ffff)
+        }
+    };
+    slug
+}
+
 pub fn response_headers(inbound: &reqwest::header::HeaderMap) -> HeaderMap {
     let mut headers = HeaderMap::new();
     for (name, value) in inbound {
@@ -702,34 +969,12 @@ pub fn inspect_request(
     query: Option<&str>,
     body: &[u8],
 ) -> (Option<String>, bool) {
-    if protocol == "gemini" {
-        let model = path
-            .split("/models/")
-            .nth(1)
-            .and_then(|value| value.split(':').next())
-            .map(|value| {
-                percent_encoding::percent_decode_str(value)
-                    .decode_utf8_lossy()
-                    .into_owned()
-            });
-        let stream = path.contains(":streamGenerateContent")
-            || query.unwrap_or_default().contains("alt=sse");
-        return (model, stream);
-    }
-    let value: Value = match serde_json::from_slice(body) {
-        Ok(value) => value,
-        Err(_) => return (None, false),
-    };
-    (
-        value
-            .get("model")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        value
-            .get("stream")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-    )
+    // Registry dispatch (P2-3): every protocol — including the nested
+    // Command Code body (`params.model` / `params.stream`) — is inspected by
+    // its own adapter instead of an inline OpenAI-shaped match.
+    ProtocolId::parse(protocol)
+        .map(|id| id.adapter().inspect_request(path, query, body))
+        .unwrap_or((None, false))
 }
 
 pub fn discovery_path(protocol: &str) -> &'static str {
@@ -752,7 +997,7 @@ pub fn parse_catalog(
 
 /// Health-probe request via the protocol adapter (P2-3); `None` for an
 /// unknown protocol.
-pub fn health_probe(protocol: &str, model: &str) -> Option<(String, Value)> {
+pub fn health_probe(protocol: &str, model: &str) -> Option<HealthProbe> {
     ProtocolId::parse(protocol).map(|id| id.adapter().health_probe(model))
 }
 
@@ -778,6 +1023,159 @@ pub fn normalize_usage(protocol: &str, usage: &Value) -> Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The inspect registry understands Command Code's nested body (and the
+    /// flat Provider API body), so route-model/stream inspection works for
+    /// both transports.
+    #[test]
+    fn command_code_inspect_reads_nested_and_flat_bodies() {
+        let (model, stream) = inspect_request(
+            "command_code",
+            "/alpha/generate",
+            None,
+            br#"{"params":{"model":"deepseek/deepseek-v4-flash","stream":true}}"#,
+        );
+        assert_eq!(model.as_deref(), Some("deepseek/deepseek-v4-flash"));
+        assert!(stream);
+        let (model, stream) = inspect_request(
+            "command_code",
+            "/provider/v1/chat/completions",
+            None,
+            br#"{"model":"cc-model","stream":false}"#,
+        );
+        assert_eq!(model.as_deref(), Some("cc-model"));
+        assert!(!stream);
+        // Command Code advertises no client-facing endpoints.
+        assert!(ProtocolId::CommandCode.endpoints().is_empty());
+        assert_eq!(
+            ProtocolId::CommandCode.discovery_path(),
+            "/provider/v1/models"
+        );
+    }
+
+    /// Identity headers are complete, W3C-shaped and kind-gated: a provider
+    /// without `kind='command_code'` can never trigger them (decision 2).
+    #[test]
+    fn command_code_identity_headers_are_complete_and_kind_gated() {
+        assert!(!requires_command_code_identity(None));
+        assert!(!requires_command_code_identity(Some("other")));
+        assert!(!requires_command_code_identity(Some("")));
+        assert!(requires_command_code_identity(Some("command_code")));
+
+        let mut headers = HeaderMap::new();
+        apply_command_code_identity(
+            &mut headers,
+            &CommandCodeIdentity {
+                cli_version: "1.53.1".into(),
+                session_id: "sess_abc".into(),
+                project_slug: "sable-1".into(),
+                zdr: true,
+            },
+        )
+        .unwrap();
+        for name in [
+            "x-cli-environment",
+            "x-command-code-version",
+            "x-session-id",
+            "x-project-slug",
+            "x-co-flag",
+            "x-taste-learning",
+            "traceparent",
+            "x-cmd-zdr",
+        ] {
+            assert!(headers.contains_key(name), "{name} missing");
+        }
+        assert_eq!(headers["x-cli-environment"], "production");
+        assert_eq!(headers["x-command-code-version"], "1.53.1");
+        assert_eq!(headers["x-session-id"], "sess_abc");
+        assert_eq!(headers["x-project-slug"], "sable-1");
+        assert_eq!(headers["x-co-flag"], "false");
+        assert_eq!(headers["x-taste-learning"], "false");
+        assert_eq!(headers["x-cmd-zdr"], "1");
+        let traceparent = headers["traceparent"].to_str().unwrap();
+        assert_eq!(traceparent.len(), 55, "{traceparent}");
+        assert!(traceparent.starts_with("00-"), "{traceparent}");
+        assert!(traceparent.ends_with("-01"), "{traceparent}");
+        assert_ne!(generate_traceparent(), generate_traceparent());
+
+        // ZDR off omits the optional header.
+        let mut headers = HeaderMap::new();
+        apply_command_code_identity(
+            &mut headers,
+            &CommandCodeIdentity {
+                cli_version: "1.53.1".into(),
+                session_id: String::new(),
+                project_slug: String::new(),
+                zdr: false,
+            },
+        )
+        .unwrap();
+        assert!(!headers.contains_key("x-cmd-zdr"));
+        assert!(
+            !headers.contains_key("x-session-id") && !headers.contains_key("x-project-slug"),
+            "empty identity values are omitted"
+        );
+    }
+
+    /// Inline `?query` in a path must reach the URL as a real query string —
+    /// `Url::set_path` would percent-encode the `?` and hit a 404 path.
+    #[test]
+    fn upstream_url_splits_inline_query_strings() {
+        let url = upstream_url(
+            "https://api.commandcode.ai",
+            "/alpha/billing/credits?orgId=org_1",
+            None,
+            "command_code",
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://api.commandcode.ai/alpha/billing/credits?orgId=org_1"
+        );
+        let url = upstream_url(
+            "https://api.commandcode.ai",
+            "/alpha/usage/summary?orgId=org_1",
+            Some("since=2026-01-01"),
+            "command_code",
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://api.commandcode.ai/alpha/usage/summary?since=2026-01-01&orgId=org_1"
+        );
+        let url = upstream_url(
+            "https://api.commandcode.ai",
+            "/provider/v1/models",
+            None,
+            "command_code",
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://api.commandcode.ai/provider/v1/models"
+        );
+    }
+
+    /// Command Code probes the read-only `whoami` endpoint with GET (no
+    /// token spend), and its verdict accepts the account shapes the CLI
+    /// returns while rejecting error bodies.
+    #[test]
+    fn command_code_health_probe_is_read_only_get() {
+        let probe = health_probe("command_code", "ignored-model").expect("probe");
+        assert_eq!(probe.method, http::Method::GET);
+        assert_eq!(probe.path, "/alpha/whoami");
+        assert!(probe.body.is_none(), "whoami carries no body");
+        assert!(probe_body_ok(
+            "command_code",
+            br#"{"user":{"userName":"u"},"org":{"id":"org_1","login":"me"}}"#
+        ));
+        assert!(probe_body_ok("command_code", br#"{"orgId":"org_2"}"#));
+        assert!(!probe_body_ok(
+            "command_code",
+            br#"{"error":{"code":"unauthorized"}}"#
+        ));
+        assert!(!probe_body_ok("command_code", b"not json"));
+    }
 
     #[test]
     fn opencode_session_required_by_host_or_zen_path() {

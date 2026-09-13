@@ -13,6 +13,7 @@
 - Codex 模型映射助手：对外暴露 Codex 标准模型名（如 `gpt-5-codex`），与 Claude 映射同一套转换体系，让 Codex CLI 通过独立入口 `/codex` 使用任意上游模型。
 - 模型能力档案：内置 `capability_profiles` 表收集可复用的模型能力集合，支持手动创建/编辑/删除；在「模型路由 → 配置能力」中可直接选择档案应用（多个模型可共用同一套能力，如 GPT-5.6 Sol/Terra/Luna），修改档案自动同步到所有引用模型；成本仍按模型独立配置。
 - 渠道余额查询（旁路、默认关闭）：按渠道手动选择 New API、Sub2API、OpenCode Go、DeepSeek 或自定义适配器；启用后每小时自动刷新，也可在渠道表单内「立即查询」或使用工具栏「刷新余额」批量刷新。上游失败只写归一化快照与稳定错误分类，不影响代理路径，也不保存原始响应正文或令牌。
+- Command Code 集成（上游专用协议、默认关闭）：为 Go 套餐渠道提供「先官方 Provider API、403 `upgrade_required` 后降级 CLI 兼容路径」的 transport router，自动注入 CLI 身份头（会话/指纹/版本，按渠道独立持久化），把 NDJSON 流转换为 Claude / Codex 入口可用的响应，并支持额度（5h/周/credits）查询。凭据通过内建**网页登录授权**获取（与官方 `cmd login` 同一 loopback 流程，密钥不经过浏览器页面），也可从 CLI 凭据文件导入。风险与合规提示见下文。
 - 原生管理端覆盖供应商、渠道、模型探测、路由、能力档案、Claude 映射、Codex 映射、日志、健康状态和运行设置，无需 Node.js 或前端构建步骤。
 
 ## 使用说明
@@ -189,6 +190,7 @@ sudo systemctl enable --now local-ai-gateway
 
 ## 设计文档
 
+- [Command Code 协议基准](docs/command-code-protocol.md)
 - [需求基线](docs/requirements.md)
 - [总体架构](docs/architecture.md)
 - [API 设计](docs/api-design.md)
@@ -197,10 +199,49 @@ sudo systemctl enable --now local-ai-gateway
 
 ## 核心边界
 
-- 支持 OpenAI Compatible、OpenAI Responses、Claude、Gemini 四种协议。
+- 支持 OpenAI Compatible、OpenAI Responses、Claude、Gemini 四种入口协议；Command Code 是**上游专用**协议（经 Claude/Codex 映射接入，没有客户端入口）。
 - 模型路由功能只在完全相同的协议内进行故障转移，不做跨协议转换。
-- 用户请求体、上游响应体和最终上游 HTTP 错误保持原始字节不变。
+- 用户请求体、上游响应体和最终上游 HTTP 错误保持原始字节不变；Command Code 是唯一例外（入口请求/响应需按 CLI 线协议转换）。
 - 网关只处理路由、认证替换、逐跳头处理、故障转移、旁路统计和健康检查。
 - 不进行价格或费用计算。
 
 详细架构与验收边界见上述设计文档。
+
+## Command Code Go（路线 B，默认关闭）
+
+> **风险提示**：Go 套餐没有官方 API 访问。网关默认先请求官方 Provider API，服务端以 `403 upgrade_required`
+> 拒绝后，**仅对该账号**降级到 CLI 兼容路径（`/alpha/generate`），并使用 CLI 身份头（会话、指纹、版本）。
+> 这是对服务端明确拒绝路径的绕过，可能违反服务条款并导致账号封禁。启用即表示已知晓并自行承担全部风险。
+> 集成默认关闭；关闭状态下网关不会向 Command Code 发出任何请求（含探测/发现/额度）。
+
+配置步骤：
+
+1. 「供应商与渠道」→「添加供应商」→ 选择预设 **Command Code Go**（`https://api.commandcode.ai`，`kind=command_code`），
+   阅读并勾选风险确认后创建。
+2. 在该供应商下「添加渠道」：请求格式勾选 `command_code`。
+3. **获取凭据（Go 套餐无法在面板创建 API Key）**：在渠道表单点击「网页登录授权」——网关会启动与官方
+   `cmd login` 完全相同的本机回环流程并打开 `commandcode.ai` 授权页；授权完成后 Studio 签发的 API Key
+   直接写入网关（浏览器页面与管理端前端都不会接触到密钥），表单显示已授权的账号后保存即可。
+   也可以点「从 CLI 导入」读取已登录 CLI 的 `~/.commandcode/auth.json`（或环境变量
+   `COMMAND_CODE_API_KEY`）。密钥会先经 `GET /alpha/whoami` 校验，失败会在表单内提示原因
+   （拒绝 / 超时 / 校验失败 / 网络错误 / 已取消）。若浏览器无法回传，可在授权页复制 key 到「API Key」输入框手动粘贴。
+4. 为渠道探测/手工登记模型（目录端点 `GET /provider/v1/models`；Go 套餐被 403 拒绝时请手工添加模型）。
+5. 在「Claude 映射」或「Codex 映射」中把标准模型名映射到 `command_code` 上游模型——Command Code 只通过映射接入。
+6. 「设置」→ 打开 **Command Code 集成** 开关并确认风险；同一面板显示 CLI 版本与协议基准的漂移告警。
+7. 可选：编辑渠道 →「余额查询」选择 `Command Code` 适配器并启用，显示 5h/周窗口与 credits。
+
+> 登录授权协议（回环回调、state 校验、CORS/PNA、失败分类、CLI 凭据导入）记录在
+> `docs/command-code-protocol.md` §13，与三份 MIT 参考实现交叉验证。
+
+模型与额度：`/provider/v1/models` 实测为公开目录，网关正常探测；实时目录不可用（网络/5xx/空）时自动
+退回官方 CLI 包内的 Go 模型快照（探测运行会带 `command_code_bundled_catalog` 诊断）。额度走
+`whoami → billing/credits → usage/summary`，需要先在渠道表单启用 `Command Code` 余额适配器；若页面提示
+「集成未启用」，请到「设置 → Command Code」打开开关（默认关闭，关闭时探测/额度/代理都不会发出请求）。
+
+运行时行为：首次请求先走官方 Provider API，命中 `403 upgrade_required` 后记忆该渠道为 `generate` 路径；
+`GOAT/Pro/Max` 用户全程留在官方 API。指纹/生命周期事件按渠道（每 API Key）在首次 + 每 8h（+抖动）上报；
+会话按渠道粘滞 12h（+抖动）以保持提示缓存命中；额度类错误（402/429）会把渠道冷却到窗口重置时间；
+`/alpha/generate` 在途请求按渠道限流（默认 2，设置项 `command_code_max_concurrency`），避免单账号突发并发。
+
+身份头只按 `providers.kind='command_code'` 注入，绝不嗅探 `base_url`：把 `base_url` 指向自建桥
+（或其他第三方上游）时，只要供应商没有 `kind` 标记，网关不会发送任何 CLI 身份信息。

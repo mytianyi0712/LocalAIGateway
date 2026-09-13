@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     convert::Infallible,
     pin::Pin,
     sync::Arc,
@@ -553,6 +554,10 @@ struct AttemptEnv<'a> {
     upstream_model: &'a str,
     /// Mapped entry target, when this attempt runs on a mapping entry.
     mapping: Option<&'a routing::MappingTarget>,
+    /// Command Code transport actually used for this attempt:
+    /// `Generate` responses are NDJSON and need the CC decoder; `Provider`
+    /// responses are ordinary OpenAI SSE/JSON.
+    command_code_transport: Option<crate::commandcode::Transport>,
     /// Remaining candidates after this one (failover eligibility flag).
     candidates_len: i64,
 }
@@ -1139,6 +1144,50 @@ enum MappedStreamResult {
     FailOver(Option<TransportFailure>),
 }
 
+/// Protocol adaptation layer between the upstream byte stream and the
+/// canonical protocol the conversion matrix consumes. Command Code's
+/// `/alpha/generate` returns NDJSON; everything downstream (scan, stream
+/// converter, usage) expects OpenAI SSE, so the decoder sits here. The
+/// official Provider API transport returns ordinary SSE/JSON and needs no
+/// adaptation.
+enum UpstreamStreamAdapter {
+    Plain,
+    CommandCode(Box<convert::CommandCodeDecoder>),
+}
+
+impl UpstreamStreamAdapter {
+    fn new(
+        upstream_protocol: &str,
+        transport: Option<crate::commandcode::Transport>,
+        model: &str,
+    ) -> Self {
+        if upstream_protocol == "command_code"
+            && transport == Some(crate::commandcode::Transport::Generate)
+        {
+            Self::CommandCode(Box::new(convert::CommandCodeDecoder::new(model)))
+        } else {
+            Self::Plain
+        }
+    }
+
+    fn feed<'a>(&mut self, decoded: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        match self {
+            // Plain traffic is re-borrowed: the mapped pipeline must not pay
+            // an extra copy per chunk for protocols that need no adaptation.
+            Self::Plain => std::borrow::Cow::Borrowed(decoded),
+            Self::CommandCode(decoder) => std::borrow::Cow::Owned(decoder.feed(decoded)),
+        }
+    }
+
+    /// Flushes a trailing unterminated NDJSON line at upstream EOF.
+    fn finish_input(&mut self) -> Vec<u8> {
+        match self {
+            Self::Plain => Vec::new(),
+            Self::CommandCode(decoder) => decoder.flush(),
+        }
+    }
+}
+
 /// Mapped streaming: a short buffered prelude (so a 200 error body can
 /// still fail over) then incremental conversion of the live stream. The
 /// prelude decode is lossless (`RequiredDecoder`, P1-2) — a corrupt or
@@ -1163,17 +1212,35 @@ async fn mapped_stream(
         entry_model,
         upstream_protocol,
         upstream_model,
+        command_code_transport,
         candidates_len,
         ..
     } = env;
     let failure_threshold = runtime.failure_threshold;
     let circuit_open_seconds = runtime.circuit_open_seconds;
+    // Command Code NDJSON is decoded to canonical OpenAI SSE first; every
+    // downstream consumer (scanner, converter, usage) then speaks
+    // `openai_compatible` and reuses the existing conversion matrix.
+    let converter_protocol = if upstream_protocol == "command_code" {
+        "openai_compatible"
+    } else {
+        upstream_protocol
+    };
+    let mut adapter =
+        UpstreamStreamAdapter::new(upstream_protocol, command_code_transport, upstream_model);
     // Absolute first-token window anchored at attempt start (P1-1): a slow
     // response head cannot extend it.
     let first_token_deadline = attempt_started_instant
         + Duration::from_secs(runtime.first_token_timeout_seconds.max(1) as u64);
-    let stream_idle_timeout =
-        Duration::from_secs(runtime.stream_idle_timeout_seconds.max(1) as u64);
+    // Command Code streams can be quiet between tool-input events; the
+    // dedicated idle window is honored for them (plan phase 2 limits).
+    let stream_idle_timeout = Duration::from_secs(
+        if upstream_protocol == "command_code" {
+            runtime.command_code_idle_timeout_seconds.max(1)
+        } else {
+            runtime.stream_idle_timeout_seconds.max(1)
+        } as u64,
+    );
     let stats = Arc::new(SharedStreamStats::default());
     let mut upstream_stream = response.body.into_stream();
     // P1-2: mapped conversion REQUIRES the plaintext — a decode failure
@@ -1187,7 +1254,7 @@ async fn mapped_stream(
     // double-advance its state and corrupt output.
     let mut prelude: Vec<(Bytes, Vec<u8>)> = Vec::new();
     let mut prelude_bytes = 0usize;
-    let mut scan = convert::StreamScan::new(upstream_protocol);
+    let mut scan = convert::StreamScan::new(converter_protocol);
     // Absolute-deadline prelude scan. `timeout(remaining, ...)` polls the
     // inner future first, so an already-buffered body would win against an
     // expired deadline; the deadline is polled first (biased) so a late
@@ -1223,8 +1290,9 @@ async fn mapped_stream(
                             return PreludeEnd::DecodeError;
                         }
                     };
-                    prelude.push((chunk.clone(), decoded.clone()));
-                    if let Some(message) = scan.feed(upstream_protocol, &decoded) {
+                    let adapted = adapter.feed(&decoded);
+                    prelude.push((chunk.clone(), adapted.clone().into_owned()));
+                    if let Some(message) = scan.feed(converter_protocol, &adapted) {
                         return PreludeEnd::UpstreamError(message);
                     }
                     if scan.first_token_now || prelude_bytes >= 1024 * 1024 {
@@ -1337,7 +1405,7 @@ async fn mapped_stream(
     }
     let converter = match convert::MappedStreamConverter::new(
         entry_protocol,
-        upstream_protocol,
+        converter_protocol,
         entry_model,
     ) {
         Ok(converter) => converter,
@@ -1352,7 +1420,7 @@ async fn mapped_stream(
             ));
         }
     };
-    let stream_protocol = upstream_protocol.to_owned();
+    let stream_protocol = converter_protocol.to_owned();
     let response_headers_for_client = response_headers.clone();
     let telemetry = telemetry.clone();
     let request_id_stream = request_id.to_owned();
@@ -1416,6 +1484,7 @@ async fn mapped_stream(
         let mut upstream_stream = cancel_aware;
         let mut converter = converter;
         let mut scan = scan;
+        let mut adapter = adapter;
         let mut decoder = decoder;
         let mut response_bytes = 0i64;
         let mut ok = true;
@@ -1553,7 +1622,10 @@ async fn mapped_stream(
                             return;
                         }
                     };
-                    if let Some(message) = scan.feed(&stream_protocol, &decoded) {
+                    // Command Code NDJSON → canonical OpenAI SSE before the
+                    // scanner and converter see it.
+                    let adapted = adapter.feed(&decoded);
+                    if let Some(message) = scan.feed(&stream_protocol, &adapted) {
                         let converted = converter.error_event(&message);
                         // The 2xx stream carries an upstream error; the
                         // converted error event is terminal.
@@ -1591,7 +1663,7 @@ async fn mapped_stream(
                         );
                         *stats.first_token_ms.lock() = first_token_ms;
                     }
-                    let converted = converter.feed(&decoded);
+                    let converted = converter.feed(&adapted);
                     sync_converter_usage(&converter, &stats, &stream_protocol);
                     if converter.finished() {
                         // The terminal event (e.g. `response.completed`)
@@ -1647,6 +1719,85 @@ async fn mapped_stream(
                     ok = false;
                     idle_timeout = true;
                     break;
+                }
+            }
+        }
+        // Command Code EOF: a final NDJSON line may lack its trailing
+        // newline. Feed the adapter tail through the same scanner/converter
+        // path as a regular chunk (byte accounting already happened when
+        // the raw bytes arrived).
+        if !decode_failed && ok {
+            let adapted_tail = adapter.finish_input();
+            if !adapted_tail.is_empty() {
+                if let Some(message) = scan.feed(&stream_protocol, &adapted_tail) {
+                    let converted = converter.error_event(&message);
+                    cancel_completed_flag.store(true, Ordering::SeqCst);
+                    finalize_stream_attempt(
+                        &telemetry,
+                        &request_id_stream,
+                        started,
+                        failure_threshold,
+                        circuit_open_seconds,
+                        &candidate_stream,
+                        attempts,
+                        attempt_started,
+                        clock.now_utc(),
+                        AttemptOutcome::UpstreamError,
+                        status.as_u16() as i64,
+                        Some("upstream_error".into()),
+                        true,
+                        first_byte_ms,
+                        first_token_ms,
+                        converter_usage(&converter, &stream_protocol, false),
+                        response_bytes,
+                        upstream_protocol_stream.clone(),
+                        upstream_model_stream.clone(),
+                    );
+                    if !converted.is_empty() {
+                        yield Ok::<Bytes, Infallible>(Bytes::from(converted));
+                    }
+                    return;
+                }
+                if first_token_ms.is_none() && scan.first_token_now {
+                    first_token_ms = Some(
+                        clock.now_utc()
+                            .signed_duration_since(attempt_started)
+                            .num_milliseconds(),
+                    );
+                    *stats.first_token_ms.lock() = first_token_ms;
+                }
+                let converted = converter.feed(&adapted_tail);
+                sync_converter_usage(&converter, &stats, &stream_protocol);
+                if converter.finished() {
+                    cancel_completed_flag.store(true, Ordering::SeqCst);
+                    finalize_stream_attempt(
+                        &telemetry,
+                        &request_id_stream,
+                        started,
+                        failure_threshold,
+                        circuit_open_seconds,
+                        &candidate_stream,
+                        attempts,
+                        attempt_started,
+                        clock.now_utc(),
+                        AttemptOutcome::Success,
+                        status.as_u16() as i64,
+                        None,
+                        false,
+                        first_byte_ms,
+                        first_token_ms,
+                        converter_usage(&converter, &stream_protocol, false),
+                        response_bytes,
+                        upstream_protocol_stream.clone(),
+                        upstream_model_stream.clone(),
+                    );
+                    if !converted.is_empty() {
+                        yield Ok::<Bytes, Infallible>(Bytes::from(converted));
+                    }
+                    return;
+                }
+                if !converted.is_empty() {
+                    yield Ok::<Bytes, Infallible>(Bytes::from(converted));
                 }
             }
         }
@@ -1782,6 +1933,41 @@ async fn mapped_stream(
     MappedStreamResult::Respond(result)
 }
 
+/// Per-channel Command Code burst guard: the returned semaphore caps the
+/// number of in-flight `/alpha/generate` requests for one account (API key).
+/// The map entry is created once per channel; capacity changes apply to new
+/// channels (a burst guard does not need live resizing).
+fn command_code_slots()
+-> Arc<parking_lot::Mutex<HashMap<String, (usize, Arc<tokio::sync::Semaphore>)>>> {
+    Arc::new(parking_lot::Mutex::new(HashMap::new()))
+}
+
+/// Attaches a per-channel permit to the upstream body so it is held until the
+/// body (streamed or buffered) is fully consumed and dropped.
+fn hold_command_code_slot(
+    response: crate::ports::UpstreamResponse,
+    slot: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> crate::ports::UpstreamResponse {
+    let Some(permit) = slot else {
+        return response;
+    };
+    let inner = response.body.into_stream();
+    let stream = futures_util::stream::unfold(
+        (inner, permit),
+        |(mut inner, permit)| async move {
+            inner
+                .next()
+                .await
+                .map(|item| (item, (inner, permit)))
+        },
+    );
+    crate::ports::UpstreamResponse {
+        status: response.status,
+        headers: response.headers,
+        body: crate::ports::UpstreamBody::new(Box::pin(stream)),
+    }
+}
+
 /// Result of the request-preparation phase (P2-4): everything the attempt
 /// loop needs, or an early gateway error response.
 struct PreparedRequest {
@@ -1795,6 +1981,9 @@ struct PreparedRequest {
     upstream_protocol: String,
     upstream_model: String,
     converted_body: Bytes,
+    /// Command Code only: canonical OpenAI chat body for the official
+    /// Provider API transport (the generate body is `converted_body`).
+    provider_body: Option<Bytes>,
     candidates: Vec<Candidate>,
     compaction_mode: Option<CompactionMode>,
 }
@@ -1947,14 +2136,50 @@ async fn prepare_request(
             request_id,
         ));
     }
-    let upstream_protocol = mapping
+    let mut upstream_protocol = mapping
         .as_ref()
         .map(|value| value.upstream_protocol.as_str())
         .unwrap_or(entry_protocol);
+    // Silent conversion fallback: when a direct entry has no route of its own
+    // but the model is reachable through a protocol with a registered
+    // conversion (OpenAI chat → Command Code), switch to that protocol instead
+    // of failing with `no_active_channel`.
+    if mapping.is_none()
+        && let Some(fallback) = convert::fallback_upstream_protocol(entry_protocol)
+    {
+        let native_available = svc
+            .routes
+            .resolve_candidates(upstream_protocol, &entry_model, 1)
+            .await
+            .map(|candidates| !candidates.is_empty())
+            .unwrap_or(true);
+        if !native_available {
+            let fallback_available = svc
+                .routes
+                .resolve_candidates(fallback, &entry_model, 1)
+                .await
+                .map(|candidates| !candidates.is_empty())
+                .unwrap_or(false);
+            if fallback_available {
+                upstream_protocol = fallback;
+            }
+        }
+    }
     let upstream_model = mapping
         .as_ref()
         .map(|value| value.upstream_model.as_str())
         .unwrap_or(entry_model.as_str());
+    // Plan phase 7: the integration is default-off; while disabled it must
+    // issue zero upstream requests.
+    if upstream_protocol == "command_code" && !runtime.command_code_enabled {
+        return Err(gateway_error(
+            entry_protocol,
+            StatusCode::FORBIDDEN,
+            "command_code_disabled",
+            "Command Code integration is disabled. Enable it in settings after acknowledging the risk.",
+            request_id,
+        ));
+    }
     if compaction_mode.is_some() && upstream_protocol != "openai_responses" {
         let finished = svc.clock.now_utc();
         svc.telemetry.emit(Event::RequestStart {
@@ -2002,12 +2227,54 @@ async fn prepare_request(
                 ));
             }
         }
+    } else if upstream_protocol != entry_protocol {
+        // Unmapped silent conversion (e.g. OpenAI chat → Command Code): the
+        // client body needs the upstream request shape.
+        match convert::convert_request(entry_protocol, upstream_protocol, &upstream_model, &body) {
+            Ok(body) => Bytes::from(body),
+            Err(error) => {
+                return Err(gateway_error(
+                    entry_protocol,
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    &error.to_string(),
+                    request_id,
+                ));
+            }
+        }
     } else {
         body.clone()
     };
+    // Command Code: the official Provider API takes the canonical OpenAI
+    // chat body, so prepare it alongside the `/alpha/generate` body. The
+    // transport router only sends it when the account is not upgrade-gated.
+    let provider_body = if upstream_protocol == "command_code" {
+        let (provider_entry, provider_model) = mapping
+            .as_ref()
+            .map(|value| (value.entry.as_str(), value.upstream_model.as_str()))
+            .unwrap_or((entry_protocol, upstream_model));
+        match convert::convert_request(provider_entry, "openai_compatible", provider_model, &body) {
+            Ok(body) => Some(Bytes::from(body)),
+            Err(error) => {
+                return Err(gateway_error(
+                    entry_protocol,
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    &error.to_string(),
+                    request_id,
+                ));
+            }
+        }
+    } else {
+        None
+    };
     let (model_id, stream) =
         protocol::inspect_request(upstream_protocol, &path, query, &converted_body);
-    let stream_requested = stream_requested || stream;
+    // Command Code always streams NDJSON upstream; the client-facing stream
+    // decision stays the entry request's (a non-stream client is served by
+    // aggregating the NDJSON in `bounded_non_stream`).
+    let stream_requested =
+        stream_requested || (stream && upstream_protocol != "command_code");
     let route_model = model_id.as_deref().unwrap_or(upstream_model);
     svc.telemetry.emit(Event::RequestStart {
         id: request_id.to_owned(),
@@ -2098,6 +2365,7 @@ async fn prepare_request(
         upstream_protocol,
         upstream_model,
         converted_body,
+        provider_body,
         candidates,
         compaction_mode,
     })
@@ -2305,11 +2573,66 @@ async fn bounded_non_stream(
         );
         decoder.feed_observable(&raw)
     };
-    let usage = usage_from_body(env.upstream_protocol, &decoded);
+    // Command Code (generate transport) returns NDJSON even for a
+    // non-stream client; aggregate it into one canonical OpenAI completion
+    // first. A 200 body carrying an error event is an upstream failure,
+    // never a fake success.
+    let decoded = if env.upstream_protocol == "command_code"
+        && env.command_code_transport == Some(crate::commandcode::Transport::Generate)
+    {
+        match convert::ndjson_to_chat_completion(env.entry_model, &decoded) {
+            Ok(value) => serde_json::to_vec(&value).unwrap_or_else(|_| decoded.clone()),
+            Err(message) => {
+                tracing::warn!(
+                    request_id = %env.request_id,
+                    channel_id = %env.candidate.channel_id,
+                    message,
+                    "command code non-stream body carried an upstream error"
+                );
+                let finished = chrono::Utc::now();
+                AttemptFinalizer::new(
+                    Arc::new(env.telemetry.clone()),
+                    env.request_id,
+                    env.started,
+                    env.runtime.failure_threshold,
+                    env.runtime.circuit_open_seconds,
+                )
+                .finalize(
+                    env.candidate,
+                    env.attempts,
+                    env.attempt_started,
+                    finished,
+                    AttemptOutcome::UpstreamError,
+                    Some(502),
+                    Some("upstream_error".into()),
+                    env.attempts < env.candidates_len,
+                    false,
+                    None,
+                    None,
+                    Usage::default(),
+                    raw.len() as i64,
+                    Some(env.upstream_protocol.into()),
+                    Some(env.upstream_model.into()),
+                    true,
+                );
+                return NonStreamResult::FailOver(None);
+            }
+        }
+    } else {
+        decoded
+    };
+    // Both Command Code transports hand the conversion layer an
+    // OpenAI-shaped body.
+    let body_protocol = if env.upstream_protocol == "command_code" {
+        "openai_compatible"
+    } else {
+        env.upstream_protocol
+    };
+    let usage = usage_from_body(body_protocol, &decoded);
     let (result_body, conversion_failed, mapped) = if let Some(value) = env.mapping {
         match convert::convert_response(
             &value.entry,
-            &value.upstream_protocol,
+            body_protocol,
             env.entry_model,
             &decoded,
         ) {
@@ -2333,6 +2656,12 @@ async fn bounded_non_stream(
                 )
             }
         }
+    } else if env.upstream_protocol == "command_code" {
+        // Non-mapped Command Code: the upstream bytes are NDJSON (generate)
+        // or Provider-API JSON, while `decoded` is the canonical OpenAI body
+        // the client protocol expects. Marking it transformed drops the
+        // original content-length/content-encoding headers.
+        (decoded, false, true)
     } else {
         // Non-mapped: forward the raw bytes with the original
         // headers (content-length included — the body is complete).
@@ -3034,6 +3363,12 @@ pub struct ProxyService {
     clock: Arc<dyn crate::ports::Clock>,
     limits: Arc<RuntimeLimits>,
     notifier: Arc<dyn crate::ports::Notifier>,
+    /// Per-channel in-flight cap for Command Code `/alpha/generate`
+    /// (one account = one API key). The permit is held until the upstream
+    /// body is fully consumed, so a burst cannot fan out into parallel
+    /// generations on the same account (plan risk table). Capacity is kept
+    /// in the map so a runtime settings change recreates the semaphore.
+    command_code_slots: Arc<parking_lot::Mutex<HashMap<String, (usize, Arc<tokio::sync::Semaphore>)>>>,
 }
 
 impl ProxyService {
@@ -3056,6 +3391,7 @@ impl ProxyService {
             clock,
             limits,
             notifier,
+            command_code_slots: command_code_slots(),
         })
     }
 
@@ -3094,6 +3430,7 @@ impl ProxyService {
             upstream_protocol,
             upstream_model,
             converted_body,
+            provider_body,
             candidates,
             compaction_mode,
         } = prepared;
@@ -3110,7 +3447,7 @@ impl ProxyService {
         // only requests routed to such an upstream ever read it.
         let mut opencode_session_id: Option<String> = None;
         let mut attempts = 0i64;
-        for (index, candidate) in candidates.iter().enumerate() {
+        'candidates: for (index, candidate) in candidates.iter().enumerate() {
             attempts = index as i64 + 1;
             // Entering a backup candidate means the previous one failed:
             // alert the user. Remote-compaction failover is silent by design
@@ -3175,165 +3512,368 @@ impl ProxyService {
                     continue;
                 }
             };
-            let target_path = mapping
-                .as_ref()
-                .map(|value| {
-                    mapped_path(
-                        value,
-                        &path,
-                        stream_requested,
-                        &value.upstream_model,
-                        compaction_mode,
-                    )
-                })
-                .unwrap_or_else(|| path.clone());
-            let target_url = match protocol::upstream_url(
-                &candidate.base_url,
-                &target_path,
-                query,
-                upstream_protocol,
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    last_error = None;
-                    last_transport_kind = Some(TransportFailure::ConnectionReset);
-                    let _ = error;
-                    continue;
-                }
+            // Command Code transport router (plan decision 4): official
+            // Provider API first; only a documented 403 upgrade_required
+            // downgrades that channel to the CLI-compatible
+            // `/alpha/generate` path. GOAT/Pro/Max never enter the reverse
+            // path; the blast radius is limited to Go accounts that the
+            // server itself rejects.
+            let mut cc_transport = if upstream_protocol == "command_code" {
+                Some(crate::commandcode::transport(&self.db, &candidate.channel_id).await)
+            } else {
+                None
             };
-            let mut outbound =
-                match protocol::outbound_headers(&headers, upstream_protocol, &api_key) {
+            let (response, _cc_transport_used) = 'transport: loop {
+                let transport =
+                    cc_transport.unwrap_or(crate::commandcode::Transport::Provider);
+                let (target_path, request_body) = if upstream_protocol == "command_code" {
+                    match transport {
+                        crate::commandcode::Transport::Generate => (
+                            crate::commandcode::GENERATE_PATH.to_owned(),
+                            converted_body.clone(),
+                        ),
+                        // Unknown probes with the official API first; a
+                        // remembered/provider channel keeps using it.
+                        _ => (
+                            crate::commandcode::PROVIDER_CHAT_PATH.to_owned(),
+                            provider_body
+                                .clone()
+                                .unwrap_or_else(|| converted_body.clone()),
+                        ),
+                    }
+                } else {
+                    (
+                        mapping
+                            .as_ref()
+                            .map(|value| {
+                                mapped_path(
+                                    value,
+                                    &path,
+                                    stream_requested,
+                                    &value.upstream_model,
+                                    compaction_mode,
+                                )
+                            })
+                            .unwrap_or_else(|| path.clone()),
+                        converted_body.clone(),
+                    )
+                };
+                let target_url = match protocol::upstream_url(
+                    &candidate.base_url,
+                    &target_path,
+                    query,
+                    upstream_protocol,
+                ) {
                     Ok(value) => value,
                     Err(error) => {
                         last_error = None;
                         last_transport_kind = Some(TransportFailure::ConnectionReset);
                         let _ = error;
-                        continue;
+                        continue 'candidates;
                     }
                 };
-            if protocol::requires_opencode_session(&candidate.base_url) {
-                if opencode_session_id.is_none() {
-                    opencode_session_id =
-                        Some(crate::settings::opencode_session_id(&self.db).await);
+                let mut outbound =
+                    match protocol::outbound_headers(&headers, upstream_protocol, &api_key) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            last_error = None;
+                            last_transport_kind = Some(TransportFailure::ConnectionReset);
+                            let _ = error;
+                            continue 'candidates;
+                        }
+                    };
+                if protocol::requires_opencode_session(&candidate.base_url) {
+                    if opencode_session_id.is_none() {
+                        opencode_session_id =
+                            Some(crate::settings::opencode_session_id(&self.db).await);
+                    }
+                    let session_id = opencode_session_id.as_deref().unwrap_or_default();
+                    if let Err(error) = protocol::apply_opencode_session(
+                        &mut outbound,
+                        &candidate.base_url,
+                        session_id,
+                    ) {
+                        tracing::warn!(%error, "opencode session header skipped");
+                    }
                 }
-                let session_id = opencode_session_id.as_deref().unwrap_or_default();
-                if let Err(error) =
-                    protocol::apply_opencode_session(&mut outbound, &candidate.base_url, session_id)
+                if upstream_protocol == "command_code"
+                    && transport == crate::commandcode::Transport::Generate
                 {
-                    tracing::warn!(%error, "opencode session header skipped");
-                }
-            }
-            // P2-1: the upstream port applies connect timeout and the send
-            // deadline; the classified error decides the transport kind.
-            let response = match self
-                .http
-                .send(crate::ports::UpstreamRequest {
-                    url: target_url,
-                    headers: outbound,
-                    method: http::Method::POST,
-                    body: Some(converted_body.clone()),
-                    connect_timeout: Duration::from_secs(
-                        runtime.connect_timeout_seconds.max(1) as u64
-                    ),
-                    deadline: Duration::from_secs(runtime.first_byte_timeout_seconds.max(1) as u64),
-                })
-                .await
-            {
-                Ok(response) => response,
-                Err(crate::ports::UpstreamError::ConnectTimeout) => {
-                    let finished = self.clock.now_utc();
-                    last_error = None;
-                    last_transport_kind = Some(TransportFailure::ConnectTimeout);
-                    AttemptFinalizer::new(
-                        Arc::new(self.telemetry.clone()),
-                        &request_id,
-                        started,
-                        runtime.failure_threshold,
-                        runtime.circuit_open_seconds,
+                    // Fingerprint/lifecycle init is throttled per channel
+                    // (API key); failures never block the actual request.
+                    if let Err(error) = crate::commandcode::ensure_initialized(
+                        &self.db,
+                        self.http.as_ref(),
+                        &candidate.channel_id,
+                        &api_key,
+                        &candidate.base_url,
+                        runtime.command_code_init_interval_hours,
                     )
-                    .finalize(
-                        candidate,
-                        attempts,
-                        attempt_started,
-                        finished,
-                        AttemptOutcome::TransportError,
-                        None,
-                        Some("connect_timeout".into()),
-                        attempts < candidates.len() as i64,
-                        false,
-                        None,
-                        None,
-                        Usage::default(),
-                        0,
-                        Some(upstream_protocol.into()),
-                        Some(upstream_model.into()),
-                        compaction_mode.is_none(),
-                    );
-                    continue;
+                    .await
+                    {
+                        tracing::warn!(
+                            %error,
+                            channel_id = %candidate.channel_id,
+                            "command code init skipped"
+                        );
+                    }
+                    // Plan decision 2: identity headers are keyed by the
+                    // provider `kind`, never inferred from base_url.
+                    if protocol::requires_command_code_identity(candidate.kind.as_deref()) {
+                        match crate::commandcode::identity(&self.db, &candidate.channel_id).await {
+                            Ok(identity) => {
+                                if let Err(error) = protocol::apply_command_code_identity(
+                                    &mut outbound,
+                                    &identity,
+                                ) {
+                                    tracing::warn!(%error, "command code identity header skipped");
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "command code identity unavailable");
+                            }
+                        }
+                    } else {
+                        tracing::warn!(
+                            channel_id = %candidate.channel_id,
+                            "command_code channel without kind marker: CLI identity headers not injected"
+                        );
+                    }
                 }
-                Err(crate::ports::UpstreamError::Transport(error)) => {
-                    let finished = self.clock.now_utc();
-                    last_error = None;
-                    last_transport_kind = Some(TransportFailure::ConnectionReset);
-                    AttemptFinalizer::new(
-                        Arc::new(self.telemetry.clone()),
-                        &request_id,
-                        started,
-                        runtime.failure_threshold,
-                        runtime.circuit_open_seconds,
+                // Per-account burst guard (plan risk table): cap in-flight
+                // `/alpha/generate` requests for one channel. The permit is
+                // attached to the response body below and released when the
+                // body is dropped.
+                let mut cc_slot: Option<tokio::sync::OwnedSemaphorePermit> = None;
+                if upstream_protocol == "command_code"
+                    && transport == crate::commandcode::Transport::Generate
+                {
+                    let desired = runtime.command_code_max_concurrency.clamp(1, 32) as usize;
+                    let semaphore = {
+                        let mut map = self.command_code_slots.lock();
+                        let entry = map
+                            .entry(candidate.channel_id.clone())
+                            .or_insert_with(|| (desired, Arc::new(tokio::sync::Semaphore::new(desired))));
+                        if entry.0 != desired {
+                            // Setting changed: new requests use the new cap;
+                            // permits already held finish on the old one.
+                            *entry = (desired, Arc::new(tokio::sync::Semaphore::new(desired)));
+                        }
+                        Arc::clone(&entry.1)
+                    };
+                    let wait =
+                        Duration::from_secs(runtime.first_byte_timeout_seconds.max(1) as u64);
+                    match tokio::time::timeout(wait, semaphore.acquire_owned()).await {
+                        Ok(Ok(permit)) => cc_slot = Some(permit),
+                        Ok(Err(_closed)) => {}
+                        Err(_) => {
+                            // Burst guard tripped: fail over to the next
+                            // candidate instead of piling onto this account.
+                            let finished = self.clock.now_utc();
+                            last_error = None;
+                            last_transport_kind = Some(TransportFailure::FirstByteTimeout);
+                            AttemptFinalizer::new(
+                                Arc::new(self.telemetry.clone()),
+                                &request_id,
+                                started,
+                                runtime.failure_threshold,
+                                runtime.circuit_open_seconds,
+                            )
+                            .finalize(
+                                candidate,
+                                attempts,
+                                attempt_started,
+                                finished,
+                                AttemptOutcome::TransportError,
+                                None,
+                                Some("concurrency_limit".into()),
+                                attempts < candidates.len() as i64,
+                                false,
+                                None,
+                                None,
+                                Usage::default(),
+                                0,
+                                Some(upstream_protocol.into()),
+                                Some(upstream_model.into()),
+                                compaction_mode.is_none(),
+                            );
+                            continue 'candidates;
+                        }
+                    }
+                }
+                // P2-1: the upstream port applies connect timeout and the send
+                // deadline; the classified error decides the transport kind.
+                let response = match self
+                    .http
+                    .send(crate::ports::UpstreamRequest {
+                        url: target_url,
+                        headers: outbound,
+                        method: http::Method::POST,
+                        body: Some(request_body),
+                        connect_timeout: Duration::from_secs(
+                            runtime.connect_timeout_seconds.max(1) as u64,
+                        ),
+                        deadline: Duration::from_secs(
+                            runtime.first_byte_timeout_seconds.max(1) as u64,
+                        ),
+                    })
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(crate::ports::UpstreamError::ConnectTimeout) => {
+                        let finished = self.clock.now_utc();
+                        last_error = None;
+                        last_transport_kind = Some(TransportFailure::ConnectTimeout);
+                        AttemptFinalizer::new(
+                            Arc::new(self.telemetry.clone()),
+                            &request_id,
+                            started,
+                            runtime.failure_threshold,
+                            runtime.circuit_open_seconds,
+                        )
+                        .finalize(
+                            candidate,
+                            attempts,
+                            attempt_started,
+                            finished,
+                            AttemptOutcome::TransportError,
+                            None,
+                            Some("connect_timeout".into()),
+                            attempts < candidates.len() as i64,
+                            false,
+                            None,
+                            None,
+                            Usage::default(),
+                            0,
+                            Some(upstream_protocol.into()),
+                            Some(upstream_model.into()),
+                            compaction_mode.is_none(),
+                        );
+                        continue 'candidates;
+                    }
+                    Err(crate::ports::UpstreamError::Transport(error)) => {
+                        let finished = self.clock.now_utc();
+                        last_error = None;
+                        last_transport_kind = Some(TransportFailure::ConnectionReset);
+                        AttemptFinalizer::new(
+                            Arc::new(self.telemetry.clone()),
+                            &request_id,
+                            started,
+                            runtime.failure_threshold,
+                            runtime.circuit_open_seconds,
+                        )
+                        .finalize(
+                            candidate,
+                            attempts,
+                            attempt_started,
+                            finished,
+                            AttemptOutcome::TransportError,
+                            None,
+                            Some(error),
+                            attempts < candidates.len() as i64,
+                            false,
+                            None,
+                            None,
+                            Usage::default(),
+                            0,
+                            Some(upstream_protocol.into()),
+                            Some(upstream_model.into()),
+                            compaction_mode.is_none(),
+                        );
+                        continue 'candidates;
+                    }
+                    Err(crate::ports::UpstreamError::Deadline) => {
+                        let finished = self.clock.now_utc();
+                        last_error = None;
+                        last_transport_kind = Some(TransportFailure::FirstByteTimeout);
+                        AttemptFinalizer::new(
+                            Arc::new(self.telemetry.clone()),
+                            &request_id,
+                            started,
+                            runtime.failure_threshold,
+                            runtime.circuit_open_seconds,
+                        )
+                        .finalize(
+                            candidate,
+                            attempts,
+                            attempt_started,
+                            finished,
+                            AttemptOutcome::TransportError,
+                            None,
+                            Some("timeout".into()),
+                            attempts < candidates.len() as i64,
+                            false,
+                            None,
+                            None,
+                            Usage::default(),
+                            0,
+                            Some(upstream_protocol.into()),
+                            Some(upstream_model.into()),
+                            compaction_mode.is_none(),
+                        );
+                        continue 'candidates;
+                    }
+                };
+                // Go plan (or a later plan downgrade): the official API
+                // answers 403 upgrade_required. Once a channel is known to
+                // be on `generate` we never probe the provider again.
+                if upstream_protocol == "command_code"
+                    && response.status == StatusCode::FORBIDDEN
+                    && cc_transport != Some(crate::commandcode::Transport::Generate)
+                {
+                    let (body, _truncated) = response
+                        .body
+                        .read_capped(self.limits.error_body_max)
+                        .await;
+                    if crate::commandcode::is_upgrade_required(403, &body) {
+                        if let Err(error) = crate::commandcode::set_transport(
+                            &self.db,
+                            &candidate.channel_id,
+                            crate::commandcode::Transport::Generate,
+                        )
+                        .await
+                        {
+                            tracing::warn!(%error, "command code transport persist failed");
+                        }
+                        tracing::info!(
+                            channel_id = %candidate.channel_id,
+                            "command code provider API requires upgrade; using /alpha/generate"
+                        );
+                        cc_transport = Some(crate::commandcode::Transport::Generate);
+                        continue 'transport;
+                    }
+                    // Not an upgrade signal: replay the buffered body so the
+                    // generic error path below sees it unchanged.
+                    let replayed = crate::ports::UpstreamResponse {
+                        status: response.status,
+                        headers: response.headers.clone(),
+                        body: crate::ports::UpstreamBody::new(Box::pin(
+                            futures_util::stream::once(async move {
+                                Ok::<Bytes, crate::ports::UpstreamError>(Bytes::from(body))
+                            }),
+                        )),
+                    };
+                    break 'transport (hold_command_code_slot(replayed, cc_slot), cc_transport);
+                }
+                // A successful provider probe is remembered so later
+                // requests skip the detection step.
+                if upstream_protocol == "command_code"
+                    && response.status.is_success()
+                    && cc_transport == Some(crate::commandcode::Transport::Unknown)
+                {
+                    if let Err(error) = crate::commandcode::set_transport(
+                        &self.db,
+                        &candidate.channel_id,
+                        crate::commandcode::Transport::Provider,
                     )
-                    .finalize(
-                        candidate,
-                        attempts,
-                        attempt_started,
-                        finished,
-                        AttemptOutcome::TransportError,
-                        None,
-                        Some(error),
-                        attempts < candidates.len() as i64,
-                        false,
-                        None,
-                        None,
-                        Usage::default(),
-                        0,
-                        Some(upstream_protocol.into()),
-                        Some(upstream_model.into()),
-                        compaction_mode.is_none(),
-                    );
-                    continue;
+                    .await
+                    {
+                        tracing::warn!(%error, "command code transport persist failed");
+                    }
                 }
-                Err(crate::ports::UpstreamError::Deadline) => {
-                    let finished = self.clock.now_utc();
-                    last_error = None;
-                    last_transport_kind = Some(TransportFailure::FirstByteTimeout);
-                    AttemptFinalizer::new(
-                        Arc::new(self.telemetry.clone()),
-                        &request_id,
-                        started,
-                        runtime.failure_threshold,
-                        runtime.circuit_open_seconds,
-                    )
-                    .finalize(
-                        candidate,
-                        attempts,
-                        attempt_started,
-                        finished,
-                        AttemptOutcome::TransportError,
-                        None,
-                        Some("timeout".into()),
-                        attempts < candidates.len() as i64,
-                        false,
-                        None,
-                        None,
-                        Usage::default(),
-                        0,
-                        Some(upstream_protocol.into()),
-                        Some(upstream_model.into()),
-                        compaction_mode.is_none(),
-                    );
-                    continue;
-                }
+                break 'transport (hold_command_code_slot(response, cc_slot), cc_transport);
             };
+            let cc_transport_used = _cc_transport_used;
             let status = response.status;
             let response_headers = protocol::response_headers(&response.headers);
             if let Some(mode) = compaction_mode {
@@ -3356,6 +3896,7 @@ impl ProxyService {
                     upstream_model,
                     mapping: mapping.as_ref(),
                     candidates_len: candidates.len() as i64,
+                    command_code_transport: cc_transport_used,
                 };
                 match compaction_attempt(
                     &self.db,
@@ -3381,7 +3922,7 @@ impl ProxyService {
                 }
             }
             if status.is_success() {
-                if stream_requested && mapping.is_none() {
+                if stream_requested && mapping.is_none() && upstream_protocol != "command_code" {
                     // P2-4: transparent forwarding lives in its own builder.
                     let env = AttemptEnv {
                         telemetry: &self.telemetry,
@@ -3399,6 +3940,7 @@ impl ProxyService {
                         upstream_model,
                         mapping: mapping.as_ref(),
                         candidates_len: candidates.len() as i64,
+                        command_code_transport: cc_transport_used,
                     };
                     return transparent_stream(env, response, status, response_headers);
                 }
@@ -3428,6 +3970,7 @@ impl ProxyService {
                         upstream_model,
                         mapping: mapping.as_ref(),
                         candidates_len: candidates.len() as i64,
+                        command_code_transport: cc_transport_used,
                     };
                     match mapped_stream(env, response, status, response_headers).await {
                         MappedStreamResult::Respond(result) => return result,
@@ -3454,6 +3997,7 @@ impl ProxyService {
                     upstream_model,
                     mapping: mapping.as_ref(),
                     candidates_len: candidates.len() as i64,
+                    command_code_transport: cc_transport_used,
                 };
                 match bounded_non_stream(env, response, status, response_headers).await {
                     NonStreamResult::Respond(result) => return result,
@@ -3496,6 +4040,26 @@ impl ProxyService {
             // The upstream answered with an error status: this failure is
             // described by `last_error`, not by any earlier transport kind.
             last_transport_kind = None;
+            // Command Code quota windows (402 payment required / 429): cool
+            // that channel down until the window resets so the existing
+            // candidate ordering moves to the next account (plan decision 3);
+            // the health supervisor restores it after the window.
+            if upstream_protocol == "command_code"
+                && crate::commandcode::is_quota_status(status.as_u16())
+            {
+                let reset_at = crate::commandcode::quota_reset_at(&raw);
+                if let Err(error) = crate::commandcode::mark_quota_exhausted(
+                    &self.db,
+                    &candidate.channel_id,
+                    reset_at,
+                    runtime.circuit_open_seconds,
+                    status.as_u16(),
+                )
+                .await
+                {
+                    tracing::warn!(%error, "command code quota cooldown persist failed");
+                }
+            }
             let (kind, countable) = status_kind(status);
             let finished = self.clock.now_utc();
             AttemptFinalizer::new(
@@ -3877,6 +4441,9 @@ pub async fn openai_models(State(state): State<AppContext>, request: Request) ->
                 .map(str::to_owned)
         });
     if let Some(protocol) = selected.as_deref() {
+        // Entry-protocol whitelist: Command Code is upstream-only (reached
+        // through claude/codex mappings) and is deliberately rejected here —
+        // it has no client-facing catalog endpoint.
         if matches!(protocol, "openai_compatible" | "openai_responses" | "claude") {
             return models(State(state), request, protocol).await;
         }
@@ -3967,7 +4534,7 @@ mod tests {
     }
 
     async fn test_gateway(upstream_port: u16, extra_settings: &[(&str, &str)]) -> TestGateway {
-        test_gateway_inner(upstream_port, extra_settings, false, false).await
+        test_gateway_inner(upstream_port, extra_settings, false, false, false).await
     }
 
     /// Same scaffold plus a claude model mapping (`mapped-model` ->
@@ -3977,7 +4544,7 @@ mod tests {
         upstream_port: u16,
         extra_settings: &[(&str, &str)],
     ) -> TestGateway {
-        test_gateway_inner(upstream_port, extra_settings, true, false).await
+        test_gateway_inner(upstream_port, extra_settings, true, false, false).await
     }
 
     /// Same scaffold plus a second, claude-protocol route (`claude-model`
@@ -3987,7 +4554,16 @@ mod tests {
         upstream_port: u16,
         extra_settings: &[(&str, &str)],
     ) -> TestGateway {
-        test_gateway_inner(upstream_port, extra_settings, false, true).await
+        test_gateway_inner(upstream_port, extra_settings, false, true, false).await
+    }
+
+    /// Command Code scaffold: `command_code` route + provider kind marker +
+    /// an enabled claude mapping `mapped-cc` -> `cc-model`.
+    async fn test_gateway_command_code(
+        upstream_port: u16,
+        extra_settings: &[(&str, &str)],
+    ) -> TestGateway {
+        test_gateway_inner(upstream_port, extra_settings, false, false, true).await
     }
 
     async fn test_gateway_inner(
@@ -3995,6 +4571,7 @@ mod tests {
         extra_settings: &[(&str, &str)],
         mapped: bool,
         claude_route: bool,
+        command_code: bool,
     ) -> TestGateway {
         let dir = temp_dir().await;
         let db = Database::open(&dir.join("test.db")).await.unwrap();
@@ -4002,14 +4579,18 @@ mod tests {
             .await
             .unwrap();
         let time = "2026-08-04T01:00:00+00:00";
-        sqlx::query("INSERT INTO providers(id,name,base_url,created_at,updated_at) VALUES('prov-1','mock',?,?,?)")
+        sqlx::query("INSERT INTO providers(id,name,base_url,kind,created_at,updated_at) VALUES('prov-1','mock',?,?,?,?)")
             .bind(format!("http://127.0.0.1:{upstream_port}"))
+            .bind(if command_code { Some("command_code") } else { None })
             .bind(time)
             .bind(time)
             .execute(db.pool())
             .await
             .unwrap();
-        sqlx::query("INSERT INTO channels(id,provider_id,name,protocol,api_key_encrypted,api_key_hint,manual_enabled,created_at,updated_at) VALUES('ch-1','prov-1','chan','openai_compatible',?,?,1,?,?)")
+        let primary_protocol = if command_code { "command_code" } else { "openai_compatible" };
+        let primary_model = if command_code { "cc-model" } else { "test-model" };
+        sqlx::query("INSERT INTO channels(id,provider_id,name,protocol,api_key_encrypted,api_key_hint,manual_enabled,created_at,updated_at) VALUES('ch-1','prov-1','chan',?,?,?,1,?,?)")
+            .bind(primary_protocol)
             .bind(secrets.encrypt("test-key"))
             .bind("...key")
             .bind(time)
@@ -4017,18 +4598,22 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
-        sqlx::query("INSERT INTO channel_models(id,channel_id,model_id,display_name,source,available,first_seen_at,created_at,updated_at) VALUES('cm-1','ch-1','test-model','Test Model','discovered',1,?,?,?)")
+        sqlx::query("INSERT INTO channel_models(id,channel_id,model_id,display_name,source,available,first_seen_at,created_at,updated_at) VALUES('cm-1','ch-1',?,'Test Model','discovered',1,?,?,?)")
+            .bind(primary_model)
             .bind(time)
             .bind(time)
             .bind(time)
             .execute(db.pool())
             .await
             .unwrap();
-        sqlx::query("INSERT INTO channel_model_protocols(channel_model_id,protocol) VALUES('cm-1','openai_compatible')")
+        sqlx::query("INSERT INTO channel_model_protocols(channel_model_id,protocol) VALUES('cm-1',?)")
+            .bind(primary_protocol)
             .execute(db.pool())
             .await
             .unwrap();
-        sqlx::query("INSERT INTO model_routes(id,protocol,requested_model_id,enabled,created_at,updated_at) VALUES('route-1','openai_compatible','test-model',1,?,?)")
+        sqlx::query("INSERT INTO model_routes(id,protocol,requested_model_id,enabled,created_at,updated_at) VALUES('route-1',?,?,1,?,?)")
+            .bind(primary_protocol)
+            .bind(primary_model)
             .bind(time)
             .bind(time)
             .execute(db.pool())
@@ -4047,6 +4632,20 @@ mod tests {
             .unwrap();
         if mapped {
             sqlx::query("INSERT INTO claude_model_mappings(id,claude_model_id,display_name,upstream_protocol,upstream_model_id,enabled,created_at,updated_at) VALUES('map-1','mapped-model','Mapped','openai_compatible','test-model',1,?,?)")
+                .bind(time)
+                .bind(time)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        if command_code {
+            sqlx::query("INSERT INTO claude_model_mappings(id,claude_model_id,display_name,upstream_protocol,upstream_model_id,enabled,created_at,updated_at) VALUES('map-cc','mapped-cc','Mapped CC','command_code','cc-model',1,?,?)")
+                .bind(time)
+                .bind(time)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO codex_model_mappings(id,codex_model_id,display_name,upstream_protocol,upstream_model_id,enabled,created_at,updated_at) VALUES('map-cc-codex','mapped-cc-codex','Mapped CC Codex','command_code','cc-model',1,?,?)")
                 .bind(time)
                 .bind(time)
                 .execute(db.pool())
@@ -4128,6 +4727,7 @@ mod tests {
             Arc::clone(&clock),
             Arc::clone(&limits),
         );
+        let command_code_login = crate::commandcode_login::CommandCodeLogin::new(std::sync::Arc::clone(&http));
         let state = crate::application::Context {
             config: Arc::new(AppConfig::default()),
             db: db.clone(),
@@ -4144,6 +4744,7 @@ mod tests {
             limits,
             balance,
             admin: crate::admin::AdminService::new(db.clone(), secrets.clone()),
+            command_code_login,
             recovery: crate::auth::RecoverySession::new(),
         };
         TestGateway {
@@ -6361,4 +6962,805 @@ mod tests {
         assert!(session_header_value(&head).is_none());
         gateway.shutdown().await;
     }
+    // -----------------------------------------------------------------
+    // Command Code Go (route B) integration
+    // -----------------------------------------------------------------
+
+    /// Which fake upstream behavior the Command Code mock serves.
+    #[derive(Clone, Copy)]
+    enum CcUpstreamMode {
+        /// Go plan: Provider API answers 403 upgrade_required, then the
+        /// gateway switches to `/alpha/generate` (NDJSON).
+        GoDowngrade,
+        /// Paid plan: Provider API answers ordinary OpenAI SSE.
+        PaidProvider,
+        /// `test-key` hits a 429 quota window; any other key succeeds.
+        QuotaAware,
+    }
+
+    fn cc_claude_request(body: &str) -> axum::extract::Request {
+        axum::extract::Request::builder()
+            .method("POST")
+            .uri("/claudecode/v1/messages")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_owned()))
+            .unwrap()
+    }
+
+    fn cc_header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+        head.lines().find_map(|line| {
+            let (header, value) = line.split_once(':')?;
+            header.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    }
+
+    /// Raw TCP Command Code mock: records `(path, head, body)` for every
+    /// request and answers Provider API / `/alpha/generate` per mode.
+    async fn spawn_command_code_upstream(
+        mode: CcUpstreamMode,
+    ) -> (
+        u16,
+        tokio::sync::mpsc::UnboundedReceiver<(String, String, String)>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let head_end = loop {
+                        let n = match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+                    let content_length = cc_header(&head, "content-length")
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    while buf.len() < head_end + content_length {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let body = String::from_utf8_lossy(&buf[head_end..]).into_owned();
+                    let path = head
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let authorization = cc_header(&head, "authorization")
+                        .unwrap_or_default()
+                        .to_owned();
+                    let _ = tx.send((path.clone(), head, body));
+                    if path.contains("/alpha/fingerprint/record")
+                        || path.contains("/alpha/lifecycle-events")
+                    {
+                        let payload = b"{}";
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                            payload.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = stream.write_all(payload).await;
+                    } else if path.contains("/provider/v1/chat/completions") {
+                        match mode {
+                            CcUpstreamMode::GoDowngrade | CcUpstreamMode::QuotaAware => {
+                                let payload = br#"{"error":{"code":"upgrade_required","message":"upgrade required"}}"#;
+                                let response = format!(
+                                    "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                                    payload.len()
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                                let _ = stream.write_all(payload).await;
+                            }
+                            CcUpstreamMode::PaidProvider => {
+                                let payload = concat!(
+                                    "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"cc-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Paid\"},\"finish_reason\":null}]}\n\n",
+                                    "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"cc-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1,\"total_tokens\":6}}\n\n",
+                                    "data: [DONE]\n\n"
+                                );
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+                                    payload.len()
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                                let _ = stream.write_all(payload.as_bytes()).await;
+                            }
+                        }
+                    } else if path.contains("/alpha/generate") {
+                        if matches!(mode, CcUpstreamMode::QuotaAware)
+                            && authorization.contains("test-key")
+                        {
+                            let payload = br#"{"error":{"code":"rate_limit_exceeded","message":"quota exhausted for the 5h window","resetAt":"2099-01-01T00:00:00Z"}}"#;
+                            let response = format!(
+                                "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                                payload.len()
+                            );
+                            let _ = stream.write_all(response.as_bytes()).await;
+                            let _ = stream.write_all(payload).await;
+                            return;
+                        }
+                        let payload = concat!(
+                            "{\"type\":\"start\"}\n",
+                            "{\"type\":\"reasoning-delta\",\"text\":\"plan\"}\n",
+                            "{\"type\":\"text-delta\",\"text\":\"Hello\"}\n",
+                            "{\"type\":\"finish\",\"finishReason\":\"stop\",\"totalUsage\":{\"inputTokens\":120,\"outputTokens\":2,\"cachedInputTokens\":100,\"inputTokenDetails\":{\"noCacheTokens\":20,\"cacheReadTokens\":100,\"cacheWriteTokens\":0}}}\n"
+                        );
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\n\r\n",
+                            payload.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = stream.write_all(payload.as_bytes()).await;
+                    } else {
+                        let payload = b"{}";
+                        let response = format!(
+                            "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                            payload.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = stream.write_all(payload).await;
+                    }
+                });
+            }
+        });
+        (port, rx)
+    }
+
+    /// Go plan: first request hits the official Provider API, gets the
+    /// documented 403 upgrade_required, and the same candidate is retried on
+    /// `/alpha/generate` with the CLI identity headers. The NDJSON response is
+    /// converted into a Claude stream (thinking + signature + cache-correct
+    /// usage).
+    #[tokio::test]
+    async fn command_code_go_downgrades_to_generate_with_identity_headers() {
+        let (port, mut requests) = spawn_command_code_upstream(CcUpstreamMode::GoDowngrade).await;
+        let gateway =
+            test_gateway_command_code(port, &[("command_code_enabled", "true")]).await;
+        let request = cc_claude_request(
+            r#"{"model":"mapped-cc","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let response = gateway
+            .state
+            .proxy
+            .proxy(request, "claude", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let stream = String::from_utf8_lossy(&bytes);
+
+        // The attempt sequence is: Provider API probe -> 403 ->
+        // fingerprint/lifecycle init -> /alpha/generate.
+        let mut captured = Vec::new();
+        for _ in 0..4 {
+            captured.push(
+                tokio::time::timeout(Duration::from_secs(5), requests.recv())
+                    .await
+                    .expect("upstream request timed out")
+                    .expect("upstream request missing"),
+            );
+        }
+        let first = captured
+            .iter()
+            .find(|(path, _, _)| path.contains("/provider/v1/chat/completions"))
+            .expect("provider request missing");
+        let second = captured
+            .iter()
+            .find(|(path, _, _)| path.contains("/alpha/generate"))
+            .expect("generate request missing");
+        assert!(
+            captured
+                .iter()
+                .any(|(path, _, _)| path.contains("/alpha/fingerprint/record")),
+            "fingerprint must be recorded before the reverse path"
+        );
+        // The official API attempt carries no CLI identity (decision 2).
+        assert!(cc_header(&first.1, "x-cli-environment").is_none());
+        // The reverse path carries the full CLI identity.
+        for name in [
+            "x-cli-environment",
+            "x-command-code-version",
+            "x-session-id",
+            "x-co-flag",
+            "x-taste-learning",
+            "traceparent",
+            "x-project-slug",
+            "authorization",
+        ] {
+            assert!(cc_header(&second.1, name).is_some(), "{name} must be injected");
+        }
+        assert_eq!(cc_header(&second.1, "x-cli-environment"), Some("production"));
+        assert_eq!(cc_header(&second.1, "x-co-flag"), Some("false"));
+        assert_eq!(cc_header(&second.1, "x-taste-learning"), Some("false"));
+        assert!(
+            cc_header(&second.1, "authorization")
+                .unwrap()
+                .starts_with("Bearer ")
+        );
+        // Request body is the Command Code shape (hard pit 4: system
+        // placeholder, model mapping applied).
+        let cc_body: Value = serde_json::from_str(&second.2).unwrap();
+        assert_eq!(cc_body.pointer("/params/model").unwrap(), "cc-model");
+        assert_eq!(cc_body.pointer("/params/system").unwrap(), " ");
+        assert_eq!(cc_body.pointer("/params/stream").unwrap(), true);
+        assert_eq!(
+            cc_body.pointer("/params/messages/0/content/0/text").unwrap(),
+            "hi"
+        );
+        // Claude stream: thinking with synthesized signature, text, and the
+        // cache-corrected Anthropic usage (hard pits 8/9).
+        assert!(stream.contains("\"type\":\"message_start\""), "{stream}");
+        assert!(stream.contains("\"thinking_delta\""), "{stream}");
+        assert!(stream.contains("\"signature_delta\""), "{stream}");
+        assert!(stream.contains("\"text_delta\""), "{stream}");
+        assert!(stream.contains("\"input_tokens\":20"), "{stream}");
+        assert!(stream.contains("\"cache_read_input_tokens\":100"), "{stream}");
+        assert!(stream.contains("\"text\":\"Hello\""), "{stream}");
+        // Transport router memory + per-key identity state are persisted.
+        let transport: String = sqlx::query_scalar(
+            "SELECT CAST(value_json AS TEXT) FROM settings WHERE key='command_code_transport_ch-1'",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert!(transport.contains("generate"), "{transport}");
+        let fingerprint: String = sqlx::query_scalar(
+            "SELECT CAST(value_json AS TEXT) FROM settings WHERE key='command_code_fingerprint_ch-1'",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert!(fingerprint.contains("thumbmark"), "{fingerprint}");
+        let session: String = sqlx::query_scalar(
+            "SELECT CAST(value_json AS TEXT) FROM settings WHERE key='command_code_session_ch-1'",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert!(session.contains("expires_at"), "{session}");
+        gateway.shutdown().await;
+    }
+
+    /// Paid plan: the official Provider API succeeds and is remembered; the
+    /// reverse path is never touched (no fingerprint, no CLI identity).
+    #[tokio::test]
+    async fn command_code_paid_plan_stays_on_provider_api() {
+        let (port, mut requests) = spawn_command_code_upstream(CcUpstreamMode::PaidProvider).await;
+        let gateway =
+            test_gateway_command_code(port, &[("command_code_enabled", "true")]).await;
+        let request = cc_claude_request(
+            r#"{"model":"mapped-cc","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let response = gateway
+            .state
+            .proxy
+            .proxy(request, "claude", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let stream = String::from_utf8_lossy(&bytes);
+        assert!(stream.contains("Paid"), "{stream}");
+        let first = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+            .await
+            .expect("provider request timed out")
+            .expect("provider request missing");
+        assert!(first.0.contains("/provider/v1/chat/completions"));
+        assert!(cc_header(&first.1, "x-cli-environment").is_none());
+        assert!(cc_header(&first.1, "x-command-code-version").is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), requests.recv())
+                .await
+                .is_err(),
+            "paid plans must never fall back to /alpha/generate"
+        );
+        let transport: String = sqlx::query_scalar(
+            "SELECT CAST(value_json AS TEXT) FROM settings WHERE key='command_code_transport_ch-1'",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert!(transport.contains("provider"), "{transport}");
+        // No reverse-path side effects: no fingerprint and no init throttle.
+        let fingerprint: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM settings WHERE key='command_code_fingerprint_ch-1'",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(fingerprint, 0);
+        gateway.shutdown().await;
+    }
+
+    /// Non-stream Claude clients get one aggregated Claude message even
+    /// though `/alpha/generate` always streams NDJSON upstream.
+    #[tokio::test]
+    async fn command_code_non_stream_aggregates_ndjson() {
+        let (port, _requests) = spawn_command_code_upstream(CcUpstreamMode::GoDowngrade).await;
+        let gateway =
+            test_gateway_command_code(port, &[("command_code_enabled", "true")]).await;
+        let request = cc_claude_request(
+            r#"{"model":"mapped-cc","max_tokens":10,"stream":false,"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let response = gateway
+            .state
+            .proxy
+            .proxy(request, "claude", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body.get("type").and_then(Value::as_str), Some("message"));
+        assert_eq!(
+            body.pointer("/content/0/type").and_then(Value::as_str),
+            Some("thinking")
+        );
+        assert_eq!(
+            body.pointer("/content/1/text").and_then(Value::as_str),
+            Some("Hello")
+        );
+        assert_eq!(body.pointer("/usage/input_tokens").and_then(Value::as_i64), Some(20));
+        assert_eq!(
+            body.pointer("/usage/cache_read_input_tokens").and_then(Value::as_i64),
+            Some(100)
+        );
+        gateway.shutdown().await;
+    }
+
+    /// The global switch is default-off: while disabled the gateway answers
+    /// with a clear error and performs zero upstream requests.
+    #[tokio::test]
+    async fn command_code_disabled_blocks_all_upstream_requests() {
+        let (port, mut requests) = spawn_command_code_upstream(CcUpstreamMode::GoDowngrade).await;
+        let gateway = test_gateway_command_code(port, &[]).await;
+        let request = cc_claude_request(
+            r#"{"model":"mapped-cc","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let response = gateway
+            .state
+            .proxy
+            .proxy(request, "claude", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body.pointer("/error/type").and_then(Value::as_str),
+            Some("command_code_disabled")
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), requests.recv())
+                .await
+                .is_err(),
+            "disabled integration must not touch the upstream"
+        );
+        gateway.shutdown().await;
+    }
+
+    /// Plan decision 3: a Command Code quota error (429 + resetAt) cools the
+    /// channel down until the window reset, the request fails over to the
+    /// second account, and later requests skip the cooled channel entirely.
+    #[tokio::test]
+    async fn command_code_quota_error_cools_channel_until_window_reset() {
+        let (port, mut requests) = spawn_command_code_upstream(CcUpstreamMode::QuotaAware).await;
+        let gateway =
+            test_gateway_command_code(port, &[("command_code_enabled", "true")]).await;
+        let time = "2026-08-04T01:00:00+00:00";
+        sqlx::query("INSERT INTO channels(id,provider_id,name,protocol,api_key_encrypted,api_key_hint,manual_enabled,created_at,updated_at) VALUES('ch-2','prov-1','chan-2','command_code',?,?,1,?,?)")
+            .bind(gateway.secrets.encrypt("good-key"))
+            .bind("...key")
+            .bind(time)
+            .bind(time)
+            .execute(gateway.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channel_models(id,channel_id,model_id,display_name,source,available,first_seen_at,created_at,updated_at) VALUES('cm-2','ch-2','cc-model','CC 2','discovered',1,?,?,?)")
+            .bind(time)
+            .bind(time)
+            .bind(time)
+            .execute(gateway.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channel_model_protocols(channel_model_id,protocol) VALUES('cm-2','command_code')")
+            .execute(gateway.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO route_candidates(id,route_id,channel_model_id,priority,enabled,created_at,updated_at) VALUES('rc-2','route-1','cm-2',2,1,?,?)")
+            .bind(time)
+            .bind(time)
+            .execute(gateway.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channel_health(channel_id,state,consecutive_failures,updated_at) VALUES('ch-2','active',0,?)")
+            .bind(time)
+            .execute(gateway.db.pool())
+            .await
+            .unwrap();
+
+        let body = r#"{"model":"mapped-cc","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(cc_claude_request(body), "claude", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("Hello"));
+
+        let (state, disabled_until): (String, Option<String>) = sqlx::query_as(
+            "SELECT state, disabled_until FROM channel_health WHERE channel_id='ch-1'",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(state, "open", "quota error must open the channel");
+        assert!(
+            disabled_until
+                .unwrap_or_default()
+                .starts_with("2099-01-01"),
+            "cooldown must target the window resetAt"
+        );
+
+        // Drain the first request's traffic; the second request must route
+        // only to the healthy account.
+        while tokio::time::timeout(Duration::from_millis(30), requests.recv())
+            .await
+            .is_ok()
+        {}
+        let response = gateway
+            .state
+            .proxy
+            .proxy(cc_claude_request(body), "claude", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // Consume the body: an unconsumed streaming response keeps the
+        // stream generator (and its telemetry sender clone) alive, which
+        // would make the telemetry writer wait forever at shutdown.
+        let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let mut seen: Vec<(String, String)> = Vec::new();
+        while let Ok(Some((path, head, _))) =
+            tokio::time::timeout(Duration::from_millis(300), requests.recv()).await
+        {
+            seen.push((
+                path,
+                cc_header(&head, "authorization").unwrap_or_default().to_owned(),
+            ));
+        }
+        assert!(
+            !seen.is_empty(),
+            "second request must reach the healthy channel"
+        );
+        for (path, authorization) in &seen {
+            assert!(
+                authorization.contains("good-key"),
+                "{path} was routed to the cooled channel: {authorization}"
+            );
+        }
+        gateway.shutdown().await;
+    }
+
+    /// Command Code upstream whose generate body is held open until the test
+    /// releases it — used to prove the per-account burst guard.
+    async fn spawn_gated_command_code_upstream() -> (
+        u16,
+        tokio::sync::mpsc::UnboundedReceiver<(String, String, String)>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let gate_for_mock = Arc::clone(&gate);
+        // Only the first generate body is held open; later requests stream
+        // straight through once the slot frees.
+        let first_generate = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let first_for_mock = Arc::clone(&first_generate);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let tx = tx.clone();
+                let gate = Arc::clone(&gate_for_mock);
+                let first_generate = Arc::clone(&first_for_mock);
+                tokio::spawn(async move {
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let head_end = loop {
+                        let n = match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+                    let path = head
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let _ = tx.send((path.clone(), head, String::new()));
+                    if path.contains("/provider/v1/chat/completions") {
+                        let payload = br#"{"error":{"code":"upgrade_required"}}"#;
+                        let response = format!(
+                            "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                            payload.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = stream.write_all(payload).await;
+                    } else if path.contains("/alpha/generate") {
+                        let full = concat!(
+                            "{\"type\":\"text-delta\",\"text\":\"Hello\"}\n",
+                            "{\"type\":\"finish\",\"finishReason\":\"stop\",\"totalUsage\":{\"inputTokens\":5,\"outputTokens\":2,\"cachedInputTokens\":0,\"inputTokenDetails\":{\"noCacheTokens\":5,\"cacheReadTokens\":0,\"cacheWriteTokens\":0}}}\n"
+                        );
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\n\r\n",
+                            full.len()
+                        );
+                        let half = full.len() / 2;
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = stream.write_all(&full.as_bytes()[..half]).await;
+                        // Hold the FIRST body open until the test releases it.
+                        if first_generate.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                            gate.notified().await;
+                        }
+                        let _ = stream.write_all(&full.as_bytes()[half..]).await;
+                    } else {
+                        let payload = b"{}";
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                            payload.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = stream.write_all(payload).await;
+                    }
+                });
+            }
+        });
+        (port, rx, gate)
+    }
+
+    /// One account (channel) must not fan a burst out into parallel
+    /// `/alpha/generate` calls: while request A holds the slot, request B
+    /// waits; after A's body finishes, B proceeds.
+    #[tokio::test]
+    async fn command_code_single_account_concurrency_is_capped() {
+        let (port, mut requests, gate) = spawn_gated_command_code_upstream().await;
+        let gateway = test_gateway_command_code(
+            port,
+            &[
+                ("command_code_enabled", "true"),
+                ("command_code_max_concurrency", "1"),
+            ],
+        )
+        .await;
+        let body = r#"{"model":"mapped-cc","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+
+        let proxy_a = Arc::clone(&gateway.state.proxy);
+        let task_a = tokio::spawn(async move {
+            proxy_a
+                .proxy(cc_claude_request(body), "claude", None)
+                .await
+        });
+        // Wait until A actually reached `/alpha/generate`.
+        let mut a_seen = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !a_seen && tokio::time::Instant::now() < deadline {
+            if let Ok(Some((path, _, _))) =
+                tokio::time::timeout(Duration::from_millis(100), requests.recv()).await
+            {
+                a_seen = path.contains("/alpha/generate");
+            }
+        }
+        assert!(a_seen, "first request must reach /alpha/generate");
+
+        let proxy_b = Arc::clone(&gateway.state.proxy);
+        let task_b = tokio::spawn(async move {
+            proxy_b
+                .proxy(cc_claude_request(body), "claude", None)
+                .await
+        });
+        // B may probe the provider, but must not start a second generate
+        // while A holds the only slot.
+        let wait_until = tokio::time::Instant::now() + Duration::from_millis(250);
+        while tokio::time::Instant::now() < wait_until {
+            if let Ok(Some((path, _, _))) =
+                tokio::time::timeout(Duration::from_millis(50), requests.recv()).await
+            {
+                assert!(
+                    !path.contains("/alpha/generate"),
+                    "second generate started while the account slot was held"
+                );
+            }
+        }
+
+        gate.notify_one();
+        // Drain A's response body first: the slot is attached to A's upstream
+        // body, so it only frees once that body is fully consumed.
+        let response = task_a.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+
+        // A completed, freeing the slot; B must then reach generate.
+        let mut b_seen = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !b_seen && tokio::time::Instant::now() < deadline {
+            if let Ok(Some((path, _, _))) =
+                tokio::time::timeout(Duration::from_millis(100), requests.recv()).await
+            {
+                b_seen = path.contains("/alpha/generate");
+            }
+        }
+        assert!(b_seen, "second request must reach /alpha/generate after the slot frees");
+
+        let response = task_b.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        gateway.shutdown().await;
+    }
+
+    /// The Codex entry (`/codex/v1/responses`) shares the same Command Code
+    /// pipeline; Responses usage keeps the total input tokens while the
+    /// cached count stays a subset.
+    #[tokio::test]
+    async fn command_code_codex_entry_converts_ndjson_to_responses() {
+        let (port, _requests) = spawn_command_code_upstream(CcUpstreamMode::GoDowngrade).await;
+        let gateway =
+            test_gateway_command_code(port, &[("command_code_enabled", "true")]).await;
+        let body = r#"{"model":"mapped-cc-codex","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#;
+        let request = axum::extract::Request::builder()
+            .method("POST")
+            .uri("/codex/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_owned()))
+            .unwrap();
+        let response = gateway
+            .state
+            .proxy
+            .proxy(request, "openai_responses", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let stream = String::from_utf8_lossy(&bytes);
+        assert!(stream.contains("\"type\":\"response.created\""), "{stream}");
+        assert!(stream.contains("\"type\":\"response.completed\""), "{stream}");
+        assert!(stream.contains("Hello"), "{stream}");
+        assert!(stream.contains("\"input_tokens\":120"), "{stream}");
+        assert!(stream.contains("\"cached_tokens\":100"), "{stream}");
+        gateway.shutdown().await;
+    }
+
+    /// 无映射 OAI 聊天入口直连 `command_code` 路由：网关必须静默回落协议，
+    /// 把 OpenAI chat 请求转成 `/alpha/generate` body，再把 NDJSON 解码回
+    /// OpenAI SSE 交给客户端。
+    #[tokio::test]
+    async fn command_code_openai_chat_entry_silently_converts() {
+        let (port, mut requests) = spawn_command_code_upstream(CcUpstreamMode::GoDowngrade).await;
+        let gateway = test_gateway_command_code(port, &[("command_code_enabled", "true")]).await;
+        let body = r#"{"model":"cc-model","stream":true,"max_tokens":16,"reasoning_effort":"low",
+            "messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}]}"#;
+        let request = axum::extract::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_owned()))
+            .unwrap();
+        let response = gateway
+            .state
+            .proxy
+            .proxy(request, "openai_compatible", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let stream = String::from_utf8_lossy(&bytes);
+        assert!(
+            stream.contains("\"object\":\"chat.completion.chunk\""),
+            "{stream}"
+        );
+        assert!(stream.contains("Hello"), "{stream}");
+        assert!(stream.contains("\"reasoning_content\":\"plan\""), "{stream}");
+        assert!(stream.contains("\"usage\""), "{stream}");
+
+        // 上游收到的是 CC 信封，而不是原始 OpenAI body。
+        let mut generate_body = None;
+        while let Ok((path, _head, request_body)) = requests.try_recv() {
+            if path.contains("/alpha/generate") {
+                generate_body = Some(request_body);
+            }
+        }
+        let generate_body = generate_body.expect("an /alpha/generate request");
+        let value: serde_json::Value = serde_json::from_str(&generate_body).unwrap();
+        assert_eq!(
+            value.pointer("/params/system").and_then(serde_json::Value::as_str),
+            Some("be brief")
+        );
+        assert_eq!(
+            value.pointer("/params/model").and_then(serde_json::Value::as_str),
+            Some("cc-model")
+        );
+        assert_eq!(
+            value.pointer("/params/reasoning_effort").and_then(serde_json::Value::as_str),
+            Some("low")
+        );
+        assert_eq!(
+            value
+                .pointer("/params/messages/0/content/0/type")
+                .and_then(serde_json::Value::as_str),
+            Some("text")
+        );
+        gateway.shutdown().await;
+    }
+
+    /// 无映射 OAI 聊天入口 + 非流式：NDJSON 必须聚合成一个 OpenAI completion
+    /// （而不是把 NDJSON 原样转发），并清掉上游的 content-length/encoding。
+    #[tokio::test]
+    async fn command_code_openai_chat_entry_non_stream_aggregates() {
+        let (port, _requests) = spawn_command_code_upstream(CcUpstreamMode::GoDowngrade).await;
+        let gateway = test_gateway_command_code(port, &[("command_code_enabled", "true")]).await;
+        let body = r#"{"model":"cc-model","stream":false,"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
+        let request = axum::extract::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_owned()))
+            .unwrap();
+        let response = gateway
+            .state
+            .proxy
+            .proxy(request, "openai_compatible", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        assert!(response.headers().get("content-length").is_none());
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["object"], "chat.completion");
+        assert_eq!(value["model"], "cc-model");
+        assert_eq!(
+            value.pointer("/choices/0/message/content").and_then(Value::as_str),
+            Some("Hello")
+        );
+        assert_eq!(
+            value
+                .pointer("/choices/0/message/reasoning_content")
+                .and_then(Value::as_str),
+            Some("plan")
+        );
+        assert_eq!(value.pointer("/usage/prompt_tokens").and_then(Value::as_i64), Some(120));
+        assert_eq!(value.pointer("/usage/completion_tokens").and_then(Value::as_i64), Some(2));
+        assert_eq!(
+            value
+                .pointer("/usage/prompt_tokens_details/cached_tokens")
+                .and_then(Value::as_i64),
+            Some(100)
+        );
+        gateway.shutdown().await;
+    }
+
 }

@@ -147,6 +147,15 @@ mod tests {
             (("claude", "openai_compatible"), Some(ClaudeToChat)),
             (("claude", "openai_responses"), Some(ClaudeToResponses)),
             (("claude", "gemini"), Some(ClaudeToGemini)),
+            (("claude", "command_code"), Some(ClaudeToCommandCode)),
+            (
+                ("openai_compatible", "openai_compatible"),
+                Some(Passthrough),
+            ),
+            (
+                ("openai_compatible", "command_code"),
+                Some(ChatToCommandCode),
+            ),
             (("openai_responses", "openai_responses"), Some(Passthrough)),
             (
                 ("openai_responses", "openai_compatible"),
@@ -154,6 +163,10 @@ mod tests {
             ),
             (("openai_responses", "claude"), Some(ResponsesToClaude)),
             (("openai_responses", "gemini"), Some(ResponsesToGemini)),
+            (
+                ("openai_responses", "command_code"),
+                Some(ResponsesToCommandCode),
+            ),
             (("gemini", "gemini"), None),
             (("claude", "bogus"), None),
             (("openai_responses", ""), None),

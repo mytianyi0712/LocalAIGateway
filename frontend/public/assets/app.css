@@ -292,6 +292,13 @@ button:disabled { cursor: not-allowed; }
 .settings-panel .section-body { padding: 20px; }
 
 .balance-section { display: grid; gap: 14px; padding: 16px; border: 1px solid var(--line); border-radius: var(--radius-small); background: var(--surface-raised); }
+.cc-login-section { display: grid; gap: 10px; padding: 16px; border: 1px solid var(--line); border-radius: var(--radius-small); background: var(--surface-raised); }
+.cc-login-section[hidden] { display: none; }
+.cc-login-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.cc-login-head strong { color: var(--text-secondary); font-size: 13px; font-weight: 720; }
+.cc-login-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.cc-login-section .notice { margin: 0; }
+.cc-login-section code { padding: 1px 5px; border-radius: 4px; background: var(--surface); font-size: 11.5px; }
 .balance-section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .balance-section-head h3 { margin: 0; color: var(--text-secondary); font-size: 13px; font-weight: 720; }
 .balance-custom { display: grid; gap: 14px; }

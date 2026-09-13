@@ -74,6 +74,7 @@ pub async fn build(config: AppConfig) -> Result<GatewayRuntime> {
         Arc::clone(&clock),
         Arc::clone(&limits),
     );
+    let command_code_login = crate::commandcode_login::CommandCodeLogin::new(std::sync::Arc::clone(&http));
     let state = Context {
         config: Arc::new(config),
         db,
@@ -90,6 +91,7 @@ pub async fn build(config: AppConfig) -> Result<GatewayRuntime> {
         telemetry,
         background: supervisor.clone(),
         limits,
+        command_code_login,
         recovery: crate::auth::RecoverySession::new(),
     };
     let router = Router::new()

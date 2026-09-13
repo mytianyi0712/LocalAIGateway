@@ -12,7 +12,7 @@ import { getToken, setToken, api, get, post, put, patch, remove, setUnauthorized
 // P2-3: the protocol list is data-driven from /system/protocols (populated
 // into state.protocols at boot); this constant is only the offline fallback
 // so the UI still renders before/without the gateway.
-const FALLBACK_PROTOCOLS = ['openai_compatible', 'openai_responses', 'claude', 'gemini'];
+const FALLBACK_PROTOCOLS = ['openai_compatible', 'openai_responses', 'claude', 'gemini', 'command_code'];
 function protocolOptions() {
   return (state.protocols && state.protocols.length ? state.protocols : FALLBACK_PROTOCOLS);
 }
@@ -87,6 +87,8 @@ const state = {
   connected: false,
   trustedLocal: true,
   providers: [],
+  providerPresets: [],
+  commandCodeStatus: null,
   channels: [],
   channelModels: [],
   routes: [],
@@ -262,11 +264,26 @@ function remoteCompactionBadge(channel) {
   return `<span class="subtle-text">${escapeHtml(status.join(' / '))}</span>`;
 }
 
+
+// Command Code 的稳定错误码 → 可读文案（探测/额度共用）。
+const COMMAND_CODE_ERROR_TEXT = {
+  command_code_disabled: 'Command Code 集成未启用：请到「设置 → Command Code」开启并确认风险后再试',
+  disabled: 'Command Code 集成未启用：请到「设置 → Command Code」开启并确认风险后再试',
+  command_code_bundled_catalog: '实时目录不可用，已使用网关内置的 Go 模型快照',
+  'invalid-key': 'API Key 未通过校验，请重新发起网页登录授权',
+};
+
+function friendlyError(kind) {
+  if (!kind) return '';
+  return COMMAND_CODE_ERROR_TEXT[kind] || kind;
+}
+
 const BALANCE_ADAPTERS = [
   ['newapi', 'New API'],
   ['sub2api', 'Sub2API'],
   ['opencode_go', 'OpenCode Go'],
   ['deepseek', 'DeepSeek'],
+  ['command_code', 'Command Code'],
   ['custom', '自定义'],
 ];
 
@@ -291,12 +308,14 @@ function balanceSnapshotText(snapshot) {
   if (!snapshot) return '<span class="subtle-text">尚未查询</span>';
   const when = snapshot.checked_at ? `查询于 ${formatTime(snapshot.checked_at)}` : '';
   if (snapshot.status === 'error') {
-    return `<span class="balance-error" title="${escapeAttr(snapshot.error_kind || 'error')}">查询失败：${escapeHtml(snapshot.error_kind || 'error')}</span><span class="subtle-text">${escapeHtml(when)}</span>`;
+    return `<span class="balance-error" title="${escapeAttr(snapshot.error_kind || 'error')}">查询失败：${escapeHtml(friendlyError(snapshot.error_kind) || 'error')}</span><span class="subtle-text">${escapeHtml(when)}</span>`;
   }
   const parts = [];
+  // Windows first; a concrete credit balance still shows next to them
+  // (Command Code reports 5h/周 windows AND credits).
   if (snapshot.windows?.length) parts.push(snapshot.windows.map((window) => `${window.label} ${balancePercent(window.remaining_percent)}`).join(' / '));
-  else if (snapshot.remaining !== null && snapshot.remaining !== undefined) parts.push(balanceAmount(snapshot));
-  else if (snapshot.unlimited) parts.push('不限额');
+  if (snapshot.remaining !== null && snapshot.remaining !== undefined) parts.push(balanceAmount(snapshot));
+  else if (!snapshot.windows?.length && snapshot.unlimited) parts.push('不限额');
   if (snapshot.used !== null && snapshot.used !== undefined) parts.push(`已用 ${number(snapshot.used)}`);
   if (snapshot.total !== null && snapshot.total !== undefined) parts.push(`总额 ${number(snapshot.total)}`);
   const summary = parts.length ? escapeHtml(parts.join(' · ')) : '-';
@@ -309,14 +328,17 @@ function balanceCellContent(channel) {
   const snapshot = balance.snapshot;
   if (!snapshot) return '<span class="subtle-text">未查询</span>';
   if (snapshot.status === 'error') {
-    return `<span class="balance-error" title="${escapeAttr(snapshot.error_kind || 'error')}">查询失败</span>`;
+    return `<span class="balance-error" title="${escapeAttr(friendlyError(snapshot.error_kind) || 'error')}">查询失败</span>`;
   }
   if (snapshot.windows?.length) {
     const rows = snapshot.windows.map((window) => {
       const title = window.resets_at ? `重置：${formatTime(window.resets_at)}` : '';
       return `<span class="balance-window"${title ? ` title="${escapeAttr(title)}"` : ''}><b>${escapeHtml(window.label)}</b><span>${balancePercent(window.remaining_percent)}</span></span>`;
     }).join('');
-    return `<div class="balance-windows">${rows}</div>`;
+    const credits = snapshot.remaining !== null && snapshot.remaining !== undefined
+      ? `<span class="balance-amount" title="${escapeAttr(snapshot.label || '')}">${escapeHtml(balanceAmount(snapshot))}</span>`
+      : '';
+    return `<div class="balance-windows">${rows}${credits}</div>`;
   }
   // A concrete number always wins: some upstreams set an unlimited flag
   // while still reporting a usable balance (even a negative/overdrawn one).
@@ -534,13 +556,14 @@ function renderDashboard() {
 }
 
 async function loadProviders(version) {
-  const [providerData, channelData, modelData] = await Promise.all([get('/providers'), get('/channels'), get('/channel-models')]);
+  const [providerData, channelData, modelData, presetData] = await Promise.all([get('/providers'), get('/channels'), get('/channel-models'), get('/provider-presets')]);
   // P2-9: this loader paints the providers page; it must never paint onto
   // another page, even when the version counter somehow still matches.
   if (version !== state.renderVersion || currentPath() !== '/providers') return;
   state.providers = providerData.items;
   state.channels = channelData.items;
   state.channelModels = modelData.items;
+  state.providerPresets = presetData.items || [];
   elements.page.innerHTML = renderProvidersMarkup();
 }
 
@@ -582,12 +605,22 @@ function renderProvidersMarkup() {
 }
 
 function providerForm(editing = null) {
+  const presets = state.providerPresets || [];
+  const presetOptions = presets.map((preset) => `<option value="${escapeAttr(preset.id)}" data-warning="${escapeAttr(preset.warning || '')}" data-base-url="${escapeAttr(preset.base_url)}" data-protocol="${escapeAttr(preset.protocol)}" data-kind="${escapeAttr(preset.kind || '')}">${escapeHtml(preset.name)}</option>`).join('');
+  // A Command Code provider carries `kind='command_code'` and stays
+  // default-off; the reverse path is only entered after the server itself
+  // answers 403 upgrade_required. The preset warning is mandatory reading.
+  const presetField = editing ? '' : `<div class="field"><label for="provider-preset">供应商预设</label><select class="select" id="provider-preset" name="preset" data-provider-preset><option value="">自定义（不套用预设）</option>${presetOptions}</select><span class="field-help">选择预设会自动填充名称与 API 根地址；Command Code Go 预设会启用 CLI 兼容身份，其渠道凭据需通过「网页登录授权」获取（Go 套餐无法在面板创建 API Key）。</span></div>`;
+  const warning = editing ? '' : `<div class="notice is-error" id="provider-preset-warning" hidden></div>
+      <label class="checkbox-row" id="provider-preset-confirm-row" hidden><input type="checkbox" id="provider-preset-confirm" data-provider-preset-confirm> <span>我已阅读并知悉上述风险，确认创建该供应商</span></label>`;
   openModal({
     title: editing ? '编辑供应商' : '新建供应商',
     mode: editing ? 'provider-edit' : 'provider-create',
-    body: `<form class="form-stack" id="provider-form" data-form="provider" data-provider-id="${escapeAttr(editing?.id || '')}">
+    body: `<form class="form-stack" id="provider-form" data-form="provider" data-provider-id="${escapeAttr(editing?.id || '')}" data-provider-kind="${escapeAttr(editing?.kind || '')}">
+      ${presetField}
       <div class="field"><label for="provider-name">名称</label><input class="input" id="provider-name" name="name" required maxlength="120" value="${escapeAttr(editing?.name || '')}" autocomplete="off"></div>
       <div class="field"><label for="provider-base-url">API 根地址</label><input class="input" id="provider-base-url" name="base_url" type="url" required placeholder="https://api.example.com" value="${escapeAttr(editing?.base_url || '')}" autocomplete="url"><span class="field-help">无需填写末尾的 /v1 或 /v1beta。</span></div>
+      ${warning}
     </form>`,
     footer: `${button({ action: 'close-modal', label: '取消' })}${button({ action: 'submit-provider', label: editing ? '保存' : '创建', iconName: editing ? 'check' : 'plus', primary: true })}`,
   });
@@ -638,7 +671,144 @@ function channelBalanceSection(editing, balance) {
   </section>`;
 }
 
+
+// ---------------------------------------------------------------------------
+// Command Code 网页登录授权（等价官方 cmd login 的 loopback 流程）
+// ---------------------------------------------------------------------------
+
+const CC_LOGIN_REASON_TEXT = {
+  denied: '浏览器授权被拒绝',
+  timeout: '等待浏览器授权超时（2 分钟）',
+  'invalid-key': '签发的 API Key 未通过校验，请重试',
+  network: '无法连接 Command Code API，请检查网络后重试',
+  error: '登录流程出错，请重试',
+  cancelled: '已取消网页登录',
+};
+
+function commandCodeLoginPayload() {
+  const providerSelect = document.getElementById('channel-provider');
+  const provider = (state.providers || []).find((item) => item.id === providerSelect?.value);
+  return { api_base: provider?.base_url || null };
+}
+
+function stopCommandCodeLoginPolling() {
+  if (state.ccLogin?.pollTimer) {
+    clearTimeout(state.ccLogin.pollTimer);
+    state.ccLogin.pollTimer = null;
+  }
+}
+
+function ccLoginStatusHtml() {
+  const login = state.ccLogin || { status: 'idle' };
+  if (login.status === 'stored') {
+    const hint = login.hint ? `（${escapeHtml(login.hint)}）` : '';
+    return `<strong>已保存凭据</strong>${hint}：本渠道已有有效密钥，可直接保存/使用；如需更换密钥再点击「网页登录授权」。`;
+  }
+  if (login.status === 'waiting') {
+    return '<span class="subtle-text">等待浏览器授权…请在打开的 commandcode.ai 页面完成登录</span>';
+  }
+  if (login.status === 'success') {
+    const who = [login.userName, login.keyName].filter(Boolean).map(escapeHtml).join(' / ');
+    return `<strong>已授权</strong>${who ? `：${who}` : ''} — 保存渠道即可将密钥写入本渠道`;
+  }
+  if (login.status === 'failed') {
+    const reason = CC_LOGIN_REASON_TEXT[login.reason] || login.reason || '未知原因';
+    return `<span class="balance-error">授权失败：${escapeHtml(reason)}</span>${login.message ? ` <span class="subtle-text">${escapeHtml(login.message)}</span>` : ''}`;
+  }
+  return '<span class="subtle-text">尚未开始；Go 套餐无法在面板创建 API Key，请使用网页登录授权或从 CLI 导入</span>';
+}
+
+function paintCommandCodeLogin() {
+  const box = document.querySelector('[data-cc-login-status]');
+  if (box) box.innerHTML = ccLoginStatusHtml();
+  const cancel = document.querySelector('[data-action="cc-login-cancel"]');
+  if (cancel) cancel.hidden = state.ccLogin?.status !== 'waiting';
+  const start = document.querySelector('[data-action="cc-login-start"]');
+  // 已授权后禁用重开：再次 begin 会作废尚未保存的一次性交接。
+  if (start) start.disabled = ['waiting', 'success'].includes(state.ccLogin?.status);
+}
+
+function applyCommandCodeLoginStatus(login) {
+  state.ccLogin = state.ccLogin || {};
+  if (login.state === 'waiting') {
+    state.ccLogin.status = 'waiting';
+    state.ccLogin.loginId = null;
+    state.ccLogin.authUrl = login.auth_url;
+  } else if (login.state === 'success') {
+    state.ccLogin.status = 'success';
+    state.ccLogin.loginId = login.login_id;
+    state.ccLogin.userName = login.user_name;
+    state.ccLogin.keyName = login.key_name;
+    stopCommandCodeLoginPolling();
+  } else if (login.state === 'failed') {
+    state.ccLogin.status = 'failed';
+    state.ccLogin.loginId = null;
+    state.ccLogin.reason = login.reason;
+    state.ccLogin.message = login.message || '';
+    stopCommandCodeLoginPolling();
+  } else {
+    state.ccLogin.status = 'idle';
+    state.ccLogin.loginId = null;
+    stopCommandCodeLoginPolling();
+  }
+  paintCommandCodeLogin();
+}
+
+function pollCommandCodeLogin() {
+  stopCommandCodeLoginPolling();
+  const tick = async () => {
+    try {
+      const data = await get('/command-code/login');
+      applyCommandCodeLoginStatus(data.login || { state: 'idle' });
+      if (state.ccLogin?.status === 'waiting') {
+        state.ccLogin.pollTimer = setTimeout(tick, 1200);
+      }
+    } catch (error) {
+      state.ccLogin = { status: 'failed', reason: 'error', message: error.message };
+      paintCommandCodeLogin();
+    }
+  };
+  state.ccLogin.pollTimer = setTimeout(tick, 800);
+}
+
+async function startCommandCodeLogin() {
+  try {
+    const data = await post('/command-code/login', commandCodeLoginPayload());
+    applyCommandCodeLoginStatus(data.login || { state: 'idle' });
+    if (data.login?.auth_url) window.open(data.login.auth_url, '_blank', 'noopener');
+    if (data.login?.state === 'waiting') pollCommandCodeLogin();
+  } catch (error) {
+    toast(error.message, 'error');
+  }
+}
+
+async function importCommandCodeCliKey() {
+  try {
+    const data = await post('/command-code/import-cli', commandCodeLoginPayload());
+    applyCommandCodeLoginStatus(data.login || { state: 'idle' });
+    if (data.login?.state === 'success') toast('已从官方 CLI 凭据导入');
+  } catch (error) {
+    toast(error.message, 'error');
+  }
+}
+
+async function cancelCommandCodeLogin() {
+  try {
+    const data = await remove('/command-code/login');
+    applyCommandCodeLoginStatus(data.login || { state: 'idle' });
+  } catch (error) {
+    toast(error.message, 'error');
+  }
+}
+
 async function channelForm(providerId = '', editing = null) {
+  const currentProviderId = editing?.provider_id || providerId || state.providers[0]?.id || '';
+  const currentProvider = (state.providers || []).find((provider) => provider.id === currentProviderId);
+  const isCommandCode = (editing ? editing.provider_kind : currentProvider?.kind) === 'command_code';
+  // 编辑已有渠道且已保存密钥时，不要假装“尚未授权”逼用户重新登录。
+  state.ccLogin = editing?.has_api_key
+    ? { status: 'stored', hint: editing.api_key_hint || '' }
+    : { status: 'idle' };
   const selected = new Set(editing?.protocols || (editing?.protocol ? [editing.protocol] : ['openai_compatible']));
   const options = state.providers.map((provider) => `<option value="${escapeAttr(provider.id)}" ${provider.id === (editing?.provider_id || providerId) ? 'selected' : ''}>${escapeHtml(provider.name)}</option>`).join('');
   const compactionStatus = editing
@@ -663,23 +833,44 @@ async function channelForm(providerId = '', editing = null) {
   openModal({
     title: editing ? '编辑渠道' : '新建渠道',
     mode: editing ? 'channel-edit' : 'channel-create',
-    body: `<form class="form-stack" id="channel-form" data-form="channel" data-channel-id="${escapeAttr(editing?.id || '')}" data-original-protocols="${escapeAttr(JSON.stringify([...selected]))}" data-balance-configured="${editing && balance?.configured ? '1' : '0'}">
+    body: `<form class="form-stack" id="channel-form" data-form="channel" data-channel-id="${escapeAttr(editing?.id || '')}" data-cc-has-key="${editing?.has_api_key ? '1' : '0'}" data-original-protocols="${escapeAttr(JSON.stringify([...selected]))}" data-balance-configured="${editing && balance?.configured ? '1' : '0'}">
       <div class="field"><label for="channel-provider">供应商</label><select class="select" id="channel-provider" name="provider_id" required ${editing ? 'disabled' : ''}><option value="">请选择供应商</option>${options}</select>${editing ? `<input type="hidden" name="provider_id" value="${escapeAttr(editing.provider_id)}">` : ''}</div>
       <div class="field"><label for="channel-name">渠道名称</label><input class="input" id="channel-name" name="name" required maxlength="120" value="${escapeAttr(editing?.name || '')}" autocomplete="off"></div>
       <fieldset class="protocol-fieldset"><legend class="fieldset-title">支持的请求格式</legend><div class="protocol-options">${protocolOptions().map((protocol) => `<label class="protocol-option"><input type="checkbox" name="protocols" value="${protocol}" ${selected.has(protocol) ? 'checked' : ''}>${escapeHtml(protocol)}</label>`).join('')}</div></fieldset>
       ${compactionField}
-      <div class="field"><label for="channel-api-key">${editing ? 'API Key（留空则保持不变）' : 'API Key'}</label><input class="input" id="channel-api-key" name="api_key" type="password" ${editing ? '' : 'required'} autocomplete="new-password" placeholder="${escapeAttr(editing?.api_key_hint || '')}"></div>
+      <section class="cc-login-section" data-cc-login-panel ${isCommandCode ? '' : 'hidden'}>
+        <div class="cc-login-head"><strong>Command Code 凭据</strong><span class="subtle-text">Go 套餐无法在面板创建 API Key</span></div>
+        <p class="field-help">点击「网页登录授权」会在浏览器打开 commandcode.ai 授权页（与官方 <code>cmd login</code> 同一流程）；授权完成后密钥由网关直接写入本渠道，不会经过浏览器页面。也可从已登录的官方 CLI 凭据导入。</p>
+        <div class="cc-login-actions" data-cc-login-actions>
+          ${button({ action: 'cc-login-start', label: '网页登录授权', iconName: 'key-round', primary: true })}
+          ${button({ action: 'cc-login-import', label: '从 CLI 导入', iconName: 'file-text' })}
+          ${button({ action: 'cc-login-cancel', label: '取消登录', iconName: 'x' })}
+        </div>
+        <div class="notice" data-cc-login-status></div>
+      </section>
+      <div class="field"><label for="channel-api-key">${isCommandCode ? (editing ? 'API Key（可选；推荐用上方网页登录，留空保持不变）' : 'API Key（可选；推荐用上方网页登录）') : editing ? 'API Key（留空则保持不变）' : 'API Key'}</label><input class="input" id="channel-api-key" name="api_key" type="password" ${!isCommandCode && !editing ? 'required' : ''} autocomplete="new-password" placeholder="${escapeAttr(editing?.api_key_hint || '')}"></div>
       <div class="field"><label for="channel-health-model">健康探测模型</label><select class="select" id="channel-health-model" name="health_check_model_id"><option value="" ${editing?.health_check_model_id ? '' : 'selected'}>自动（模型列表第一个）</option>${healthModelOptions}</select><span class="field-help">熔断到期或手动探测时使用；自动模式选择该渠道模型列表中的第一个可用模型。</span></div>
       ${balanceSection}
     </form>`,
     footer: `${button({ action: 'close-modal', label: '取消' })}${button({ action: 'submit-channel', label: editing ? '保存' : '创建', iconName: editing ? 'check' : 'plus', primary: true })}`,
   });
+  paintCommandCodeLogin();
 }
 
 async function saveProvider(form) {
   const values = new FormData(form);
-  const payload = { name: values.get('name').trim(), base_url: values.get('base_url').trim() };
   const providerId = form.dataset.providerId;
+  const presetSelect = form.querySelector('[data-provider-preset]');
+  const preset = presetSelect ? (state.providerPresets || []).find((item) => item.id === presetSelect.value) : null;
+  const kind = preset?.kind || form.dataset.providerKind || '';
+  if (preset?.warning) {
+    const confirmed = document.getElementById('provider-preset-confirm')?.checked;
+    if (!confirmed) {
+      toast('请先阅读并勾选确认风险提示', 'error');
+      return;
+    }
+  }
+  const payload = { name: values.get('name').trim(), base_url: values.get('base_url').trim(), kind: kind || null };
   if (providerId) await patch(`/providers/${providerId}`, payload);
   else await post('/providers', payload);
   closeModal();
@@ -695,6 +886,13 @@ async function saveChannel(form) {
   const protocolsValue = values.getAll('protocols');
   if (!protocolsValue.length) throw new Error('至少选择一种请求格式');
   const channelId = form.dataset.channelId;
+  const commandCodeForm = Boolean(form.querySelector('[data-cc-login-panel]'));
+  const commandCodeLoginId = commandCodeForm ? state.ccLogin?.loginId || null : null;
+  const manualApiKey = values.get('api_key').trim();
+  const hasStoredKey = form.dataset.ccHasKey === '1';
+  if (commandCodeForm && !commandCodeLoginId && !manualApiKey && !hasStoredKey) {
+    throw new Error('请先完成 Command Code 网页登录授权，或手动粘贴 API Key');
+  }
   const payload = {
     name: values.get('name').trim(),
     protocols: protocolsValue,
@@ -706,8 +904,8 @@ async function saveChannel(form) {
     // P2-3: the API key is part of ONE atomic PATCH — fields and key either
     // all commit or none do; a rejected key can no longer leave the channel
     // half-updated.
-    const apiKey = values.get('api_key').trim();
-    if (apiKey) payload.api_key = apiKey;
+    if (manualApiKey) payload.api_key = manualApiKey;
+    if (commandCodeLoginId) payload.login_id = commandCodeLoginId;
     await patch(`/channels/${channelId}`, payload);
     // Balance config is saved together with the channel form. Choosing "请选择"
     // (empty adapter) removes an existing config, back to default-off.
@@ -721,8 +919,12 @@ async function saveChannel(form) {
     if (isCurrent(ctx)) await refreshProviders(ctx.renderVersion);
     if (protocolsChanged && isCurrent(ctx)) await discoverChannel(channelId, { quiet: true });
   } else {
-    const apiKey = values.get('api_key').trim();
-    await post('/channels', { provider_id: values.get('provider_id'), ...payload, api_key: apiKey });
+    await post('/channels', {
+      provider_id: values.get('provider_id'),
+      ...payload,
+      api_key: manualApiKey,
+      ...(commandCodeLoginId ? { login_id: commandCodeLoginId } : {}),
+    });
     closeModal();
     toast('渠道已创建');
     if (isCurrent(ctx)) await refreshProviders(ctx.renderVersion);
@@ -769,7 +971,7 @@ async function discoverChannel(channelId, { quiet = false } = {}) {
       return;
     }
     if (run.status === 'failed') {
-      throw new Error(`模型探测失败：${run.error_kind || run.status_code}`);
+      throw new Error(`模型探测失败：${friendlyError(run.error_kind) || run.status_code}`);
     }
   }
   if (isCurrent(ctx)) toast('探测仍在后台运行', 'warning');
@@ -796,7 +998,7 @@ async function queryChannelBalance(channelId) {
   const target = form.querySelector('[data-balance-snapshot]');
   if (target) target.innerHTML = balanceSnapshotText(result);
   if (result.status === 'ok') toast('余额查询成功');
-  else toast(`余额查询失败：${result.error_kind || 'error'}`, 'warning');
+  else toast(`余额查询失败：${friendlyError(result.error_kind) || 'error'}`, 'warning');
   renderIfCurrent(version, renderPage);
 }
 
@@ -835,7 +1037,7 @@ async function refreshChannelBalance(channelId, button) {
     const result = await post(`/channels/${channelId}/balance`);
     channel.balance = { ...(channel.balance || {}), configured: true, snapshot: result };
     if (result.status === 'ok') toast(`${channel.name} 余额已刷新`);
-    else toast(`${channel.name} 余额刷新失败：${result.error_kind || 'error'}`, 'warning');
+    else toast(`${channel.name} 余额刷新失败：${friendlyError(result.error_kind) || 'error'}`, 'warning');
     renderIfCurrent(version, () => {
       elements.page.innerHTML = renderProvidersMarkup();
     });
@@ -1345,6 +1547,7 @@ const PROTOCOL_LABELS = {
   openai_responses: 'OpenAI Responses',
   claude: 'Claude 原生',
   gemini: 'Gemini',
+  command_code: 'Command Code（CLI 兼容，上游专用）',
 };
 
 function protocolLabel(protocol) {
@@ -1621,6 +1824,11 @@ async function loadSettings(version) {
   let settings;
   try {
     settings = await get('/settings');
+    try {
+      state.commandCodeStatus = await get('/command-code/status');
+    } catch {
+      state.commandCodeStatus = null;
+    }
   } catch (error) {
     if (version !== state.renderVersion || currentPath() !== '/settings') return;
     if (error.body?.code === 'config_corrupted') {
@@ -1685,6 +1893,9 @@ const SETTINGS_SECTIONS = [
     fields: [['max_request_body_mb', '最大请求体（MiB）', 1, 1024], ['max_buffered_upstream_body_mb', '上游响应缓冲上限（MiB）', 1, 1024]] },
   { id: 'maintenance', title: '维护', note: '周期任务与数据保留', grid: 'is-two',
     fields: [['model_discovery_interval_hours', '模型探测周期（小时）', 1, 168], ['log_retention_days', '日志保留（天）', 1, 365]] },
+  { id: 'command_code', title: 'Command Code 运行参数', note: '仅在上方开关启用后生效', grid: 'is-two',
+    help: '指纹/生命周期按渠道（每 API Key）独立节流；额度窗口 5h 重置较快，因此额度刷新周期默认 15 分钟。',
+    fields: [['command_code_idle_timeout_seconds', '流空闲超时（秒）', 10, 3600], ['command_code_init_interval_hours', '指纹刷新周期（小时）', 1, 168], ['command_code_version_check_interval_hours', '版本探测周期（小时）', 1, 720], ['command_code_quota_interval_minutes', '额度刷新周期（分钟）', 1, 1440], ['command_code_max_concurrency', '单账号并发上限', 1, 32]] },
 ];
 
 // 设置损坏修复表单的初始值,与后端 RuntimeSettings::default() 一致
@@ -1703,6 +1914,12 @@ const SETTINGS_DEFAULTS = {
   max_buffered_upstream_body_mb: 64,
   model_discovery_interval_hours: 24,
   log_retention_days: 30,
+  command_code_enabled: false,
+  command_code_idle_timeout_seconds: 120,
+  command_code_init_interval_hours: 8,
+  command_code_version_check_interval_hours: 24,
+  command_code_quota_interval_minutes: 15,
+  command_code_max_concurrency: 2,
 };
 
 function settingsSectionsHtml(settings) {
@@ -1714,6 +1931,23 @@ function settingsSectionsHtml(settings) {
       `<div class="section-body"><div class="form-grid ${section.grid}">${fields}${help}</div></div>`,
       'settings-panel');
   }).join('');
+}
+
+function commandCodePanel(settings) {
+  const enabled = Boolean(settings.command_code_enabled);
+  const status = state.commandCodeStatus || {};
+  const drift = Boolean(status.drift);
+  const driftNotice = drift
+    ? `<div class="notice is-error">上游 CLI 版本 ${escapeHtml(status.cli_version || '?')} 已偏离协议基准 ${escapeHtml(status.verified_baseline || '?')}，线协议可能已静默变更；遇到异常请先更新网关或停用该集成。</div>`
+    : (status.cli_version ? `<div class="notice">CLI 版本 ${escapeHtml(status.cli_version)}（协议基准 ${escapeHtml(status.verified_baseline || '?')}）${status.version_checked_at ? ` · 探测于 ${escapeHtml(status.version_checked_at)}` : ''}</div>` : '');
+  const warning = 'Go 套餐没有官方 API 访问：网关默认先请求官方 Provider API，服务端以 403 upgrade_required 拒绝后，仅对该账号降级到 CLI 兼容路径（/alpha/generate），并使用 CLI 身份头（会话、指纹、版本）。这是对服务端明确拒绝路径的绕过，可能违反服务条款并导致账号封禁；启用即表示已知晓并自行承担全部风险。';
+  return panel('Command Code（Go 套餐）', '默认关闭；关闭时零上游请求', `<div class="section-body"><div class="form-stack">
+    <div class="switch-row"><div class="switch-copy"><strong>启用 Command Code 集成</strong><p>${enabled ? '已启用：Command Code 渠道的映射请求可路由（先官方 API，403 后降级）' : '已关闭：Command Code 渠道的请求会被拒绝，探测/发现/额度也都不会发出'}</p></div><input class="switch-control" id="command-code-enabled" name="command_code_enabled" type="checkbox" aria-label="启用 Command Code 集成" ${enabled ? 'checked' : ''}></div>
+    <div class="notice is-error" data-command-code-warning ${enabled ? '' : 'hidden'}>${warning}</div>
+    <label class="checkbox-row" data-command-code-confirm-row ${enabled ? 'hidden' : ''}><input type="checkbox" data-command-code-confirm> <span>我已阅读并知悉上述风险，确认启用</span></label>
+    ${driftNotice}
+    ${Number(status.channel_count) > 0 ? `<div class="notice">当前已配置 ${number(status.channel_count)} 个 Command Code 渠道；每个渠道（API Key）拥有独立指纹与会话。</div>` : ''}
+  </div></div>`, 'settings-panel');
 }
 
 function renderSettingsPage() {
@@ -1732,6 +1966,7 @@ function renderSettingsPage() {
   return `<form class="settings-stack" id="settings-form" data-form="settings">
     ${toolbar('访问与运行参数', '配置局域网信任、故障转移与运行时限制', `${button({ action: 'refresh-settings', label: '还原', iconName: 'refresh-cw' })}${button({ action: 'submit-settings', label: '保存设置', iconName: 'check', primary: true })}`)}
     ${panel('局域网访问', '默认信任局域网请求', `<div class="section-body"><div class="form-stack"><div class="switch-row"><div class="switch-copy"><strong>信任局域网访问</strong><p id="trust-description">${settings.trust_local_network ? '代理和管理员界面不要求密钥' : '代理和管理员界面要求对应密钥'}</p></div><input class="switch-control" id="trust-local-network" name="trust_local_network" type="checkbox" aria-label="信任局域网访问" data-trust-toggle ${settings.trust_local_network ? 'checked' : ''}></div>${settings.config_corrupted_keys?.length ? `<div class="notice is-error">以下设置项数据损坏（已显示默认值），重新填写并保存即可修复：${settings.config_corrupted_keys.map(escapeHtml).join('、')}</div>` : ''}${keyBlock}</div></div>`, 'settings-panel')}
+    ${commandCodePanel(settings)}
     ${settingsSectionsHtml(settings)}
   </form>`;
 }
@@ -1739,8 +1974,18 @@ function renderSettingsPage() {
 async function saveSettings(form) {
   const version = state.renderVersion;
   const values = new FormData(form);
+  const commandCodeEnabled = form.querySelector('#command-code-enabled')?.checked || false;
+  const commandCodeWasEnabled = Boolean(state.settings?.command_code_enabled);
+  if (commandCodeEnabled && !commandCodeWasEnabled) {
+    const confirmed = form.querySelector('[data-command-code-confirm]')?.checked;
+    if (!confirmed) {
+      toast('启用 Command Code 前必须确认风险提示', 'error');
+      return;
+    }
+  }
   const payload = {
     trust_local_network: values.get('trust_local_network') === 'on',
+    command_code_enabled: commandCodeEnabled,
   };
   // P1-7: the payload is generated from the SAME schema that renders the
   // fields, and each value is range-checked client-side before the PATCH
@@ -1900,6 +2145,9 @@ async function handleAction(target) {
     if (action === 'lock-console') { setToken(''); setConnection(false, false); return openAuthModal(); }
     if (action === 'refresh-dashboard') return renderPage();
     if (action === 'refresh-providers') return renderPage();
+    if (action === 'cc-login-start') return startCommandCodeLogin();
+    if (action === 'cc-login-import') return importCommandCodeCliKey();
+    if (action === 'cc-login-cancel') return cancelCommandCodeLogin();
     if (action === 'open-provider') return providerForm();
     if (action === 'edit-provider') return providerForm(state.providers.find((item) => item.id === target.dataset.providerId));
     if (action === 'open-channel') return channelForm(target.dataset.providerId || '');
@@ -2008,6 +2256,45 @@ function handleChange(event) {
       if (!stillValid) modelSelect.value = '';
     }
   }
+  if (target.matches('[data-provider-preset]')) {
+    const option = target.selectedOptions[0];
+    if (option) {
+      const nameInput = document.getElementById('provider-name');
+      const urlInput = document.getElementById('provider-base-url');
+      const baseUrl = option.dataset.baseUrl || '';
+      if (baseUrl && urlInput) urlInput.value = baseUrl;
+      if (baseUrl && nameInput) nameInput.value = option.textContent.trim();
+    }
+    const preset = (state.providerPresets || []).find((item) => item.id === target.value);
+    const warningBox = document.getElementById('provider-preset-warning');
+    const confirmRow = document.getElementById('provider-preset-confirm-row');
+    const confirmInput = document.getElementById('provider-preset-confirm');
+    if (warningBox) {
+      warningBox.hidden = !preset?.warning;
+      warningBox.textContent = preset?.warning || '';
+    }
+    if (confirmRow) confirmRow.hidden = !preset?.warning;
+    if (confirmInput) confirmInput.checked = false;
+  }
+  if (target.matches('#channel-provider')) {
+    const provider = (state.providers || []).find((item) => item.id === target.value);
+    const isCommandCode = provider?.kind === 'command_code';
+    const panel = document.querySelector('[data-cc-login-panel]');
+    if (panel) panel.hidden = !isCommandCode;
+    const keyInput = document.getElementById('channel-api-key');
+    if (keyInput) keyInput.required = !isCommandCode && !target.closest('form')?.dataset?.channelId;
+    stopCommandCodeLoginPolling();
+    state.ccLogin = { status: 'idle' };
+    paintCommandCodeLogin();
+  }
+  if (target.matches('#command-code-enabled')) {
+    const warning = document.querySelector('[data-command-code-warning]');
+    const confirmRow = document.querySelector('[data-command-code-confirm-row]');
+    const confirmInput = document.querySelector('[data-command-code-confirm]');
+    if (warning) warning.hidden = !target.checked;
+    if (confirmRow) confirmRow.hidden = !target.checked;
+    if (confirmInput) confirmInput.checked = false;
+  }
   if (target.matches('[data-trust-toggle]')) {
     const keyArea = document.getElementById('access-keys');
     const description = document.getElementById('trust-description');
@@ -2055,6 +2342,10 @@ document.addEventListener('keydown', (event) => {
 });
 document.addEventListener('submit', handleSubmit);
 document.addEventListener('change', handleChange);
+elements.modal.addEventListener('close', () => {
+  stopCommandCodeLoginPolling();
+  state.ccLogin = { status: 'idle' };
+});
 document.addEventListener('input', (event) => {
   if (event.target.closest('[data-form="caps"]')) refreshCapsPreview();
 });
