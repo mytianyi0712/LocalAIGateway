@@ -54,6 +54,49 @@ pub trait ProtocolAdapter {
     /// Public gateway-error body shape for this protocol.
     fn error_shape(&self, status: StatusCode, code: &str, message: &str, request_id: &str)
     -> Value;
+    /// Rewrite the outbound model id for a single candidate. Returns the
+    /// (possibly unchanged) request path and, only when the body actually
+    /// changed, the new body — `None` means "keep the original bytes".
+    ///
+    /// Callers invoke this **only** when the gateway-facing model differs from
+    /// the candidate's upstream `channel_models.model_id`, so the ordinary
+    /// byte-exact passthrough never re-serializes the request.
+    fn retarget_model(&self, path: &str, body: &[u8], model: &str) -> (String, Option<Vec<u8>>) {
+        (path.to_owned(), set_json_model(body, model))
+    }
+}
+
+/// Set the top-level `model` field of a JSON request body, preserving every
+/// other field. `None` when the body is not a JSON object (callers then keep
+/// the original bytes).
+fn set_json_model(body: &[u8], model: &str) -> Option<Vec<u8>> {
+    let mut value: Value = serde_json::from_slice(body).ok()?;
+    value.as_object_mut()?;
+    value["model"] = json!(model);
+    serde_json::to_vec(&value).ok()
+}
+
+/// Percent-encode characters reserved in the Gemini `/models/{model}` path
+/// segment, mirroring the `percent_decode_str` used in `inspect_request`.
+fn encode_path_segment(model: &str) -> String {
+    const UNRESERVED: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    percent_encoding::utf8_percent_encode(model, UNRESERVED).to_string()
+}
+
+/// Replace the `{model}` segment of `/…/models/{model}:action`, preserving the
+/// action suffix and any inline query. Unknown shapes return the path unchanged.
+fn rewrite_path_model(path: &str, model: &str) -> String {
+    let Some(marker) = path.find("/models/") else {
+        return path.to_owned();
+    };
+    let start = marker + "/models/".len();
+    let rest = &path[start..];
+    let end = rest.find([':', '/', '?']).unwrap_or(rest.len());
+    format!("{}{}{}", &path[..start], encode_path_segment(model), &rest[end..])
 }
 
 /// Shared OpenAI-family behaviors (chat completions and Responses).
@@ -367,6 +410,10 @@ impl ProtocolAdapter for GeminiAdapter {
             || query.unwrap_or_default().contains("alt=sse");
         (model, stream)
     }
+    /// Gemini carries the model in the URL path, not the body.
+    fn retarget_model(&self, path: &str, _body: &[u8], model: &str) -> (String, Option<Vec<u8>>) {
+        (rewrite_path_model(path, model), None)
+    }
     fn discovery_path(&self) -> &'static str {
         "/v1beta/models"
     }
@@ -481,6 +528,22 @@ impl ProtocolAdapter for CommandCodeAdapter {
             .and_then(Value::as_bool)
             .unwrap_or(true);
         (model, stream)
+    }
+    fn retarget_model(&self, path: &str, body: &[u8], model: &str) -> (String, Option<Vec<u8>>) {
+        let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
+            return (path.to_owned(), None);
+        };
+        let Some(object) = value.as_object_mut() else {
+            return (path.to_owned(), None);
+        };
+        // `/alpha/generate` nests the fields under `params`; the provider API
+        // body keeps `model` at the root (mirrors `inspect_request`).
+        if let Some(params) = object.get_mut("params").and_then(Value::as_object_mut) {
+            params.insert("model".to_owned(), Value::String(model.to_owned()));
+        } else {
+            object.insert("model".to_owned(), Value::String(model.to_owned()));
+        }
+        (path.to_owned(), serde_json::to_vec(&value).ok())
     }
     /// Official Provider API catalog (OpenAI shape).
     fn discovery_path(&self) -> &'static str {
@@ -983,6 +1046,19 @@ pub fn discovery_path(protocol: &str) -> &'static str {
         .unwrap_or("/v1/models")
 }
 
+/// Per-candidate upstream model rewrite (custom models). `None` body means the
+/// body is unchanged and the caller keeps its original bytes.
+pub fn retarget_model(
+    protocol: &str,
+    path: &str,
+    body: &[u8],
+    model: &str,
+) -> (String, Option<Vec<u8>>) {
+    ProtocolId::parse(protocol)
+        .map(|id| id.adapter().retarget_model(path, body, model))
+        .unwrap_or_else(|| (path.to_owned(), None))
+}
+
 /// Catalog parsing via the protocol adapter (P2-3).
 pub fn parse_catalog(
     protocol: &str,
@@ -1051,6 +1127,95 @@ mod tests {
             ProtocolId::CommandCode.discovery_path(),
             "/provider/v1/models"
         );
+    }
+
+    /// Per-candidate model rewrite: body-carried protocols patch only `model`,
+    /// gemini patches the path segment, command code patches `params.model`.
+    #[test]
+    fn retarget_model_rewrites_body_per_protocol() {
+        let body = br#"{"model":"my-gpt","messages":[],"temperature":0.5}"#;
+        let (path, rewritten) = retarget_model("openai_compatible", "/v1/chat/completions", body, "gpt-4o");
+        assert_eq!(path, "/v1/chat/completions");
+        let value: Value = serde_json::from_slice(rewritten.as_deref().unwrap()).unwrap();
+        assert_eq!(value["model"], json!("gpt-4o"));
+        assert_eq!(value["temperature"], json!(0.5));
+
+        let (_, rewritten) = retarget_model("claude", "/v1/messages", body, "claude-sonnet-5");
+        let value: Value = serde_json::from_slice(rewritten.as_deref().unwrap()).unwrap();
+        assert_eq!(value["model"], json!("claude-sonnet-5"));
+
+        let (_, rewritten) = retarget_model("openai_responses", "/v1/responses", body, "gpt-5");
+        let value: Value = serde_json::from_slice(rewritten.as_deref().unwrap()).unwrap();
+        assert_eq!(value["model"], json!("gpt-5"));
+    }
+
+    #[test]
+    fn retarget_model_handles_command_code_nested_and_flat() {
+        let (_, rewritten) = retarget_model(
+            "command_code",
+            "/alpha/generate",
+            br#"{"params":{"model":"old","stream":true}}"#,
+            "deepseek/real",
+        );
+        let value: Value = serde_json::from_slice(rewritten.as_deref().unwrap()).unwrap();
+        assert_eq!(value["params"]["model"], json!("deepseek/real"));
+        assert_eq!(value["params"]["stream"], json!(true));
+
+        let (_, rewritten) = retarget_model(
+            "command_code",
+            "/provider/v1/chat/completions",
+            br#"{"model":"old"}"#,
+            "real",
+        );
+        let value: Value = serde_json::from_slice(rewritten.as_deref().unwrap()).unwrap();
+        assert_eq!(value["model"], json!("real"));
+    }
+
+    #[test]
+    fn retarget_model_rewrites_gemini_path_only() {
+        let body = br#"{"contents":[]}"#;
+        let (path, rewritten) = retarget_model(
+            "gemini",
+            "/v1beta/models/my-gpt:generateContent",
+            body,
+            "gemini-2.5-pro",
+        );
+        assert_eq!(path, "/v1beta/models/gemini-2.5-pro:generateContent");
+        assert!(rewritten.is_none(), "gemini carries the model in the path");
+
+        let (path, _) = retarget_model(
+            "gemini",
+            "/v1beta/models/my-gpt:streamGenerateContent?alt=sse",
+            body,
+            "gemini-2.5-pro",
+        );
+        assert_eq!(
+            path,
+            "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+        );
+
+        let (path, _) = retarget_model(
+            "gemini",
+            "/v1beta/models/models%2Fgemini-pro:generateContent",
+            body,
+            "a b/c",
+        );
+        assert_eq!(path, "/v1beta/models/a%20b%2Fc:generateContent");
+    }
+
+    #[test]
+    fn retarget_model_leaves_non_object_bodies_untouched() {
+        // Non-JSON / non-object bodies keep the original bytes (byte-exact
+        // passthrough path must never be broken).
+        let (path, rewritten) = retarget_model("openai_compatible", "/v1/chat/completions", b"not json", "x");
+        assert_eq!(path, "/v1/chat/completions");
+        assert!(rewritten.is_none());
+        let (_, rewritten) = retarget_model("openai_compatible", "/v1/chat/completions", b"[1,2]", "x");
+        assert!(rewritten.is_none());
+        // Unknown protocols never touch the request.
+        let (path, rewritten) = retarget_model("bogus", "/x", br#"{"model":"a"}"#, "b");
+        assert_eq!(path, "/x");
+        assert!(rewritten.is_none());
     }
 
     /// Identity headers are complete, W3C-shaped and kind-gated: a provider

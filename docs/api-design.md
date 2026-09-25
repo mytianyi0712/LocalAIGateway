@@ -297,7 +297,7 @@ New API 有两种取数模式：只配置渠道 API Key（`sk-`）时查询 `/ap
 | `POST` | `/channels/{channel_id}/discover-models` | 异步执行上游模型探测 |
 | `GET` | `/channels/{channel_id}/discovery-runs` | 查询该渠道探测历史 |
 | `GET` | `/discovery-runs/{run_id}` | 查询单次探测状态 |
-| `GET` | `/channel-models` | 查询所有渠道模型 |
+| `GET` | `/channel-models` | 查询所有渠道模型（每条附带 `available`、`channel_enabled`、`health_state`） |
 | `POST` | `/channels/{channel_id}/models` | 手动添加模型 |
 | `PATCH` | `/channel-models/{channel_model_id}` | 修改手动显示名或可用状态 |
 | `DELETE` | `/channel-models/{channel_model_id}` | 删除未被路由引用的手动模型 |
@@ -361,6 +361,8 @@ Command Code 渠道的探测端点是 `GET /provider/v1/models`。Go 套餐下�
       "channel_model_id": "channel-model-a",
       "channel_id": "channel-a",
       "provider_name": "Provider A",
+      "model_id": "gpt-4.1-mini",
+      "display_name": "GPT 4.1 Mini",
       "priority": 0,
       "protocols": ["openai_compatible", "openai_responses"],
       "enabled": true,
@@ -370,6 +372,8 @@ Command Code 渠道的探测端点是 `GET /provider/v1/models`。Go 套餐下�
       "channel_model_id": "channel-model-b",
       "channel_id": "channel-b",
       "provider_name": "Provider B",
+      "model_id": "gpt-4.1-mini-2025",
+      "display_name": "GPT 4.1 Mini (B)",
       "priority": 1,
       "protocols": ["openai_responses"],
       "enabled": true,
@@ -394,10 +398,13 @@ Command Code 渠道的探测端点是 `GET /provider/v1/models`。Go 套餐下�
 
 ```json
 {
-  "requested_model_id": "gpt-4.1-mini",
+  "requested_model_id": "my-gpt",
+  "protocols": ["openai_compatible", "openai_responses"],
   "enabled": true
 }
 ```
+
+`requested_model_id` 是网关对外暴露的模型 ID，可以是自定义名。省略 `protocols` 时按「存在该 `model_id` 的可用渠道模型」自动推导（保持旧行为）；提供 `protocols` 时按其创建（去重、校验协议合法性），因此自定义模型必须提供 `protocols`。
 
 替换候选列表：
 
@@ -415,7 +422,7 @@ Command Code 渠道的探测端点是 `GET /provider/v1/models`。Go 套餐下�
 - `priority` 不重复且大于等于 0。
 - `channel_model_id` 不重复。
 - 每个渠道模型至少支持逻辑路由的一个协议。
-- 每个渠道模型的原始模型 ID 与 `requested_model_id` 一致。
+- 渠道模型必须存在且 `available=1`；其原始模型 ID **不必**等于 `requested_model_id`——转发时会按该候选的上游 `model_id` 改写请求的 `model`（Gemini 改写路径段），因此可以把多个 ID 不同的上游模型合并到同一个自定义模型下。
 - 同一优先级会写入该渠道实际支持的各内部协议路由。例如 A=`0`、B=`2` 支持 Chat/Responses，C=`1` 仅支持 Responses：Chat 顺序为 A→B，Responses 顺序为 A→C→B。
 
 任一条件不满足时整个操作失败，原顺序保持不变。

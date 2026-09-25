@@ -118,6 +118,8 @@ Python `adapters/convert.py`（2859 行）vs Rust `convert.rs`（539 行）：
 | 流式转换 | 逐事件、工具按 id/index 合并、usage 采集、error_event | 整体缓冲后合成固定事件序列；message_delta usage 恒 0；无 error_event | 增量、工具、usage |
 
 > 注：同协议映射（claude→claude、responses→responses）两侧均为纯透传，行为一致。
+>
+> 注（Rust 特有，本文档其余部分不覆盖）：Rust 端支持**自定义模型**——路由名与候选上游 `model_id` 可以不同，转发时按命中候选改写请求体的 `model`（Gemini 改写路径段）。Python 端没有该能力（其候选模型 ID 必须等于路由名）。仅在两者不同时才会重新序列化请求体；相同时仍是逐字节透传，因此两侧的透传一致性结论对既有配置依然成立。
 
 ---
 

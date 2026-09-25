@@ -551,7 +551,13 @@ struct AttemptEnv<'a> {
     entry_protocol: &'a str,
     entry_model: &'a str,
     upstream_protocol: &'a str,
+    /// Model id actually sent upstream for this candidate (recorded in attempt
+    /// telemetry). Equals `response_model` for ordinary routes; for a custom
+    /// model it is the candidate's real `channel_models.model_id`.
     upstream_model: &'a str,
+    /// Route-level (gateway-facing) model name used to stamp converted
+    /// responses — Command Code decoding and mapped streams only.
+    response_model: &'a str,
     /// Mapped entry target, when this attempt runs on a mapping entry.
     mapping: Option<&'a routing::MappingTarget>,
     /// Command Code transport actually used for this attempt:
@@ -1212,6 +1218,7 @@ async fn mapped_stream(
         entry_model,
         upstream_protocol,
         upstream_model,
+        response_model,
         command_code_transport,
         candidates_len,
         ..
@@ -1227,7 +1234,7 @@ async fn mapped_stream(
         upstream_protocol
     };
     let mut adapter =
-        UpstreamStreamAdapter::new(upstream_protocol, command_code_transport, upstream_model);
+        UpstreamStreamAdapter::new(upstream_protocol, command_code_transport, response_model);
     // Absolute first-token window anchored at attempt start (P1-1): a slow
     // response head cannot extend it.
     let first_token_deadline = attempt_started_instant
@@ -3449,6 +3456,11 @@ impl ProxyService {
         let mut attempts = 0i64;
         'candidates: for (index, candidate) in candidates.iter().enumerate() {
             attempts = index as i64 + 1;
+            // Custom models: the gateway-facing route name may differ from this
+            // candidate's real upstream id. Only rewrite when they differ, so
+            // the ordinary byte-exact passthrough body is never re-serialized.
+            let candidate_model: Option<&str> =
+                (candidate.model_id != upstream_model).then_some(candidate.model_id.as_str());
             // Entering a backup candidate means the previous one failed:
             // alert the user. Remote-compaction failover is silent by design
             // (P2-remote-compaction): the Codex client itself retries/falls
@@ -3505,7 +3517,7 @@ impl ProxyService {
                         Usage::default(),
                         0,
                         Some(upstream_protocol.into()),
-                        Some(upstream_model.into()),
+                        Some(candidate.model_id.clone()),
                         compaction_mode.is_none(),
                     );
                     let _ = error;
@@ -3557,6 +3569,20 @@ impl ProxyService {
                             .unwrap_or_else(|| path.clone()),
                         converted_body.clone(),
                     )
+                };
+                // Rewrite after `mapped_path` (which re-inserts the mapping's
+                // model for gemini) so the candidate's real id wins.
+                let (target_path, request_body) = match candidate_model {
+                    Some(model) => {
+                        let (path, body) = protocol::retarget_model(
+                            upstream_protocol,
+                            &target_path,
+                            &request_body,
+                            model,
+                        );
+                        (path, body.map(Bytes::from).unwrap_or(request_body))
+                    }
+                    None => (target_path, request_body),
                 };
                 let target_url = match protocol::upstream_url(
                     &candidate.base_url,
@@ -3694,7 +3720,7 @@ impl ProxyService {
                                 Usage::default(),
                                 0,
                                 Some(upstream_protocol.into()),
-                                Some(upstream_model.into()),
+                                Some(candidate.model_id.clone()),
                                 compaction_mode.is_none(),
                             );
                             continue 'candidates;
@@ -3746,7 +3772,7 @@ impl ProxyService {
                             Usage::default(),
                             0,
                             Some(upstream_protocol.into()),
-                            Some(upstream_model.into()),
+                            Some(candidate.model_id.clone()),
                             compaction_mode.is_none(),
                         );
                         continue 'candidates;
@@ -3777,7 +3803,7 @@ impl ProxyService {
                             Usage::default(),
                             0,
                             Some(upstream_protocol.into()),
-                            Some(upstream_model.into()),
+                            Some(candidate.model_id.clone()),
                             compaction_mode.is_none(),
                         );
                         continue 'candidates;
@@ -3808,7 +3834,7 @@ impl ProxyService {
                             Usage::default(),
                             0,
                             Some(upstream_protocol.into()),
-                            Some(upstream_model.into()),
+                            Some(candidate.model_id.clone()),
                             compaction_mode.is_none(),
                         );
                         continue 'candidates;
@@ -3893,7 +3919,8 @@ impl ProxyService {
                     entry_protocol,
                     entry_model: &entry_model,
                     upstream_protocol,
-                    upstream_model,
+                    upstream_model: candidate.model_id.as_str(),
+                    response_model: upstream_model,
                     mapping: mapping.as_ref(),
                     candidates_len: candidates.len() as i64,
                     command_code_transport: cc_transport_used,
@@ -3937,7 +3964,8 @@ impl ProxyService {
                         entry_protocol,
                         entry_model: &entry_model,
                         upstream_protocol,
-                        upstream_model,
+                        upstream_model: candidate.model_id.as_str(),
+                        response_model: upstream_model,
                         mapping: mapping.as_ref(),
                         candidates_len: candidates.len() as i64,
                         command_code_transport: cc_transport_used,
@@ -3967,7 +3995,8 @@ impl ProxyService {
                         entry_protocol,
                         entry_model: &entry_model,
                         upstream_protocol,
-                        upstream_model,
+                        upstream_model: candidate.model_id.as_str(),
+                        response_model: upstream_model,
                         mapping: mapping.as_ref(),
                         candidates_len: candidates.len() as i64,
                         command_code_transport: cc_transport_used,
@@ -3994,7 +4023,8 @@ impl ProxyService {
                     entry_protocol,
                     entry_model: &entry_model,
                     upstream_protocol,
-                    upstream_model,
+                    upstream_model: candidate.model_id.as_str(),
+                    response_model: upstream_model,
                     mapping: mapping.as_ref(),
                     candidates_len: candidates.len() as i64,
                     command_code_transport: cc_transport_used,
@@ -4084,7 +4114,7 @@ impl ProxyService {
                 Usage::default(),
                 raw.len() as i64,
                 Some(upstream_protocol.into()),
-                Some(upstream_model.into()),
+                Some(candidate.model_id.clone()),
                 countable,
             );
             last_error = Some((status, response_headers, raw, candidate.channel_id.clone()));
@@ -7760,6 +7790,169 @@ mod tests {
                 .and_then(Value::as_i64),
             Some(100)
         );
+        gateway.shutdown().await;
+    }
+
+    /// Upstream that captures the complete request (headers + body) so a test
+    /// can assert exactly which bytes the gateway forwarded.
+    async fn spawn_upstream_capturing_request(
+    ) -> (u16, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let head_end = loop {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+                    let length: usize = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse().ok())
+                        .unwrap_or(0);
+                    while buf.len() < head_end + length {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let _ = tx.send(buf);
+                    let response = json_ok_upstream(
+                        r#"{"choices":[{"finish_reason":"stop","message":{"content":"OK"}}]}"#,
+                    );
+                    let _ = stream.write_all(&response).await;
+                });
+            }
+        });
+        (port, rx)
+    }
+
+    fn captured_body(request: &[u8]) -> Vec<u8> {
+        let head_end = request
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("captured request must carry headers")
+            + 4;
+        request[head_end..].to_vec()
+    }
+
+    fn raw_chat_request(model: &str, body: &[u8]) -> axum::extract::Request {
+        let payload = if body.is_empty() {
+            format!(r#"{{"model":"{model}","stream":false,"messages":[{{"role":"user","content":"hi"}}]}}"#)
+                .into_bytes()
+        } else {
+            body.to_vec()
+        };
+        axum::extract::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(payload))
+            .unwrap()
+    }
+
+    /// A custom model (gateway-facing id != upstream id) reaches the upstream
+    /// with the candidate's real model id.
+    #[tokio::test]
+    async fn custom_model_rewrites_upstream_model_id() {
+        let (port, mut bodies) = spawn_upstream_capturing_request().await;
+        let gateway = test_gateway(port, &[]).await;
+        sqlx::query("UPDATE model_routes SET requested_model_id='my-gpt' WHERE id='route-1'")
+            .execute(gateway.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE channel_models SET model_id='gpt-4o' WHERE id='cm-1'")
+            .execute(gateway.db.pool())
+            .await
+            .unwrap();
+
+        let response = gateway
+            .state
+            .proxy
+            .proxy(raw_chat_request("my-gpt", &[]), "openai_compatible", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let captured = tokio::time::timeout(Duration::from_secs(5), bodies.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let body = String::from_utf8(captured_body(&captured)).unwrap();
+        assert!(body.contains(r#""model":"gpt-4o""#), "body: {body}");
+        assert!(!body.contains("my-gpt"), "body: {body}");
+        gateway.shutdown().await;
+    }
+
+    /// The ordinary case (requested id == candidate id) is forwarded
+    /// byte-for-byte, including unusual whitespace, so the passthrough contract
+    /// is preserved for existing configurations.
+    #[tokio::test]
+    async fn matching_model_id_is_forwarded_byte_exact() {
+        let (port, mut bodies) = spawn_upstream_capturing_request().await;
+        let gateway = test_gateway(port, &[]).await;
+        let raw = b"{\n  \"model\" : \"test-model\",\n  \"stream\":false,\n  \"messages\":[]\n}";
+
+        let response = gateway
+            .state
+            .proxy
+            .proxy(
+                raw_chat_request("test-model", raw),
+                "openai_compatible",
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let captured = tokio::time::timeout(Duration::from_secs(5), bodies.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(captured_body(&captured), raw.to_vec());
+        gateway.shutdown().await;
+    }
+
+    /// Attempt telemetry records the model actually sent upstream (not the
+    /// gateway-facing custom name).
+    #[tokio::test]
+    async fn custom_model_records_sent_upstream_model() {
+        let (port, mut bodies) = spawn_upstream_capturing_request().await;
+        let gateway = test_gateway(port, &[]).await;
+        sqlx::query("UPDATE model_routes SET requested_model_id='my-gpt' WHERE id='route-1'")
+            .execute(gateway.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE channel_models SET model_id='gpt-4o' WHERE id='cm-1'")
+            .execute(gateway.db.pool())
+            .await
+            .unwrap();
+
+        let response = gateway
+            .state
+            .proxy
+            .proxy(raw_chat_request("my-gpt", &[]), "openai_compatible", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = bodies.recv().await;
+        wait_for_outcome(&gateway.db, "success", Duration::from_secs(5)).await;
+        let recorded: Option<String> = sqlx::query_scalar(
+            "SELECT upstream_model_id FROM request_attempts ORDER BY started_at DESC, attempt_no DESC LIMIT 1",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(recorded.as_deref(), Some("gpt-4o"));
         gateway.shutdown().await;
     }
 

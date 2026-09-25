@@ -389,7 +389,7 @@ mod tests {
     use super::{
         channels::{ChannelFilter, ChannelInput, ChannelPatch},
         profiles::ProfileInput,
-        routes::{CandidateInput, CandidateList},
+        routes::{CandidateInput, CandidateList, RouteInput},
         stats::{SummaryQuery, format_utc_millis, parse_utc_rfc3339, resolve_token_window},
     };
     use crate::{
@@ -1265,6 +1265,100 @@ mod tests {
             "openai_compatible".into()
         )));
         assert!(rows.contains(&("route-claude".into(), "cm-claude".into(), "claude".into())));
+    }
+
+    /// Custom models: an arbitrary route name can be created with explicit
+    /// protocols, and its candidates may carry a *different* upstream model id
+    /// (the gateway rewrites the outbound `model` per candidate).
+    #[tokio::test]
+    async fn create_custom_route_accepts_differing_model_candidates() {
+        let (state, _dir) = test_state().await;
+        let time = "2026-08-04T01:00:00+00:00";
+        sqlx::query("INSERT INTO providers(id,name,base_url,created_at,updated_at) VALUES('prov-1','mock','http://127.0.0.1:1',?,?)")
+            .bind(time)
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channels(id,provider_id,name,protocol,api_key_encrypted,api_key_hint,manual_enabled,created_at,updated_at) VALUES('ch-1','prov-1','chan','openai_compatible',x'00','',1,?,?)")
+            .bind(time)
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channel_models(id,channel_id,model_id,display_name,source,available,first_seen_at,created_at,updated_at) VALUES('cm-1','ch-1','gpt-4o','GPT-4o','discovered',1,?,?,?)")
+            .bind(time)
+            .bind(time)
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channel_model_protocols(channel_model_id,protocol) VALUES('cm-1','openai_compatible')")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+
+        let created = create_route(
+            AdminAuth,
+            State(state.clone()),
+            Json(RouteInput {
+                protocol: None,
+                protocols: Some(vec!["openai_compatible".into()]),
+                requested_model_id: "my-gpt".into(),
+                enabled: true,
+            }),
+        )
+        .await
+        .expect("a custom model id with explicit protocols must be creatable");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let route_id: String =
+            sqlx::query_scalar("SELECT id FROM model_routes WHERE requested_model_id='my-gpt'")
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap();
+
+        let response = replace_candidates(
+            AdminAuth,
+            State(state.clone()),
+            Path(route_id),
+            Json(CandidateList {
+                candidates: vec![CandidateInput {
+                    channel_model_id: "cm-1".into(),
+                    priority: 0,
+                    enabled: true,
+                }],
+            }),
+        )
+        .await
+        .expect("a candidate with a different upstream model id must be accepted");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bound: String = sqlx::query_scalar(
+            "SELECT cm.model_id FROM route_candidates rc JOIN channel_models cm ON cm.id=rc.channel_model_id LIMIT 1",
+        )
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(bound, "gpt-4o");
+    }
+
+    /// A custom route may be created with no candidates at all; a route with no
+    /// matching channel model is rejected only when protocols are omitted.
+    #[tokio::test]
+    async fn create_route_without_protocols_still_requires_a_channel_model() {
+        let (state, _dir) = test_state().await;
+        let result = create_route(
+            AdminAuth,
+            State(state.clone()),
+            Json(RouteInput {
+                protocol: None,
+                protocols: None,
+                requested_model_id: "ghost-model".into(),
+                enabled: true,
+            }),
+        )
+        .await;
+        let error = result.expect_err("deriving protocols must fail without a channel model");
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     /// P1-7: with a corrupt admin key, the recovery path (healthy keys ->

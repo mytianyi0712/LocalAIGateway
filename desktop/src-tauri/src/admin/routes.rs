@@ -15,10 +15,11 @@ use super::{channels::yes, profiles::get_caps_value};
 
 #[derive(Deserialize)]
 pub(super) struct RouteInput {
-    protocol: Option<String>,
-    requested_model_id: String,
+    pub protocol: Option<String>,
+    pub protocols: Option<Vec<String>>,
+    pub requested_model_id: String,
     #[serde(default = "yes")]
-    enabled: bool,
+    pub enabled: bool,
 }
 #[derive(Deserialize)]
 pub(super) struct RoutePatch {
@@ -49,10 +50,10 @@ pub(super) async fn route_bundle(state: &Context, model_id: &str) -> Result<Valu
     }
     let mut by_model: HashMap<String, Value> = HashMap::new();
     for (route_id, protocol, _, _, _) in &rows {
-        let candidates=sqlx::query("SELECT rc.id,rc.channel_model_id,rc.priority,rc.enabled,cm.channel_id,c.name channel_name,p.name provider_name,h.state,c.manual_enabled FROM route_candidates rc JOIN channel_models cm ON cm.id=rc.channel_model_id JOIN channels c ON c.id=cm.channel_id JOIN providers p ON p.id=c.provider_id LEFT JOIN channel_health h ON h.channel_id=c.id WHERE rc.route_id=? ORDER BY rc.priority,c.name").bind(route_id).fetch_all(state.db.pool()).await?;
+        let candidates=sqlx::query("SELECT rc.id,rc.channel_model_id,rc.priority,rc.enabled,cm.channel_id,cm.model_id,cm.display_name,c.name channel_name,p.name provider_name,h.state,c.manual_enabled FROM route_candidates rc JOIN channel_models cm ON cm.id=rc.channel_model_id JOIN channels c ON c.id=cm.channel_id JOIN providers p ON p.id=c.provider_id LEFT JOIN channel_health h ON h.channel_id=c.id WHERE rc.route_id=? ORDER BY rc.priority,c.name").bind(route_id).fetch_all(state.db.pool()).await?;
         for row in candidates {
             let cmid: String = row.try_get("channel_model_id")?;
-            let candidate=by_model.entry(cmid.clone()).or_insert_with(||json!({"id":row.get::<String,_>("id"),"channel_model_id":cmid,"channel_id":row.get::<String,_>("channel_id"),"channel_name":row.get::<String,_>("channel_name"),"provider_name":row.get::<String,_>("provider_name"),"priority":row.get::<i64,_>("priority"),"enabled":row.get::<bool,_>("enabled"),"health_state":row.get::<Option<String>,_>("state").unwrap_or_else(||"active".into()),"manual_enabled":row.get::<bool,_>("manual_enabled"),"protocols":Vec::<String>::new()}));
+            let candidate=by_model.entry(cmid.clone()).or_insert_with(||json!({"id":row.get::<String,_>("id"),"channel_model_id":cmid,"channel_id":row.get::<String,_>("channel_id"),"channel_name":row.get::<String,_>("channel_name"),"provider_name":row.get::<String,_>("provider_name"),"model_id":row.get::<String,_>("model_id"),"display_name":row.get::<Option<String>,_>("display_name"),"priority":row.get::<i64,_>("priority"),"enabled":row.get::<bool,_>("enabled"),"health_state":row.get::<Option<String>,_>("state").unwrap_or_else(||"active".into()),"manual_enabled":row.get::<bool,_>("manual_enabled"),"protocols":Vec::<String>::new()}));
             let object = candidate.as_object_mut().expect("candidate object");
             let current = object.get("priority").and_then(Value::as_i64).unwrap_or(0);
             object.insert(
@@ -117,11 +118,23 @@ pub(super) async fn create_route(
     Json(input): Json<RouteInput>,
 ) -> ApiResult {
     validate_text(&input.requested_model_id, "requested_model_id", 255)?;
-    let protocols = if let Some(protocol) = input.protocol {
-        if !valid_protocol(&protocol) {
+    // Custom models supply their protocols explicitly; a route name that has no
+    // matching channel model would otherwise be unreachable (empty derivation).
+    let explicit: Option<Vec<String>> = input
+        .protocols
+        .filter(|items| !items.is_empty())
+        .or_else(|| input.protocol.map(|protocol| vec![protocol]));
+    let protocols = if let Some(items) = explicit {
+        if items.iter().any(|protocol| !valid_protocol(protocol)) {
             return Err(ApiError::validation("Unsupported protocol"));
         }
-        vec![protocol]
+        let mut unique: Vec<String> = Vec::new();
+        for protocol in items {
+            if !unique.contains(&protocol) {
+                unique.push(protocol);
+            }
+        }
+        unique
     } else {
         let values:Vec<String>=sqlx::query_scalar("SELECT DISTINCT cmp.protocol FROM channel_models cm JOIN channel_model_protocols cmp ON cmp.channel_model_id=cm.id WHERE cm.model_id=? AND cm.available=1").bind(&input.requested_model_id).fetch_all(state.db.pool()).await?;
         PROTOCOL_ORDER
@@ -200,19 +213,22 @@ pub(super) async fn replace_candidates(
         .map(|(_, p, _, _, _)| p)
         .collect();
     for item in &input.candidates {
-        let model_info: Option<(String, bool)> =
-            sqlx::query_as("SELECT model_id,available FROM channel_models WHERE id=?")
+        let available: Option<bool> =
+            sqlx::query_scalar("SELECT available FROM channel_models WHERE id=?")
                 .bind(&item.channel_model_id)
                 .fetch_optional(state.db.pool())
                 .await?;
-        let Some((upstream, available)) = model_info else {
+        let Some(available) = available else {
             return Err(ApiError::validation(
                 "One or more channel models do not exist",
             ));
         };
-        if upstream != model || !available {
+        // Custom models may bind candidates whose upstream `model_id` differs
+        // from `requested_model_id` (the gateway rewrites the outbound model per
+        // candidate), so only availability and protocol support are enforced.
+        if !available {
             return Err(ApiError::validation(
-                "Candidate protocol and model must match the route",
+                "One or more channel models are not available",
             ));
         }
         // P2-6: a candidate whose channel model supports none of the route's

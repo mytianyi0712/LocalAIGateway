@@ -24,11 +24,13 @@ pub(super) struct ModelRow {
     source: String,
     available: bool,
     last_seen_at: Option<String>,
+    channel_enabled: bool,
+    health_state: Option<String>,
 }
 pub(super) async fn model_json(state: &Context, row: ModelRow) -> Result<Value, ApiError> {
     let protocols:Vec<String>=sqlx::query_scalar("SELECT protocol FROM channel_model_protocols WHERE channel_model_id=? ORDER BY CASE protocol WHEN 'openai_compatible' THEN 0 WHEN 'openai_responses' THEN 1 WHEN 'claude' THEN 2 WHEN 'command_code' THEN 4 ELSE 3 END").bind(&row.id).fetch_all(state.db.pool()).await?;
     Ok(
-        json!({"id":row.id,"channel_id":row.channel_id,"channel_name":row.channel_name,"protocol":protocols.first(),"protocols":protocols,"model_id":row.model_id,"display_name":row.display_name,"source":row.source,"available":row.available,"last_seen_at":row.last_seen_at}),
+        json!({"id":row.id,"channel_id":row.channel_id,"channel_name":row.channel_name,"protocol":protocols.first(),"protocols":protocols,"model_id":row.model_id,"display_name":row.display_name,"source":row.source,"available":row.available,"last_seen_at":row.last_seen_at,"channel_enabled":row.channel_enabled,"health_state":row.health_state.unwrap_or_else(||"active".into())}),
     )
 }
 #[derive(Deserialize, Default)]
@@ -41,7 +43,7 @@ pub(super) async fn list_channel_models(
     State(state): State<Context>,
     Query(filter): Query<ModelFilter>,
 ) -> ApiResult {
-    let rows=sqlx::query_as::<_,ModelRow>("SELECT DISTINCT cm.id,cm.channel_id,c.name channel_name,cm.model_id,cm.display_name,cm.source,cm.available,cm.last_seen_at FROM channel_models cm JOIN channels c ON c.id=cm.channel_id LEFT JOIN channel_model_protocols cmp ON cmp.channel_model_id=cm.id WHERE (? IS NULL OR cm.channel_id=?) AND (? IS NULL OR cmp.protocol=?) ORDER BY cm.model_id,c.name").bind(&filter.channel_id).bind(&filter.channel_id).bind(&filter.protocol).bind(&filter.protocol).fetch_all(state.db.pool()).await?;
+    let rows=sqlx::query_as::<_,ModelRow>("SELECT DISTINCT cm.id,cm.channel_id,c.name channel_name,cm.model_id,cm.display_name,cm.source,cm.available,cm.last_seen_at,c.manual_enabled channel_enabled,h.state health_state FROM channel_models cm JOIN channels c ON c.id=cm.channel_id LEFT JOIN channel_health h ON h.channel_id=c.id LEFT JOIN channel_model_protocols cmp ON cmp.channel_model_id=cm.id WHERE (? IS NULL OR cm.channel_id=?) AND (? IS NULL OR cmp.protocol=?) ORDER BY cm.model_id,c.name").bind(&filter.channel_id).bind(&filter.channel_id).bind(&filter.protocol).bind(&filter.protocol).fetch_all(state.db.pool()).await?;
     let mut items = Vec::new();
     for row in rows {
         items.push(model_json(&state, row).await?);
@@ -87,7 +89,7 @@ pub(super) async fn create_manual_model(
             .await?;
     }
     tx.commit().await?;
-    let row=sqlx::query_as::<_,ModelRow>("SELECT cm.id,cm.channel_id,c.name channel_name,cm.model_id,cm.display_name,cm.source,cm.available,cm.last_seen_at FROM channel_models cm JOIN channels c ON c.id=cm.channel_id WHERE cm.id=?").bind(&row_id).fetch_one(state.db.pool()).await?;
+    let row=sqlx::query_as::<_,ModelRow>("SELECT cm.id,cm.channel_id,c.name channel_name,cm.model_id,cm.display_name,cm.source,cm.available,cm.last_seen_at,c.manual_enabled channel_enabled,h.state health_state FROM channel_models cm JOIN channels c ON c.id=cm.channel_id LEFT JOIN channel_health h ON h.channel_id=c.id WHERE cm.id=?").bind(&row_id).fetch_one(state.db.pool()).await?;
     Ok(json_response(
         StatusCode::CREATED,
         model_json(&state, row).await?,
@@ -152,7 +154,7 @@ pub(super) async fn patch_channel_model(
         }
     }
     tx.commit().await?;
-    let row=sqlx::query_as::<_,ModelRow>("SELECT cm.id,cm.channel_id,c.name channel_name,cm.model_id,cm.display_name,cm.source,cm.available,cm.last_seen_at FROM channel_models cm JOIN channels c ON c.id=cm.channel_id WHERE cm.id=?").bind(&row_id).fetch_one(state.db.pool()).await?;
+    let row=sqlx::query_as::<_,ModelRow>("SELECT cm.id,cm.channel_id,c.name channel_name,cm.model_id,cm.display_name,cm.source,cm.available,cm.last_seen_at,c.manual_enabled channel_enabled,h.state health_state FROM channel_models cm JOIN channels c ON c.id=cm.channel_id LEFT JOIN channel_health h ON h.channel_id=c.id WHERE cm.id=?").bind(&row_id).fetch_one(state.db.pool()).await?;
     Ok(ok(model_json(&state, row).await?))
 }
 pub(super) async fn delete_channel_model(

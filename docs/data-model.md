@@ -10,7 +10,7 @@
 - API Key 只保存密文。
 - 请求日志与渠道尝试分表，支持一次请求对应多次故障转移。
 - 原始 usage 可以保留，用户请求、响应和错误正文默认不落库。
-- 数据库约束负责保证优先级唯一，服务层负责保证协议和模型 ID 一致。
+- 数据库约束负责保证优先级唯一，服务层负责保证候选协议与路由协议兼容；候选的上游模型 ID 允许与路由名不同（转发时按候选改写请求的 `model`）。
 
 ## 2. 实体关系
 
@@ -142,7 +142,7 @@ erDiagram
 | --- | --- | --- | --- |
 | `id` | TEXT | PK | UUID |
 | `protocol` | TEXT | NOT NULL | 路由协议 |
-| `requested_model_id` | TEXT | NOT NULL | 客户端请求中的原始模型 ID |
+| `requested_model_id` | TEXT | NOT NULL | 客户端请求中的模型 ID；可以是自定义名，不必等于任何上游模型 ID |
 | `enabled` | BOOLEAN | NOT NULL | 路由总开关 |
 | `created_at` | DATETIME | NOT NULL | 创建时间 |
 | `updated_at` | DATETIME | NOT NULL | 更新时间 |
@@ -168,7 +168,7 @@ erDiagram
 - `UNIQUE(route_id, channel_model_id)`
 - `UNIQUE(route_id, priority)`
 
-服务层按模型 ID 接收一份全局渠道优先级，再将每个渠道写入其支持的内部协议路由；同一渠道在各协议路由中保持相同优先级。`channel_models.model_id` 必须等于 `model_routes.requested_model_id`。
+服务层按模型 ID 接收一份全局渠道优先级，再将每个渠道写入其支持的内部协议路由；同一渠道在各协议路由中保持相同优先级。`channel_models.model_id` **不必**等于 `model_routes.requested_model_id`：命中候选后，网关以该候选所属渠道模型的上游 `model_id` 改写转发请求的 `model`（Gemini 改写路径段），两者相同时保持逐字节透传。因此一个自定义模型可以聚合多个 ID 不同的上游模型。
 
 ### 3.6 `model_caps` 与 `capability_profiles`
 

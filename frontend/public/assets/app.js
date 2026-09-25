@@ -8,6 +8,7 @@ import {
   tokenMetric, settingNumberField, pageError, getModalMode,
 } from './ui.js';
 import { getToken, setToken, api, get, post, put, patch, remove, setUnauthorizedHandler } from './api.js';
+import { rankModelMatches } from './model-search.js';
 
 // P2-3: the protocol list is data-driven from /system/protocols (populated
 // into state.protocols at boot); this constant is only the offline fallback
@@ -105,6 +106,9 @@ const state = {
   generatedKeys: null,
   recovery: null,
   drawerRoute: null,
+  candidateView: 'list',
+  candidatePicker: { query: '', channelId: '' },
+  candidateDraft: [],
 };
 
 
@@ -1079,13 +1083,43 @@ async function deleteChannel(channelId) {
   renderIfCurrent(version, renderPage);
 }
 
+// A channel model counts as "supplied" only when the upstream still returns it
+// (available), its channel is manually enabled and it is not circuit-open.
+// Models without a supplier are hidden from the add-route list; already
+// configured routes are never deleted and stay in the routes table.
+function isLiveModel(model) {
+  return Boolean(model.available) && model.channel_enabled !== false && (model.health_state ?? 'active') === 'active';
+}
+
+// model_id -> protocols, unioned across every live supplier channel.
+function liveModelProtocols() {
+  const map = new Map();
+  for (const model of state.channelModels) {
+    if (!isLiveModel(model)) continue;
+    const protocols = map.get(model.model_id) || new Set();
+    for (const protocol of model.protocols || []) protocols.add(protocol);
+    map.set(model.model_id, protocols);
+  }
+  return map;
+}
+
 function routeOptions() {
   const routed = new Set(state.routes.map((route) => route.requested_model_id));
-  const seen = new Set();
-  return state.channelModels
-    .filter((model) => model.available && !routed.has(model.model_id) && !seen.has(model.model_id) && seen.add(model.model_id))
-    .map((model) => model.model_id)
+  return [...liveModelProtocols().keys()]
+    .filter((modelId) => !routed.has(modelId))
     .sort();
+}
+
+// Protocols offered by default for a custom model (Command Code is
+// upstream-only and opt-in, matching the mapping form).
+const ROUTE_DEFAULT_PROTOCOLS = ['openai_compatible', 'openai_responses', 'claude', 'gemini'];
+
+function syncRouteProtocols() {
+  const input = document.getElementById('route-model');
+  if (!input) return;
+  const protocols = liveModelProtocols().get(input.value.trim());
+  if (!protocols) return;
+  document.querySelectorAll('[data-route-protocol]').forEach((box) => { box.checked = protocols.has(box.value); });
 }
 
 async function loadRoutes(version) {
@@ -1115,30 +1149,39 @@ function renderRoutesPage() {
     <td><span class="mono">${escapeHtml(route.requested_model_id)}</span></td>
     <td>${protocols(route.protocols)}</td>
     <td>${capabilitySummary(route.capabilities || {})}</td>
-    <td><div class="route-chain">${route.candidates.length ? route.candidates.map((candidate) => `<span class="route-candidate ${candidate.health_state === 'open' || candidate.manual_enabled === false ? 'is-open' : ''}"><b>P${number(candidate.priority)}</b>${escapeHtml(candidate.channel_name)}</span>`).join('') : '<span class="subtle-text">未配置候选渠道</span>'}</div></td>
+    <td><div class="route-chain">${route.candidates.length ? route.candidates.map((candidate) => `<span class="route-candidate ${candidate.health_state === 'open' || candidate.manual_enabled === false ? 'is-open' : ''}" title="${escapeAttr(candidate.model_id || '')}"><b>P${number(candidate.priority)}</b>${escapeHtml(candidate.channel_name)}${candidate.model_id && candidate.model_id !== route.requested_model_id ? `<code class="route-candidate-model">${escapeHtml(candidate.model_id)}</code>` : ''}</span>`).join('') : '<span class="subtle-text">未配置候选渠道</span>'}</div></td>
     <td class="action-cell"><div class="table-actions">${iconButton({ action: 'edit-caps', iconName: 'settings', label: '配置能力', attrs: `data-route-id="${escapeAttr(route.id)}"` })}${iconButton({ action: 'edit-candidates', iconName: 'pencil', label: '编辑候选', attrs: `data-route-id="${escapeAttr(route.id)}"` })}${iconButton({ action: 'delete-route', iconName: 'trash-2', label: '删除路由', danger: true, attrs: `data-route-id="${escapeAttr(route.id)}"` })}</div></td>
   </tr>`).join('');
   return `<div class="page-stack">
-    ${toolbar('模型候选优先级', '一个模型路由包含跨格式共享的候选顺序', `${button({ action: 'refresh-routes', label: '刷新', iconName: 'refresh-cw' })}${button({ action: 'open-route', label: '添加路由', iconName: 'plus', primary: true, disabled: !options.length })}`)}
-    ${panel('路由表', '优先级 0 最高', `<div class="section-body-flush">${state.routes.length ? `<div class="table-scroll"><table class="data-table routes-table"><thead><tr><th>请求模型</th><th>请求格式</th><th>能力</th><th>候选顺序</th><th class="action-cell">操作</th></tr></thead><tbody>${rows}</tbody></table></div>` : emptyState('尚未创建模型路由', options.length ? '选择一个已探测模型，为它创建统一的路由入口。' : '请先在供应商与渠道页面探测可用模型。', 'route')}</div>`) }
+    ${toolbar('模型候选优先级', '一个模型路由包含跨格式共享的候选顺序', `${button({ action: 'refresh-routes', label: '刷新', iconName: 'refresh-cw' })}${button({ action: 'open-route', label: '添加路由', iconName: 'plus', primary: true })}`)}
+    ${panel('路由表', '优先级 0 最高', `<div class="section-body-flush">${state.routes.length ? `<div class="table-scroll"><table class="data-table routes-table"><thead><tr><th>请求模型</th><th>请求格式</th><th>能力</th><th>候选顺序</th><th class="action-cell">操作</th></tr></thead><tbody>${rows}</tbody></table></div>` : emptyState('尚未创建模型路由', options.length ? '选择一个已探测模型，或填写自定义模型 ID，再为它配置候选渠道。' : '填写一个自定义模型 ID，或先在供应商与渠道页面探测可用模型。', 'route')}</div>`) }
   </div>`;
 }
 
 function routeForm() {
   const options = routeOptions();
+  const protocolBoxes = Object.keys(PROTOCOL_LABELS)
+    .map((protocol) => `<label class="checkbox-row"><input type="checkbox" name="protocols" value="${escapeAttr(protocol)}" data-route-protocol ${ROUTE_DEFAULT_PROTOCOLS.includes(protocol) ? 'checked' : ''}><span>${escapeHtml(protocolLabel(protocol))}</span></label>`)
+    .join('');
   openModal({
     title: '新建模型路由',
     mode: 'route',
-    body: `<form class="form-stack" id="route-form" data-form="route"><div class="field"><label for="route-model">模型</label><select class="select" id="route-model" name="requested_model_id" required><option value="">选择已探测模型</option>${options.map((model) => `<option value="${escapeAttr(model)}">${escapeHtml(model)}</option>`).join('')}</select><span class="field-help">同一模型的候选优先级只需配置一次，网关会按入口格式自动过滤。</span></div></form>`,
+    body: `<form class="form-stack" id="route-form" data-form="route">
+      <div class="field"><label for="route-model">模型 ID</label><input class="input" id="route-model" name="requested_model_id" list="route-model-options" required maxlength="255" placeholder="填写自定义模型 ID，或选择已探测模型" autocomplete="off"><datalist id="route-model-options">${options.map((model) => `<option value="${escapeAttr(model)}"></option>`).join('')}</datalist><span class="field-help">可自由填写网关对外暴露的模型 ID；创建后在候选抽屉中选择「渠道 + 模型」作为请求源，多个 ID 不同的来源可合并到同一个模型。</span></div>
+      <div class="field"><label>请求格式</label><div class="checkbox-grid">${protocolBoxes}</div><span class="field-help">网关按候选各自支持的协议自动过滤；输入已探测模型 ID 时会自动勾选它支持的协议。Command Code 为上游专用，仅在需要映射到此协议时勾选。</span></div>
+    </form>`,
     footer: `${button({ action: 'close-modal', label: '取消' })}${button({ action: 'submit-route', label: '创建', iconName: 'plus', primary: true })}`,
   });
 }
 
 async function saveRoute(form) {
   const ctx = captureContext();
-  const requestedModelId = new FormData(form).get('requested_model_id');
-  if (!requestedModelId) throw new Error('请选择模型');
-  const created = await post('/routes', { requested_model_id: requestedModelId });
+  const values = new FormData(form);
+  const requestedModelId = String(values.get('requested_model_id') || '').trim();
+  if (!requestedModelId) throw new Error('请填写模型 ID');
+  const protocols = values.getAll('protocols');
+  if (!protocols.length) throw new Error('请至少选择一个请求格式');
+  const created = await post('/routes', { requested_model_id: requestedModelId, protocols });
   closeModal();
   toast('模型路由已创建');
   // P2-9: the reload and the drawer only run on the page this mutation
@@ -1295,77 +1338,196 @@ async function detectCapabilities() {
   if (isCurrent(ctx)) await loadRoutes(ctx.renderVersion);
 }
 
+// 候选渠道抽屉（模型 → 渠道）分两层：
+//   1) 列表层只显示「已添加」的候选，可拖拽/方向键排序、单独启停、移除；
+//   2) 选择层由「添加模型」按钮进入，按渠道筛选 + 模型名模糊搜索，默认
+//      填入当前模型名，结果按相似度排序。
+// 两层改动都只落在 state.candidateDraft 上，点「保存」才 PUT 覆盖候选。
+
+// 一次最多渲染的搜索结果；其余靠细化关键词或渠道筛选收敛。
+const CANDIDATE_RESULT_LIMIT = 60;
+
+function routeProtocolSet(route) {
+  return new Set(route.protocols || []);
+}
+
+// 候选池 = 仍可用的渠道模型（上游可见、渠道启用、未熔断）且至少支持路由的
+// 一个请求格式；不可用的模型不会出现在搜索结果里。
+function candidatePool(route) {
+  const wanted = routeProtocolSet(route);
+  return state.channelModels.filter((model) => isLiveModel(model) && (model.protocols || []).some((protocol) => wanted.has(protocol)));
+}
+
+// 已添加候选的展示数据；渠道或渠道模型已被删除时退化为路由快照，仍可移除。
+function candidateEntry(route, channelModelId) {
+  const live = state.channelModels.find((model) => model.id === channelModelId);
+  if (live) return { ...live, live: isLiveModel(live) };
+  const snapshot = route.candidates.find((candidate) => candidate.channel_model_id === channelModelId);
+  if (!snapshot) return null;
+  return {
+    id: channelModelId,
+    channel_id: snapshot.channel_id,
+    channel_name: snapshot.channel_name,
+    model_id: snapshot.model_id,
+    display_name: snapshot.display_name,
+    protocols: snapshot.protocols || [],
+    live: false,
+  };
+}
+
 function openCandidates(routeId) {
   const route = state.routes.find((item) => item.id === routeId);
   if (!route) return;
   state.drawerRoute = route;
-  const current = new Map(route.candidates.map((candidate) => [candidate.channel_model_id, candidate]));
-  const candidates = state.channelModels
-    .filter((model) => model.available && model.model_id === route.requested_model_id)
-    .map((model) => ({ ...model, existing: current.get(model.id) }))
-    .sort((a, b) => {
-      if (a.existing && b.existing) return a.existing.priority - b.existing.priority;
-      if (a.existing) return -1;
-      if (b.existing) return 1;
-      return (a.channel_name || '').localeCompare(b.channel_name || '');
-    });
-  let visiblePriority = 1;
-  const rows = candidates.map((candidate) => {
-    const selected = Boolean(candidate.existing);
-    return `<div class="candidate-row ${selected ? 'is-selected' : ''}" data-candidate-row data-model-id="${escapeAttr(candidate.id)}">
-      <button class="candidate-drag-handle" type="button" data-candidate-drag-handle data-model-id="${escapeAttr(candidate.id)}" aria-label="调整 ${escapeAttr(candidate.channel_name)} 的顺序" title="拖动调整顺序；可用上下方向键移动" ${selected ? 'draggable="true"' : 'disabled'}>${icon('grip-vertical')}</button>
-      <span class="candidate-order" data-candidate-order>${selected ? number(visiblePriority++) : '-'}</span>
-      <label class="checkbox-row"><input type="checkbox" data-candidate-selected data-model-id="${escapeAttr(candidate.id)}" ${selected ? 'checked' : ''}><span><strong>${escapeHtml(candidate.channel_name)}</strong><small class="subtle-text">${escapeHtml((candidate.protocols || [candidate.protocol]).join(' / '))}</small></span></label>
-      <input class="switch-control" type="checkbox" aria-label="启用 ${escapeAttr(candidate.channel_name)}" data-candidate-enabled data-model-id="${escapeAttr(candidate.id)}" ${candidate.existing?.enabled !== false ? 'checked' : ''} ${selected ? '' : 'disabled'}>
-    </div>`;
-  }).join('');
-  openDrawer({
-    title: route.requested_model_id,
-    subtitle: '列表越靠上，调度优先级越高',
-    body: `<section class="drawer-section"><h3>候选渠道</h3><div class="candidate-list" data-candidate-list>${rows || emptyState('没有可用候选渠道', '当前模型没有可用的上游渠道。', 'route')}</div></section>`,
-    footer: `${button({ action: 'close-drawer', label: '取消' })}${button({ action: 'save-candidates', label: '保存顺序', iconName: 'check', primary: true })}`,
-  });
+  state.candidateView = 'list';
+  state.candidatePicker = { query: route.requested_model_id || '', channelId: '' };
+  state.candidateDraft = [...route.candidates]
+    .sort((a, b) => a.priority - b.priority)
+    .map((candidate) => ({ channel_model_id: candidate.channel_model_id, enabled: candidate.enabled !== false }));
+  renderCandidateDrawer();
 }
 
-async function saveCandidates() {
-  const ctx = captureContext();
+function renderCandidateDrawer() {
   const route = state.drawerRoute;
   if (!route) return;
-  const candidates = [...elements.drawerBody.querySelectorAll('[data-candidate-row]')]
-    .filter((row) => row.querySelector('[data-candidate-selected]').checked)
-    .map((row, priority) => {
-      const modelId = row.dataset.modelId;
-      const enabledInput = row.querySelector('[data-candidate-enabled]');
-      return { channel_model_id: modelId, priority, enabled: enabledInput.checked };
+  const picker = state.candidateView === 'picker';
+  openDrawer({
+    title: route.requested_model_id,
+    subtitle: picker ? '按渠道筛选或搜索模型名，逐条添加到候选' : '列表越靠上调度优先级越高；可单独启停每个候选',
+    body: picker ? candidatePickerMarkup(route) : candidateListMarkup(route),
+    footer: picker
+      ? button({ action: 'close-candidate-picker', label: '返回候选列表', iconName: 'arrow-left' })
+      : `${button({ action: 'close-drawer', label: '取消' })}${button({ action: 'open-candidate-picker', label: '添加模型', iconName: 'plus' })}${button({ action: 'save-candidates', label: '保存', iconName: 'check', primary: true })}`,
   });
-  await put(`/routes/${route.id}/candidates`, { candidates });
-  closeDrawer();
-  toast('候选顺序已保存');
-  if (isCurrent(ctx)) await loadRoutes(ctx.renderVersion);
+  if (!picker) return;
+  const input = elements.drawerBody.querySelector('[data-candidate-query]');
+  if (input) {
+    input.focus();
+    input.select();
+  }
+  refreshCandidateResults();
 }
 
+function candidateRowMarkup(route, entry, index) {
+  const model = candidateEntry(route, entry.channel_model_id);
+  if (!model) return '';
+  const label = `${model.channel_name} / ${model.model_id}`;
+  return `<div class="candidate-row ${model.live ? '' : 'is-unavailable'}" data-candidate-row data-model-id="${escapeAttr(model.id)}">
+      <button class="candidate-drag-handle" type="button" data-candidate-drag-handle data-model-id="${escapeAttr(model.id)}" draggable="true" aria-label="调整 ${escapeAttr(label)} 的顺序" title="拖动调整顺序；可用上下方向键移动">${icon('grip-vertical')}</button>
+      <span class="candidate-order" data-candidate-order>${number(index + 1)}</span>
+      <div class="candidate-copy"><strong>${escapeHtml(model.channel_name)}</strong><small class="subtle-text"><code>${escapeHtml(model.model_id)}</code>${model.display_name ? ` · ${escapeHtml(model.display_name)}` : ''} · ${escapeHtml((model.protocols || []).join(' / '))}</small>${model.live ? '' : '<small class="candidate-warning">渠道当前不可用，请求时会跳过</small>'}</div>
+      <input class="switch-control" type="checkbox" aria-label="启用 ${escapeAttr(label)}" data-candidate-enabled data-model-id="${escapeAttr(model.id)}" ${entry.enabled === false ? '' : 'checked'}>
+      ${iconButton({ action: 'remove-candidate-model', iconName: 'trash-2', label: '移除候选', danger: true, attrs: `data-model-id="${escapeAttr(model.id)}"` })}
+    </div>`;
+}
+
+function candidateListMarkup(route) {
+  const rows = state.candidateDraft.map((entry, index) => candidateRowMarkup(route, entry, index)).filter(Boolean).join('');
+  return `<section class="drawer-section">
+    <div class="candidate-section-head"><h3>已添加候选</h3><span class="subtle-text">${number(state.candidateDraft.length)} 个</span></div>
+    <div class="candidate-list" data-candidate-list>${rows || emptyState('尚未添加候选渠道', '点击下方「添加模型」，按渠道筛选或按模型名模糊搜索后加入。', 'route')}</div>
+    <p class="field-help">拖动左侧手柄或用上下方向键调整优先级，开关控制单个候选启停，垃圾桶移除；点击「保存」后生效。上游模型 ID 与请求模型不同的候选，转发时会改写请求里的 <code>model</code>。</p>
+  </section>`;
+}
+
+function candidatePickerMarkup(route) {
+  const pool = candidatePool(route);
+  const channels = [...new Map(pool.map((model) => [model.channel_id, model.channel_name])).entries()]
+    .sort((a, b) => String(a[1]).localeCompare(String(b[1])))
+    .map(([id, name]) => `<option value="${escapeAttr(id)}" ${state.candidatePicker.channelId === id ? 'selected' : ''}>${escapeHtml(name)}</option>`)
+    .join('');
+  return `<section class="drawer-section">
+    <p class="field-help">候选池：支持 ${escapeHtml((route.protocols || []).join(' / '))} 中任一格式、且当前可用的渠道模型。</p>
+    <div class="candidate-filter-bar">
+      <input class="input" type="search" data-candidate-query value="${escapeAttr(state.candidatePicker.query)}" placeholder="搜索模型名，如 deepseek-v4.1-flash" aria-label="搜索模型名" autocomplete="off" spellcheck="false">
+      <select class="select" data-candidate-channel aria-label="按渠道筛选"><option value="">全部渠道</option>${channels}</select>
+    </div>
+    <p class="field-help" data-candidate-summary></p>
+    <div class="candidate-result-list" data-candidate-results></div>
+  </section>`;
+}
+
+function candidateResultMarkup(model, added) {
+  return `<div class="candidate-result ${added ? 'is-added' : ''}">
+      <div class="candidate-result-copy"><span class="mono">${escapeHtml(model.model_id)}</span><small class="subtle-text">${escapeHtml(model.channel_name)} · ${escapeHtml((model.protocols || []).join(' / '))}</small></div>
+      ${button({ action: 'add-candidate-model', label: added ? '已添加' : '添加', iconName: added ? 'check' : 'plus', attrs: `data-model-id="${escapeAttr(model.id)}"` })}
+    </div>`;
+}
+
+// 输入/切换渠道只重绘结果区，输入框焦点与已添加状态都不丢。
+function refreshCandidateResults() {
+  const route = state.drawerRoute;
+  if (!route) return;
+  const list = elements.drawerBody.querySelector('[data-candidate-results]');
+  if (!list) return;
+  const { query, channelId } = state.candidatePicker;
+  const pool = candidatePool(route);
+  const scoped = channelId ? pool.filter((model) => model.channel_id === channelId) : pool;
+  const ranked = rankModelMatches(query, scoped, { limit: CANDIDATE_RESULT_LIMIT });
+  const added = new Set(state.candidateDraft.map((entry) => entry.channel_model_id));
+  list.innerHTML = ranked.length
+    ? ranked.map(({ item }) => candidateResultMarkup(item, added.has(item.id))).join('')
+    : emptyState('没有匹配的模型', '换个关键词，或把渠道筛选改为「全部渠道」。', 'search');
+  const summary = elements.drawerBody.querySelector('[data-candidate-summary]');
+  if (!summary) return;
+  const scope = channelId ? '该渠道' : '全部渠道';
+  const truncated = ranked.length >= CANDIDATE_RESULT_LIMIT ? `，仅显示前 ${CANDIDATE_RESULT_LIMIT} 个` : '';
+  summary.textContent = `${scope}共 ${number(scoped.length)} 个可选模型，匹配 ${number(ranked.length)} 个${truncated}${query.trim() ? '；按相似度排序' : ''}。`;
+}
+
+// 选择层里的「添加」是开关：再点一次即从候选移除；未保存前都可撤销。
+function toggleCandidateModel(channelModelId) {
+  const index = state.candidateDraft.findIndex((entry) => entry.channel_model_id === channelModelId);
+  if (index >= 0) state.candidateDraft.splice(index, 1);
+  else state.candidateDraft.push({ channel_model_id: channelModelId, enabled: true });
+}
+
+function removeCandidateModel(channelModelId) {
+  toggleCandidateModel(channelModelId);
+  renderCandidateDrawer();
+}
+
+// DOM 顺序即优先级顺序；任何重排都回写草稿，两层视图来回切换不丢顺序。
 function updateCandidateOrder() {
   let priority = 1;
+  const byId = new Map(state.candidateDraft.map((entry) => [entry.channel_model_id, entry]));
+  const ordered = [];
   for (const row of elements.drawerBody.querySelectorAll('[data-candidate-row]')) {
-    const selected = row.querySelector('[data-candidate-selected]').checked;
-    row.classList.toggle('is-selected', selected);
-    row.querySelector('[data-candidate-enabled]').disabled = !selected;
-    const dragHandle = row.querySelector('[data-candidate-drag-handle]');
-    dragHandle.disabled = !selected;
-    dragHandle.draggable = selected;
-    row.querySelector('[data-candidate-order]').textContent = selected ? String(priority++) : '-';
+    row.querySelector('[data-candidate-order]').textContent = String(priority);
+    priority += 1;
+    const entry = byId.get(row.dataset.modelId);
+    if (!entry) continue;
+    ordered.push(entry);
+    byId.delete(row.dataset.modelId);
   }
+  ordered.push(...byId.values());
+  state.candidateDraft = ordered;
 }
 
 function moveCandidateRow(row, direction) {
-  const rows = [...elements.drawerBody.querySelectorAll('[data-candidate-row]')]
-    .filter((item) => item.querySelector('[data-candidate-selected]').checked);
+  const rows = [...elements.drawerBody.querySelectorAll('[data-candidate-row]')];
   const index = rows.indexOf(row);
   const destination = rows[index + direction];
   if (!destination) return;
   if (direction < 0) destination.before(row);
   else destination.after(row);
   updateCandidateOrder();
+}
+
+async function saveCandidates() {
+  const ctx = captureContext();
+  const route = state.drawerRoute;
+  if (!route) return;
+  const draft = new Map(state.candidateDraft.map((entry) => [entry.channel_model_id, entry]));
+  const candidates = [...elements.drawerBody.querySelectorAll('[data-candidate-row]')].map((row, priority) => ({
+    channel_model_id: row.dataset.modelId,
+    priority,
+    enabled: draft.get(row.dataset.modelId)?.enabled !== false,
+  }));
+  await put(`/routes/${route.id}/candidates`, { candidates });
+  closeDrawer();
+  toast(candidates.length ? `已保存 ${candidates.length} 个候选渠道` : '候选渠道已清空');
+  if (isCurrent(ctx)) await loadRoutes(ctx.renderVersion);
 }
 
 async function deleteRoute(routeId) {
@@ -2165,6 +2327,17 @@ async function handleAction(target) {
     if (action === 'open-route') return routeForm();
     if (action === 'edit-caps') return openCapabilityEditor(target.dataset.routeId);
     if (action === 'edit-candidates') return openCandidates(target.dataset.routeId);
+    if (action === 'open-candidate-picker') {
+      state.candidateView = 'picker';
+      if (!state.candidatePicker.query) state.candidatePicker.query = state.drawerRoute?.requested_model_id || '';
+      return renderCandidateDrawer();
+    }
+    if (action === 'close-candidate-picker') { state.candidateView = 'list'; return renderCandidateDrawer(); }
+    if (action === 'add-candidate-model') {
+      toggleCandidateModel(target.dataset.modelId);
+      return refreshCandidateResults();
+    }
+    if (action === 'remove-candidate-model') return removeCandidateModel(target.dataset.modelId);
     if (action === 'save-candidates') return saveCandidates();
     if (action === 'save-caps') return document.getElementById('caps-form')?.requestSubmit();
     if (action === 'detect-caps') return detectCapabilities();
@@ -2232,10 +2405,13 @@ function handleChange(event) {
     form.querySelectorAll('[name="start"], [name="end"]').forEach((input) => { input.disabled = !custom; });
   }
   if (target.matches('[data-channel-toggle]')) toggleChannel(target.dataset.channelId, target.checked);
-  if (target.matches('[data-candidate-selected]')) {
-    const row = target.closest('.candidate-row');
-    if (target.checked) elements.drawerBody.querySelector('[data-candidate-list]').append(row);
-    updateCandidateOrder();
+  if (target.matches('[data-candidate-enabled]')) {
+    const entry = state.candidateDraft.find((item) => item.channel_model_id === target.dataset.modelId);
+    if (entry) entry.enabled = target.checked;
+  }
+  if (target.matches('[data-candidate-channel]')) {
+    state.candidatePicker.channelId = target.value;
+    refreshCandidateResults();
   }
   if (target.matches('[data-preset-select]')) {
     const presetId = target.value;
@@ -2348,6 +2524,11 @@ elements.modal.addEventListener('close', () => {
 });
 document.addEventListener('input', (event) => {
   if (event.target.closest('[data-form="caps"]')) refreshCapsPreview();
+  if (event.target.matches('#route-model')) syncRouteProtocols();
+  if (event.target.matches('[data-candidate-query]')) {
+    state.candidatePicker.query = event.target.value;
+    refreshCandidateResults();
+  }
 });
 document.addEventListener('dragstart', (event) => {
   const dragHandle = event.target.closest('[data-candidate-drag-handle]');
@@ -2379,7 +2560,12 @@ elements.modal.addEventListener('cancel', () => {
   resolveConfirmation(false);
 });
 elements.modal.addEventListener('close', () => { closeModal(); });
-window.addEventListener('drawer-closed', () => { state.drawerRoute = null; });
+window.addEventListener('drawer-closed', () => {
+  state.drawerRoute = null;
+  state.candidateView = 'list';
+  state.candidatePicker = { query: '', channelId: '' };
+  state.candidateDraft = [];
+});
 
 checkConnection();
 renderPage();
