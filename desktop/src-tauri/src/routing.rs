@@ -1,76 +1,37 @@
-use serde::Serialize;
-use sqlx::FromRow;
+//! 路由领域层：上游回退协议映射与按协议组装目录入口端点。
+//!
+//! 边界：本模块只做纯映射，不读写数据库、不发起请求。
+//! 共享的数据形状（`Candidate` / `RoutableModel` / `MappingTarget`）已移入
+//! `domain`，此处不再定义类型。
+//! 关键不变量：入口端点顺序由调用方保证（生产调用方在 SQL 中按
+//! `PROTOCOL_ORDER` 排序）；本模块只按输入顺序映射并丢弃未知协议。
 
-use crate::remote_compaction::CompactionSupport;
-
-/// A configured mapping from an entry model to an upstream protocol+model
-/// (claudecode/codex entries).
-#[derive(Clone)]
-pub struct MappingTarget {
-    pub entry: String,
-    pub upstream_protocol: String,
-    pub upstream_model: String,
+/// 客户端入口在没有专属路由时可以静默回退到的上游协议。
+///
+/// 目前是三种客户端入口协议 → `command_code`：这三种入口都有对应的请求与流式
+/// 转换器，所以直接发往 `/v1/chat/completions`、`/v1/messages`、`/v1/responses`
+/// 的请求无需 Claude/Codex 映射即可驱动 `command_code` 路由。`gemini` 不在其中
+/// ——它没有指向 `command_code` 的转换器。
+pub fn fallback_upstream_protocol(entry: &str) -> Option<&'static str> {
+    // 判定来自转换注册表（`converts_to_command_code`），不再维护第二份白名单。
+    crate::protocol::converts_to_command_code(entry).then_some("command_code")
 }
 
-#[derive(Clone, Debug, FromRow)]
-pub struct Candidate {
-    pub candidate_id: String,
-    pub channel_id: String,
-    pub channel_name: String,
-    pub priority: i64,
-    pub base_url: String,
-    /// `providers.kind`: `command_code` opts into CLI identity headers.
-    pub kind: Option<String>,
-    pub api_key_encrypted: Vec<u8>,
-    pub model_id: String,
-    /// Raw `channel_protocols.remote_compaction_v1_support`:
-    /// 0 unknown, 1 supported, 2 unsupported.
-    pub remote_compaction_v1_support: i64,
-    /// Raw `channel_protocols.remote_compaction_v2_support`:
-    /// 0 unknown, 1 supported, 2 unsupported.
-    pub remote_compaction_v2_support: i64,
-}
-
-impl Candidate {
-    pub fn remote_compaction_v1(&self) -> CompactionSupport {
-        CompactionSupport::from_db(Some(self.remote_compaction_v1_support))
-    }
-
-    pub fn remote_compaction_v2(&self) -> CompactionSupport {
-        CompactionSupport::from_db(Some(self.remote_compaction_v2_support))
-    }
-}
-
-#[derive(Clone, Debug, Serialize, FromRow)]
-pub struct RoutableModel {
-    pub id: String,
-    pub display_name: String,
-    pub created_at: String,
-}
-
-/// Primary proxy entrypoint per protocol, as advertised in the model catalog.
-/// OpenAI Compatible only advertises `/v1/chat/completions` — embeddings and
-/// completions are deliberately not guessed (see requirements.md 3.7).
-/// Command Code is upstream-only (reached through claude/codex mappings), so
-/// it has no entry endpoint and is dropped from the catalog.
+/// 每个协议在模型目录中公布的主代理入口点。
+/// OpenAI Compatible 只公布 `/v1/chat/completions`——embeddings 与 completions
+/// 刻意不做猜测（见 requirements.md 3.7）。
+/// Command Code 没有面向客户端的入口端点（只能经 claude / openai 路由或
+/// claude/codex 映射抵达），因此从目录中剔除。
 pub fn protocol_main_endpoint(protocol: &str, model_id: &str) -> Option<String> {
-    match protocol {
-        "openai_compatible" => Some("/v1/chat/completions".to_owned()),
-        "openai_responses" => Some("/v1/responses".to_owned()),
-        "claude" => Some("/v1/messages".to_owned()),
-        "gemini" => Some(format!("/v1beta/models/{model_id}:generateContent")),
-        "command_code" => None,
-        _ => None,
-    }
+    crate::protocol::main_path(protocol, model_id, false)
 }
 
-/// All primary entrypoints the model can currently be routed through: the
-/// distinct enabled route protocols with at least one live candidate, ordered
-/// by `PROTOCOL_ORDER`. Mirrors the candidate-existence filter of
-/// `list_routable_models` so endpoints only appear when the route is actually
-/// callable.
-/// Pure mapping used by `list_routable_model_endpoints` (and unit-tested):
-/// unknown protocols are dropped, known ones keep their input order.
+/// 该模型当前可经其路由的全部主入口点：至少有一个存活候选的已启用路由协议。
+/// 它镜像 `list_routable_models` 的候选存在性过滤，因此只有当路由确实可调用时
+/// 端点才会出现。
+/// 这是 `RouteRepository::routable_endpoints_for_model` 使用的纯映射
+/// （并有单测覆盖）：未知协议被丢弃，已知协议保持输入顺序——顺序由调用方保证
+/// （生产调用方在 SQL 中按 `PROTOCOL_ORDER` 排序）。
 pub fn endpoints_for_protocols(protocols: &[&str], model_id: &str) -> Vec<String> {
     protocols
         .iter()
@@ -119,7 +80,7 @@ mod tests {
             protocol_main_endpoint("openai_compatible", "any-model").as_deref(),
             Some("/v1/chat/completions")
         );
-        // Embeddings/completions are not guessed.
+        // embeddings/completions 不做猜测。
         assert_eq!(
             endpoints_for_protocols(&["bogus"], "any-model"),
             Vec::<String>::new()

@@ -1,14 +1,11 @@
-//! Command Code（CC）上游协议转换（硬坑 1/2/3/4/6/7 的落点）。
+//! Command Code（CC）上游协议转换。
 //!
-//! 三条通路：
-//! 1. 入口请求 → CC `/alpha/generate` 请求体（[`claude_to_commandcode`] /
-//!    [`responses_to_commandcode`]）；
-//! 2. CC NDJSON → canonical OpenAI chat SSE（[`CommandCodeDecoder`]），
-//!    交给既有 `(entry, "openai_compatible")` 流转换复用；
-//! 3. CC NDJSON → 单个 OpenAI chat completion（[`ndjson_to_chat_completion`]），
-//!    供非流式入口复用既有响应转换。
-//!
-//! 事件表与硬坑清单见 `docs/command-code-protocol.md`。
+//! 职责：把入口请求转换为 CC `/alpha/generate` 请求体（[`claude_to_commandcode`] /
+//! [`openai_chat_to_commandcode`] / [`responses_to_commandcode`]）；把 CC NDJSON 转为
+//! OpenAI chat SSE（[`CommandCodeDecoder`]）或单个 chat completion（[`ndjson_to_chat_completion`]）。
+//! 边界：只做形状转换，不管连接/认证/错误码；产物交给既有 `(entry, "openai_compatible")` 转换复用。
+//! 关键不变量：assistant parts 顺序为 reasoning→text→tool-call；缺失的 tool result 必须补合成回复。
+//! 事件与字段细节见 `docs/command-code-protocol.md`。
 
 use std::collections::{HashMap, HashSet};
 
@@ -16,18 +13,13 @@ use serde_json::{Value, json};
 
 use super::*;
 
-/// `params.system` 的空占位（硬坑 4）：缺省会让上游注入 ~7.5K token 默认提示词。
+/// `params.system` 的空占位：缺省会让上游注入 ~7.5K token 默认提示词。
 pub const EMPTY_SYSTEM_PLACEHOLDER: &str = " ";
 /// 社区实现夹取的 `max_tokens` 上限。
 pub const MAX_TOKENS_CAP: i64 = 200_000;
-/// 缺失 tool result 的合成文案（硬坑 3）。
+/// 缺失 tool result 时合成的文案。
 pub const MISSING_TOOL_RESULT: &str =
     "No result — the tool call did not complete (interrupted or lost).";
-
-/// CC usage 根部的标记：`prompt_tokens` 是 TOTAL（含缓存命中）。
-/// 流/非流转换据此换算 Anthropic 的 `input_tokens`（硬坑 9），
-/// 不影响其他上游（它们不带这个标记）。
-pub const INPUT_INCLUDES_CACHE: &str = "prompt_tokens_includes_cache";
 
 // ---------------------------------------------------------------------------
 // 请求构造
@@ -61,7 +53,7 @@ fn clamp_max_tokens(value: Option<&Value>, fallback: i64) -> i64 {
         .clamp(1, MAX_TOKENS_CAP)
 }
 
-/// `params.system` 恒为字符串；空提示用空格占位（硬坑 4）。
+/// `params.system` 恒为字符串；空提示用空格占位。
 fn system_param(system: Option<String>) -> Value {
     match system {
         Some(text) if !text.trim().is_empty() => json!(text),
@@ -90,6 +82,7 @@ fn tool_result_output(value: &Value, is_error: bool) -> Value {
 }
 
 /// Claude tools → CC（Anthropic 形）。
+// 与 request.rs::responses_tools_* 的差异：不过滤 tool.type，并透传 tool.type 作为 CC 的 type；不合并。
 fn claude_tools_to_cc(tools: Option<&Value>) -> Option<Value> {
     let tools = tools?.as_array()?;
     let converted: Vec<Value> = tools
@@ -123,6 +116,7 @@ fn claude_tool_choice_to_cc(choice: Option<&Value>) -> Option<Value> {
 }
 
 /// OpenAI chat `content`（string 或 parts 数组）→ 纯文本。
+// 与 mod.rs::text 的差异：多认 input_text 块、无 Object 分支（对象落入 _ 返回空串）；不合并。
 fn openai_content_text(content: &Value) -> String {
     match content {
         Value::String(text) => text.clone(),
@@ -140,7 +134,8 @@ fn openai_content_text(content: &Value) -> String {
     }
 }
 
-/// OpenAI chat tools（`{type:"function",function:{...}}`）→ CC。
+/// OpenAI chat tools（`{type:"function",function:{...}}`）→ CC（OpenAI 形）。
+// 与 responses_tools_to_cc 的差异：兼容 function 包装（tool.get("function").unwrap_or(tool)）；不合并。
 fn openai_tools_to_cc(tools: Option<&Value>) -> Option<Value> {
     let tools = tools?.as_array()?;
     let converted: Vec<Value> = tools
@@ -181,6 +176,7 @@ fn openai_tool_choice_to_cc(choice: Option<&Value>) -> Option<Value> {
 }
 
 /// Responses tools（扁平 `{type,name,parameters}`）→ CC。
+// 与 request.rs::responses_tools_to_* 的差异：输出 CC 扁平形（name/input_schema，无 function 包装）；不合并。
 fn responses_tools_to_cc(tools: Option<&Value>) -> Option<Value> {
     let tools = tools?.as_array()?;
     let converted: Vec<Value> = tools
@@ -217,7 +213,7 @@ fn responses_tool_choice_to_cc(choice: Option<&Value>) -> Option<Value> {
     })
 }
 
-/// CC 消息装配（硬坑 1/2/3/7）：
+/// CC 消息装配：
 /// - assistant parts 顺序固定 `[reasoning, text, tool-call]`；
 /// - tool result 紧跟对应 assistant 消息（缺失时合成 `error-text`）；
 /// - 角色只输出 user/assistant/tool。
@@ -262,7 +258,7 @@ impl CcMessages {
         }
     }
 
-    /// Assistant 消息 + 该消息中缺失结果的合成 tool 回复（硬坑 3）。
+    /// Assistant 消息 + 该消息中缺失结果的合成 tool 回复。
     fn push_assistant(&mut self, parts: Vec<Value>, calls: Vec<(String, String)>) {
         let mut parts: Vec<Value> = parts.into_iter().filter(|part| !part.is_null()).collect();
         if parts.is_empty() && calls.is_empty() {
@@ -283,7 +279,7 @@ impl CcMessages {
         if parts.is_empty() && missing.is_empty() {
             return;
         }
-        // A tool-only assistant turn still needs a valid parts array.
+        // 只含 tool 的 assistant 轮仍需要一个合法的 parts 数组。
         if parts.is_empty() {
             parts.push(json!({"type": "text", "text": ""}));
         }
@@ -374,7 +370,7 @@ pub(super) fn claude_to_commandcode(upstream_model: &str, data: &Value) -> Value
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    // 预扫描所有 tool_result / tool_use，供「缺失 result 补齐」判断（硬坑 3）。
+    // 预扫描所有 tool_result / tool_use，供「缺失 result 补齐」判断。
     for message in &messages {
         let Some(blocks) = message.get("content").and_then(Value::as_array) else {
             continue;
@@ -408,7 +404,7 @@ pub(super) fn claude_to_commandcode(upstream_model: &str, data: &Value) -> Value
                 if let Some(blocks) = content.as_array() {
                     for block in blocks {
                         match block.get("type").and_then(Value::as_str) {
-                            // 硬坑 2：thinking 必须回传成 reasoning。
+                            // thinking 必须回传成 reasoning。
                             Some("thinking") => {
                                 let text = block
                                     .get("thinking")
@@ -458,7 +454,7 @@ pub(super) fn claude_to_commandcode(upstream_model: &str, data: &Value) -> Value
                 builder.push_assistant(parts, calls);
             }
             "user" => {
-                // 硬坑 7：tool_result 先于 user 文本；已有 assistant 调用后紧跟。
+                // tool_result 先于 user 文本；已有 assistant 调用后紧跟。
                 let mut tool_parts: Vec<Value> = Vec::new();
                 let mut user_parts: Vec<Value> = Vec::new();
                 if let Some(blocks) = content.as_array() {
@@ -489,7 +485,7 @@ pub(super) fn claude_to_commandcode(upstream_model: &str, data: &Value) -> Value
                                     user_parts.push(json!({"type": "text", "text": text}));
                                 }
                             }
-                            // 硬坑 6：图片是 data URL 的 `{type:'image', image}`。
+                            // 图片是 data URL 的 `{type:'image', image}`。
                             Some("image") => {
                                 let source = block.get("source").unwrap_or(&Value::Null);
                                 user_parts.push(json!({
@@ -510,7 +506,7 @@ pub(super) fn claude_to_commandcode(upstream_model: &str, data: &Value) -> Value
                     builder.push_user(user_parts);
                 }
             }
-            // 硬坑：role 仅接受 user/assistant/tool，未知角色降级为 user。
+            // role 仅接受 user/assistant/tool，未知角色降级为 user。
             _ => {
                 let text = content_text(content);
                 if !text.is_empty() {
@@ -543,7 +539,7 @@ pub(super) fn claude_to_commandcode(upstream_model: &str, data: &Value) -> Value
 
 /// OpenAI Chat Completions 请求 → CC `/alpha/generate` 请求体。
 ///
-/// 与 [`claude_to_commandcode`] 共用 [`CcMessages`]（硬坑 1/2/3/7），差异在
+/// 与 [`claude_to_commandcode`] 共用 [`CcMessages`]，差异在
 /// 输入形状：`tool_calls[].function.arguments` 是 JSON 字符串、图片在
 /// `image_url.url`、system 是消息而不是顶层字段。
 pub(super) fn openai_chat_to_commandcode(upstream_model: &str, data: &Value) -> Value {
@@ -553,7 +549,7 @@ pub(super) fn openai_chat_to_commandcode(upstream_model: &str, data: &Value) -> 
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    // 预扫描 assistant.tool_calls / role=tool（硬坑 3 的缺失结果判定）。
+    // 预扫描 assistant.tool_calls / role=tool（缺失结果判定）。
     for message in &messages {
         match message.get("role").and_then(Value::as_str).unwrap_or("user") {
             "assistant" => {
@@ -598,7 +594,7 @@ pub(super) fn openai_chat_to_commandcode(upstream_model: &str, data: &Value) -> 
                     .and_then(Value::as_str)
                     .filter(|text| !text.is_empty())
                 {
-                    // 硬坑 2：思考历史先于 text/tool-call 回传。
+                    // 思考历史先于 text/tool-call 回传。
                     parts.push(json!({"type": "reasoning", "text": reasoning}));
                 }
                 let text = openai_content_text(content);
@@ -662,7 +658,7 @@ pub(super) fn openai_chat_to_commandcode(upstream_model: &str, data: &Value) -> 
                                     parts.push(json!({"type": "text", "text": text}));
                                 }
                             }
-                            // 硬坑 6：图片放进 `image`（data URL 或原始 URL）。
+                            // 图片放进 `image`（data URL 或原始 URL）。
                             Some("image_url") => {
                                 let url = block
                                     .pointer("/image_url/url")
@@ -742,7 +738,7 @@ pub(super) fn responses_to_commandcode(upstream_model: &str, data: &Value) -> Va
         match item.get("type").and_then(Value::as_str).unwrap_or("") {
             "message" => {
                 let mut role = item.get("role").and_then(Value::as_str).unwrap_or("user");
-                // 会话中途的 developer/system：降级为 user 而不是丢弃（计划 §2.6）。
+                // 会话中途的 developer/system：降级为 user 而不是丢弃。
                 if matches!(role, "developer" | "system") {
                     role = "user";
                 }
@@ -905,14 +901,18 @@ pub(super) fn responses_to_commandcode(upstream_model: &str, data: &Value) -> Va
 }
 
 // ---------------------------------------------------------------------------
-// usage
+// usage（用量换算）
 // ---------------------------------------------------------------------------
 
 fn i64_field(value: &Value, key: &str) -> Option<i64> {
     value.get(key).and_then(Value::as_i64)
 }
 
-/// CC usage → OpenAI usage（总数语义），带 [`INPUT_INCLUDES_CACHE`] 标记。
+/// CC usage → OpenAI usage：`prompt_tokens` 取 CC 的 `inputTokens`（含缓存命中的总数），
+/// 并打上 [`INPUT_INCLUDES_CACHE`]（`prompt_tokens_includes_cache`）标记，供流/非流转换
+/// 据此把 Anthropic 的 `input_tokens` 换算为去缓存部分。
+// 与 stream.rs 的 UsageAcc::merge_openai 差异：这里把 CC 原始 usage 构造为 OpenAI 形并打标记，
+// 不是累积合并；两者语义不同，不合并。
 pub fn cc_usage_to_openai(usage: &Value) -> Value {
     let input = i64_field(usage, "inputTokens").unwrap_or(0);
     let output = i64_field(usage, "outputTokens").unwrap_or(0);
@@ -962,8 +962,8 @@ fn event_error_message(event: &Value) -> String {
 /// 逐块消费 CC NDJSON，输出 canonical OpenAI chat SSE（含 `[DONE]`）。
 ///
 /// - 未知事件类型忽略并计数（前向兼容）；
-/// - `error` 事件输出 `data: {"error":...}`，**不**产生 finish_reason（硬坑 5）；
-/// - `tool-call` 已带完整 input，单次给出完整 `arguments`（硬坑 10 的回退基础）。
+/// - `error` 事件输出 `data: {"error":...}`，**不**产生 finish_reason；
+/// - `tool-call` 已带完整 input，单次给出完整 `arguments`（也是增量回退的基础）。
 pub struct CommandCodeDecoder {
     model: String,
     buffer: Vec<u8>,
@@ -978,9 +978,8 @@ pub struct CommandCodeDecoder {
     finished: bool,
     produced_content: bool,
     unknown_events: usize,
-    /// Hard pit 10 fallback: `tool-input-delta` events are normally ignored
-    /// because `tool-call` already carries the full input. If an upstream
-    /// only emits increments, the accumulated JSON is used instead.
+    /// 增量回退：`tool-input-delta` 事件通常被忽略，因为 `tool-call` 已带完整
+    /// input；若上游只发增量，则改用累积出的 JSON。
     pending_tool_inputs: HashMap<String, String>,
     pending_tool_names: HashMap<String, String>,
     emitted_tool_calls: HashSet<String>,
@@ -1028,8 +1027,8 @@ impl CommandCodeDecoder {
         self.unknown_events
     }
 
-    /// Feeds raw upstream bytes; returns OpenAI SSE bytes ready for the
-    /// existing `(entry, openai_compatible)` converter.
+    /// 喂入上游原始字节，返回可直接交给既有 `(entry, openai_compatible)`
+    /// 转换器使用的 OpenAI SSE 字节。
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
         if self.finished || bytes.is_empty() {
             return Vec::new();
@@ -1053,7 +1052,7 @@ impl CommandCodeDecoder {
         out
     }
 
-    /// Handles a trailing unterminated line at upstream EOF.
+    /// 处理上游 EOF 处未以换行结尾的残留行。
     pub fn flush(&mut self) -> Vec<u8> {
         if self.finished || self.buffer.is_empty() {
             return Vec::new();
@@ -1082,7 +1081,7 @@ impl CommandCodeDecoder {
         sse_data(&payload)
     }
 
-    /// Emits one canonical OpenAI `tool_calls` delta for a complete tool call.
+    /// 为一个完整工具调用产出一条规范化的 OpenAI `tool_calls` delta。
     fn emit_tool_call(&mut self, id: String, name: String, arguments: String, out: &mut Vec<u8>) {
         if !self.emitted_tool_calls.insert(id.clone()) {
             return;
@@ -1127,7 +1126,7 @@ impl CommandCodeDecoder {
             "start" | "start-step" | "text-start" | "reasoning-start" | "reasoning-end"
             | "provider-metadata" | "text-end" => {}
             "tool-input-start" => {
-                // Hard pit 10 fallback bookkeeping (normally silent).
+                // 增量回退的记账（正常路径下静默）。
                 if let Some(id) = event.get("toolCallId").and_then(Value::as_str) {
                     self.pending_tool_inputs.entry(id.to_owned()).or_default();
                     if let Some(name) = event.get("toolName").and_then(Value::as_str) {
@@ -1152,8 +1151,8 @@ impl CommandCodeDecoder {
                 }
             }
             "tool-input-end" => {
-                // Fallback: an upstream that ONLY streams increments ends the
-                // tool input without a full `tool-call` event.
+                // 回退：只发增量的上游以 `tool-input-end` 结束输入，没有完整的
+                // `tool-call` 事件。
                 let Some(id) = event
                     .get("toolCallId")
                     .and_then(Value::as_str)
@@ -1226,8 +1225,7 @@ impl CommandCodeDecoder {
                     }
                     _ => None,
                 };
-                // Hard pit 10 fallback: prefer the accumulated increments
-                // when the full-input event is empty.
+                // 增量回退：完整 input 事件为空时，改用累积的增量。
                 let arguments = inline
                     .or_else(|| {
                         self.pending_tool_inputs
@@ -1266,7 +1264,7 @@ impl CommandCodeDecoder {
                 self.saw_finish = true;
             }
             "error" => {
-                // 硬坑 5：错误不产生 finish_reason，交给流扫描器以 error 事件收尾。
+                // 错误不产生 finish_reason，交给流扫描器以 error 事件收尾。
                 let message = event_error_message(&event);
                 tracing::warn!(message, "command code stream error");
                 self.upstream_error = Some(message.clone());
@@ -1284,9 +1282,8 @@ impl CommandCodeDecoder {
 // NDJSON → OpenAI chat completion（非流式）
 // ---------------------------------------------------------------------------
 
-/// Aggregates a full NDJSON body into one OpenAI chat completion. Returns
-/// `Err(message)` when the stream carried an `error` event (the caller maps
-/// it to an upstream failure instead of a fake success).
+/// 把完整的 NDJSON 体聚合为一个 OpenAI chat completion。流中出现 `error` 事件时
+/// 返回 `Err(message)`，由调用方映射为上游失败，而不是伪装成成功。
 pub fn ndjson_to_chat_completion(model: &str, bytes: &[u8]) -> Result<Value, String> {
     let mut text = String::new();
     let mut reasoning = String::new();
@@ -1490,13 +1487,13 @@ mod tests {
         let messages = body.pointer("/params/messages").unwrap().as_array().unwrap();
         assert_eq!(messages[0]["role"], "user");
         let parts = messages[1]["content"].as_array().unwrap();
-        // 硬坑 1：reasoning 在最前，随后 text、tool-call。
+        // reasoning 在最前，随后 text、tool-call。
         assert_eq!(parts[0]["type"], "reasoning");
         assert_eq!(parts[0]["text"], "plan");
         assert_eq!(parts[1]["type"], "text");
         assert_eq!(parts[2]["type"], "tool-call");
         assert_eq!(parts[2]["input"]["path"], "a");
-        // 硬坑 3：缺失 tool result 合成 error-text。
+        // 缺失 tool result 合成 error-text。
         assert_eq!(messages[2]["role"], "tool");
         assert_eq!(messages[2]["content"][0]["type"], "tool-result");
         assert_eq!(messages[2]["content"][0]["output"]["type"], "error-text");
@@ -1769,7 +1766,7 @@ mod tests {
 
     #[test]
     fn decoder_falls_back_to_incremental_tool_input() {
-        // Hard pit 10 fallback: no full `tool-call` event, only increments.
+        // 增量回退：没有完整的 `tool-call` 事件，只有增量。
         let fixture = concat!(
             "{\"type\":\"tool-input-start\",\"toolCallId\":\"c9\",\"toolName\":\"read\"}\n",
             "{\"type\":\"tool-input-delta\",\"toolCallId\":\"c9\",\"delta\":\"{\\\"a\\\":\"}\n",
@@ -1869,7 +1866,7 @@ mod tests {
         assert!(out.contains("hi"), "{out}");
         assert!(!out.contains("late"), "events after finish must be ignored");
         assert!(decoder.finished());
-        // The terminal marker is emitted exactly once.
+        // 终止标记只发出一次。
         assert_eq!(out.matches("data: [DONE]").count(), 1);
     }
 
@@ -1898,8 +1895,8 @@ mod tests {
               {\"type\":\"tool-error\",\"toolCallId\":\"c\"}\n\
               {\"type\":\"text-end\"}\n",
         );
-        // `tool-input-end` may legitimately emit the fallback tool-call, so
-        // only assert no event was classified as unknown.
+        // `tool-input-end` 合法地可能产出回退的 tool-call，因此这里只断言
+        // 没有事件被归类为 unknown。
         assert_eq!(decoder.unknown_events(), 0);
     }
 
@@ -1923,7 +1920,7 @@ mod tests {
         );
         assert_eq!(body.pointer("/params/tool_choice/type").unwrap(), "tool");
         assert_eq!(body.pointer("/params/tool_choice/name").unwrap(), "read");
-        // auto/any/none keep their Anthropic vocabulary.
+        // auto/any/none 保留 Anthropic 的词表。
         let body = claude_to_commandcode("m", &json!({"tool_choice": {"type": "any"}}));
         assert_eq!(body.pointer("/params/tool_choice/type").unwrap(), "any");
     }

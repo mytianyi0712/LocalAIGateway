@@ -1,14 +1,27 @@
+//! 遥测事件通道与写入 worker：请求/尝试日志、token 用量统计的落库路径。
+//!
+//! 职责：`Telemetry` 是事件 channel 的发送端，`EventSink` 实现把事件非阻塞地
+//! 投递进队列；`run_writer` 作为写入 worker 消费事件，落 `request_logs` /
+//! `request_attempts` / `token_usage` 三张表。
+//! 边界：只负责落库，不做任何业务判定（熔断/路由/重试都在别处）。
+//! 不变量：worker 自身不持有发送端，否则关停时会等待自己；`run_writer` 收到
+//! cancel 后阻塞式排空队列，直到所有发送端释放（channel 关闭）才退出。
+
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
 
-use serde_json::Value;
 use sqlx::Row;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::{db::Database, ports::EventSink};
+use crate::{
+    db::Database,
+    domain::Event,
+    health::{HealthEvent, apply_health_event},
+    ports::EventSink,
+};
 
 #[derive(Clone)]
 pub struct Telemetry {
@@ -16,118 +29,9 @@ pub struct Telemetry {
     dropped: Arc<AtomicU64>,
 }
 
-#[derive(Debug)]
-pub enum Event {
-    RequestStart {
-        id: String,
-        protocol: String,
-        model_id: Option<String>,
-        endpoint: String,
-        stream: bool,
-        started_at: String,
-        request_bytes: i64,
-    },
-    RequestFinish {
-        id: String,
-        finished_at: String,
-        duration_ms: i64,
-        status: Option<i64>,
-        outcome: String,
-        attempts: i64,
-        channel_id: Option<String>,
-        response_bytes: i64,
-    },
-    // Attempt is by far the largest variant (21 fields incl. Usage); boxing it
-    // keeps the Event enum small so every queued event costs one allocation
-    // of the same size instead of padding each message to the largest variant.
-    Attempt(Box<AttemptData>),
-    ChannelSuccess {
-        channel_id: String,
-    },
-    ChannelFailure {
-        channel_id: String,
-        error_kind: String,
-        status: Option<i64>,
-        threshold: i64,
-        open_seconds: i64,
-        countable: bool,
-    },
-}
-
-/// Per-attempt telemetry snapshot, carried by [`Event::Attempt`].
-#[derive(Debug)]
-pub struct AttemptData {
-    pub id: String,
-    pub request_id: String,
-    pub channel_id: String,
-    pub channel_name: String,
-    pub attempt_no: i64,
-    pub priority: i64,
-    pub started_at: String,
-    pub finished_at: String,
-    pub status: Option<i64>,
-    pub outcome: String,
-    pub error_kind: Option<String>,
-    pub failover: bool,
-    pub response_started: bool,
-    pub first_byte_ms: Option<i64>,
-    pub first_token_ms: Option<i64>,
-    pub duration_ms: i64,
-    pub usage: Usage,
-    pub response_bytes: i64,
-    pub upstream_protocol: Option<String>,
-    pub upstream_model_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct Usage {
-    pub input_tokens: Option<i64>,
-    pub cache_read_tokens: Option<i64>,
-    pub cache_write_tokens: Option<i64>,
-    pub cache_miss_input_tokens: Option<i64>,
-    pub output_tokens: Option<i64>,
-    pub raw: Option<Value>,
-}
-
-impl Usage {
-    /// Merge a newer usage snapshot into this one, per-field
-    /// latest-non-None-wins: a streaming upstream reports usage across
-    /// several chunks and a later chunk often omits fields the earlier one
-    /// carried (e.g. `prompt_tokens_details.cached_tokens`), so a full
-    /// overwrite would silently drop input/cache data. `cache_miss` is
-    /// recomputed from the merged input/cache values; `raw` keeps the newest
-    /// snapshot.
-    pub fn merge(&mut self, other: &Usage) {
-        if other.input_tokens.is_some() {
-            self.input_tokens = other.input_tokens;
-        }
-        if other.cache_read_tokens.is_some() {
-            self.cache_read_tokens = other.cache_read_tokens;
-        }
-        if other.cache_write_tokens.is_some() {
-            self.cache_write_tokens = other.cache_write_tokens;
-        }
-        if other.output_tokens.is_some() {
-            self.output_tokens = other.output_tokens;
-        }
-        // All four protocol adapters derive the miss as
-        // total_input - cache_read - cache_write.
-        self.cache_miss_input_tokens = match (self.input_tokens, self.cache_read_tokens) {
-            (Some(total), Some(read)) => {
-                Some((total - read - self.cache_write_tokens.unwrap_or(0)).max(0))
-            }
-            _ => None,
-        };
-        if other.raw.is_some() {
-            self.raw = other.raw.clone();
-        }
-    }
-}
-
 impl Telemetry {
-    /// Pure assembly: builds the telemetry handle and its event channel
-    /// without spawning any task. The writer task is owned by the caller via
-    /// [`Self::run_writer`], so background-task lifetime is explicit.
+    /// 纯组装：构造遥测句柄及其事件 channel，不启动任何任务。写入任务由调用方
+    /// 通过 [`Self::run_writer`] 持有，因此后台任务的生命周期是显式的。
     pub fn new(capacity: usize) -> (Self, mpsc::Receiver<Event>) {
         let (sender, receiver) = mpsc::channel(capacity);
         let dropped = Arc::new(AtomicU64::new(0));
@@ -138,13 +42,10 @@ impl Telemetry {
         self.dropped.clone()
     }
 
-    /// Runs the telemetry writer task body in the caller's task — the
-    /// [`RuntimeSupervisor`] registers it directly, so no `tokio::spawn`
-    /// boundary can detach it mid-shutdown. On cancel it keeps draining
-    /// events with a blocking receive — handlers may still emit during
-    /// graceful shutdown — and only exits once every sender is released
-    /// (channel closed), so the tail of the request log is never lost
-    /// (P1-5).
+    /// 在调用方的任务里运行遥测写入任务体：`RuntimeSupervisor` 直接注册它，
+    /// 因此不存在可能让任务在关停中途脱管的 `tokio::spawn` 边界。收到 cancel 后
+    /// 仍以阻塞式接收继续排空事件——优雅关停期间 handler 仍可能发出事件——直到
+    /// 所有发送端释放（channel 关闭）才退出，因此请求日志的尾部永不丢失。
     pub async fn run_writer(
         db: Database,
         mut rx: mpsc::Receiver<Event>,
@@ -225,20 +126,17 @@ async fn write_event(db: &Database, event: Event) -> anyhow::Result<()> {
                 (Some(tokens), ms) if ms > 0 => Some(tokens as f64 * 1000.0 / ms as f64),
                 _ => None,
             };
-            // The request log row and the token usage snapshot are written in
-            // one transaction: token statistics must never diverge from the
-            // logged attempt, and a failed write rolls both back together.
+            // 请求日志行与 token 用量快照在同一个事务里写入：token 统计绝不能与
+            // 记录的尝试发生偏离，写入失败时两者一起回滚。
             let mut tx = db.pool().begin().await?;
             sqlx::query("INSERT INTO request_attempts(id, request_id, channel_id, channel_name, attempt_no, priority_snapshot, started_at, finished_at, status_code, outcome, error_kind, failover_eligible, response_started, first_byte_ms, first_token_ms, duration_ms, input_tokens, cache_read_tokens, cache_write_tokens, cache_miss_input_tokens, output_tokens, tps, raw_usage_json, response_bytes, upstream_protocol, upstream_model_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
                 .bind(&attempt.id).bind(&attempt.request_id).bind(&attempt.channel_id).bind(&attempt.channel_name).bind(attempt.attempt_no).bind(attempt.priority).bind(&attempt.started_at).bind(&attempt.finished_at).bind(attempt.status).bind(&attempt.outcome).bind(&attempt.error_kind).bind(attempt.failover).bind(attempt.response_started).bind(attempt.first_byte_ms).bind(attempt.first_token_ms).bind(attempt.duration_ms)
                 .bind(attempt.usage.input_tokens).bind(attempt.usage.cache_read_tokens).bind(attempt.usage.cache_write_tokens).bind(attempt.usage.cache_miss_input_tokens).bind(attempt.usage.output_tokens).bind(tps).bind(attempt.usage.raw.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default())).bind(attempt.response_bytes).bind(&attempt.upstream_protocol).bind(&attempt.upstream_model_id).execute(&mut *tx).await?;
             if attempt.response_started {
-                // Only the attempt whose response reached the client carries
-                // user-visible usage. The whole request is attributed to its
-                // actual start time (request_logs.started_at, the same source
-                // the backfill migration joins), so a failover attempt that
-                // crosses midnight is never split onto another day. protocol /
-                // model_id are snapshotted from the same request row.
+                // 只有响应已经到达客户端的尝试才携带用户可见的用量。整条请求按它
+                // 实际的开始时间归属（request_logs.started_at，与回填迁移 join 的
+                // 是同一来源），因此跨越午夜的故障转移尝试不会被拆到另一天。
+                // protocol / model_id 从同一请求行快照而来。
                 let request_row = sqlx::query(
                     "SELECT started_at, protocol, model_id FROM request_logs WHERE id=?",
                 )
@@ -249,10 +147,9 @@ async fn write_event(db: &Database, event: Event) -> anyhow::Result<()> {
                     .as_ref()
                     .and_then(|row| row.try_get::<String, _>("started_at").ok())
                     .and_then(|started| {
-                        // Normalize to the canonical UTC representation of
-                        // token_usage.occurred_at (fixed milliseconds, Z) so
-                        // [from, to) range comparisons on the text index are
-                        // exact regardless of the stored log format.
+                        // 归一化为 token_usage.occurred_at 的规范 UTC 表示（固定
+                        // 毫秒、Z），这样无论日志里存的是什么格式，文本索引上的
+                        // [from, to) 区间比较都保持精确。
                         chrono::DateTime::parse_from_rfc3339(&started)
                             .ok()
                             .map(|value| {
@@ -262,38 +159,61 @@ async fn write_event(db: &Database, event: Event) -> anyhow::Result<()> {
                             })
                     });
                 if let (Some(row), Some(occurred_at)) = (request_row, occurred_at) {
-                    // INSERT OR IGNORE deduplicates by attempt id: replaying a
-                    // previously recorded attempt can never double-count.
-                    sqlx::query("INSERT OR IGNORE INTO token_usage(attempt_id, occurred_at, bucket, protocol, model_id, input_tokens, cache_read_tokens, cache_write_tokens, cache_miss_input_tokens, output_tokens, first_token_ms, duration_ms) VALUES(?,?,strftime('%Y-%m-%dT%H:00:00Z', ?),?,?,?,?,?,?,?,?,?)")
-                        .bind(&attempt.id)
-                        .bind(&occurred_at)
-                        .bind(&occurred_at)
-                        .bind(
-                            row.try_get::<String, _>("protocol")
-                                .unwrap_or_default(),
-                        )
-                        .bind(
-                            row.try_get::<Option<String>, _>("model_id")
-                                .ok()
-                                .flatten()
-                                .unwrap_or_default(),
-                        )
-                        .bind(attempt.usage.input_tokens)
-                        .bind(attempt.usage.cache_read_tokens)
-                        .bind(attempt.usage.cache_write_tokens)
-                        .bind(attempt.usage.cache_miss_input_tokens)
-                        .bind(attempt.usage.output_tokens)
-                        .bind(attempt.first_token_ms)
-                        .bind(attempt.duration_ms)
-                        .execute(&mut *tx)
-                        .await?;
+                    // protocol 读不出来就不写这一行统计：与其把一个无法归类的空协议
+                    // 写进 token_usage，不如少一行并留下告警。
+                    match row.try_get::<String, _>("protocol") {
+                        Ok(protocol) => {
+                            let model_id = match row.try_get::<Option<String>, _>("model_id") {
+                                Ok(model_id) => model_id,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        error = ?error,
+                                        attempt_id = attempt.id,
+                                        "token_usage model_id unreadable; recorded as NULL"
+                                    );
+                                    None
+                                }
+                            };
+                            // INSERT OR IGNORE 以 attempt id 去重：重放同一次尝试
+                            // 永远不会重复计数。
+                            sqlx::query("INSERT OR IGNORE INTO token_usage(attempt_id, occurred_at, bucket, protocol, model_id, input_tokens, cache_read_tokens, cache_write_tokens, cache_miss_input_tokens, output_tokens, first_token_ms, duration_ms) VALUES(?,?,strftime('%Y-%m-%dT%H:00:00Z', ?),?,?,?,?,?,?,?,?,?)")
+                                .bind(&attempt.id)
+                                .bind(&occurred_at)
+                                .bind(&occurred_at)
+                                .bind(protocol)
+                                .bind(model_id)
+                                .bind(attempt.usage.input_tokens)
+                                .bind(attempt.usage.cache_read_tokens)
+                                .bind(attempt.usage.cache_write_tokens)
+                                .bind(attempt.usage.cache_miss_input_tokens)
+                                .bind(attempt.usage.output_tokens)
+                                .bind(attempt.first_token_ms)
+                                .bind(attempt.duration_ms)
+                                .execute(&mut *tx)
+                                .await?;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                error = ?error,
+                                attempt_id = attempt.id,
+                                "token_usage skipped: protocol column is unreadable"
+                            );
+                        }
+                    }
                 }
             }
             tx.commit().await?;
         }
         Event::ChannelSuccess { channel_id } => {
-            sqlx::query("UPDATE channel_health SET state='active', consecutive_failures=0, disabled_until=NULL, last_success_at=?, last_error_kind=NULL, last_status_code=NULL, updated_at=? WHERE channel_id=?")
-                .bind(chrono::Utc::now().to_rfc3339()).bind(chrono::Utc::now().to_rfc3339()).bind(channel_id).execute(db.pool()).await?;
+            let at = chrono::Utc::now().to_rfc3339();
+            apply_health_event(
+                db.pool(),
+                HealthEvent::Success {
+                    channel_id: &channel_id,
+                    at: &at,
+                },
+            )
+            .await?;
         }
         Event::ChannelFailure {
             channel_id,
@@ -305,9 +225,21 @@ async fn write_event(db: &Database, event: Event) -> anyhow::Result<()> {
         } => {
             if countable {
                 let now = chrono::Utc::now();
-                let disabled = now + chrono::Duration::seconds(open_seconds);
-                sqlx::query("UPDATE channel_health SET consecutive_failures=consecutive_failures+1, last_failure_at=?, last_error_kind=?, last_status_code=?, state=CASE WHEN consecutive_failures+1 >= ? THEN 'open' ELSE state END, disabled_until=CASE WHEN consecutive_failures+1 >= ? THEN ? ELSE disabled_until END, updated_at=? WHERE channel_id=?")
-                    .bind(now.to_rfc3339()).bind(error_kind).bind(status).bind(threshold).bind(threshold).bind(disabled.to_rfc3339()).bind(now.to_rfc3339()).bind(channel_id).execute(db.pool()).await?;
+                let at = now.to_rfc3339();
+                let disabled_until =
+                    (now + chrono::Duration::seconds(open_seconds)).to_rfc3339();
+                apply_health_event(
+                    db.pool(),
+                    HealthEvent::RequestFailure {
+                        channel_id: &channel_id,
+                        at: &at,
+                        error_kind: Some(error_kind.as_str()),
+                        status,
+                        disabled_until: &disabled_until,
+                        threshold,
+                    },
+                )
+                .await?;
             }
         }
     }
@@ -318,6 +250,8 @@ async fn write_event(db: &Database, event: Event) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::db::Database;
+    use crate::domain::{AttemptData, Usage};
+    use crate::test_support::TempDir;
     use std::time::Duration;
 
     fn attempt_event(response_started: bool) -> Event {
@@ -352,15 +286,15 @@ mod tests {
         }))
     }
 
-    async fn temp_db() -> Database {
-        let dir =
-            std::env::temp_dir().join(format!("lagw-telemetry-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        Database::open(&dir.join("test.db")).await.unwrap()
+    /// 测试数据库与其临时目录：目录随返回值一起交给调用方，测试结束时由
+    /// `TempDir` 的 `Drop` 清理（必须等连接池用完，目录才会被删除）。
+    async fn temp_db() -> (Database, TempDir) {
+        let dir = TempDir::new("telemetry");
+        let db = Database::open(&dir.path().join("test.db")).await.unwrap();
+        (db, dir)
     }
 
-    /// Attempt rows reference their request log and channel via FK; seed the
-    /// parent rows exactly like the proxy flow does before writing an attempt.
+    /// 尝试行通过外键引用其请求日志与渠道；写尝试之前，像代理流程那样先播种父行。
     async fn seed_request(db: &Database) {
         let time = "2026-08-04T01:00:00+00:00";
         sqlx::query("INSERT INTO providers(id,name,base_url,created_at,updated_at) VALUES('prov-1','mock','http://127.0.0.1:1',?,?)")
@@ -393,7 +327,7 @@ mod tests {
 
     #[tokio::test]
     async fn responded_attempt_writes_token_usage_with_canonical_utc_time() {
-        let db = temp_db().await;
+        let (db, _dir) = temp_db().await;
         seed_request(&db).await;
         write_event(&db, attempt_event(true)).await.unwrap();
         let row: (String, String, String, String, i64, i64, i64) = sqlx::query_as(
@@ -414,9 +348,33 @@ mod tests {
         assert_eq!(row.6, 200);
     }
 
+    /// `request_logs.protocol` 不可读（类型不符）时跳过 token_usage 写入并留下
+    /// 告警——旧实现在这里 `unwrap_or_default()`，会写进一个空协议。
+    #[tokio::test]
+    async fn unreadable_protocol_column_skips_token_usage_without_panicking() {
+        let (db, _dir) = temp_db().await;
+        seed_request(&db).await;
+        // 用 BLOB 覆盖文本列：`try_get::<String>` 会失败（TEXT 亲和性不转换 BLOB）。
+        sqlx::query("UPDATE request_logs SET protocol = x'00ff' WHERE id='req-1'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        write_event(&db, attempt_event(true)).await.unwrap();
+        let usage_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM token_usage")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(usage_rows, 0, "no token_usage row may be written");
+        let attempt_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_attempts")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(attempt_rows, 1, "the attempt itself must still be recorded");
+    }
+
     #[tokio::test]
     async fn non_responded_attempt_never_reaches_token_usage() {
-        let db = temp_db().await;
+        let (db, _dir) = temp_db().await;
         seed_request(&db).await;
         write_event(&db, attempt_event(false)).await.unwrap();
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM token_usage")
@@ -433,7 +391,7 @@ mod tests {
 
     #[tokio::test]
     async fn replaying_the_same_attempt_rolls_back_and_never_double_counts() {
-        let db = temp_db().await;
+        let (db, _dir) = temp_db().await;
         seed_request(&db).await;
         write_event(&db, attempt_event(true)).await.unwrap();
         let error = write_event(&db, attempt_event(true)).await.unwrap_err();
@@ -456,11 +414,10 @@ mod tests {
         );
     }
 
-    /// P1-5: cancelling the writer must flush every queued event before exit,
-    /// and the task must be joinable promptly.
+    /// 取消 writer 必须让它在退出前排空所有排队事件，且任务能被及时 join。
     #[tokio::test]
     async fn writer_drains_remaining_events_on_cancel() {
-        let db = temp_db().await;
+        let (db, _dir) = temp_db().await;
         seed_request(&db).await;
         let (telemetry, rx) = Telemetry::new(1000);
         let cancel = CancellationToken::new();
@@ -481,8 +438,8 @@ mod tests {
         });
         telemetry.emit(attempt_event(false));
         cancel.cancel();
-        // The writer only exits once every sender is released (blocking
-        // drain), so the test must drop its own sender first.
+        // writer 只在所有发送端释放后才退出（阻塞式排空），所以测试必须先 drop
+        // 自己的发送端。
         let dropped_before = telemetry.dropped();
         drop(telemetry);
         tokio::time::timeout(Duration::from_secs(5), writer)
@@ -505,7 +462,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_usage_is_not_cascaded_by_log_deletion() {
-        let db = temp_db().await;
+        let (db, _dir) = temp_db().await;
         seed_request(&db).await;
         write_event(&db, attempt_event(true)).await.unwrap();
         let mut tx = db.pool().begin().await.unwrap();

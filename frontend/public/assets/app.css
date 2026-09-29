@@ -1,3 +1,12 @@
+/**
+ * 管理界面样式表：主题变量、页面外壳与组件样式。
+ *
+ * 职责：定义 `:root` 设计变量、布局（外壳/侧边栏/表格/表单/弹窗/抽屉）
+ * 以及各组件外观。
+ * 边界：只负责展示，不承载业务逻辑；类名与 app.js/ui.js 输出的结构一致。
+ * 关键不变量：主要语义色经 `:root` 变量；个别一次性色值就地硬编码；
+ * 响应式断点集中在文件末尾。
+ */
 :root {
   font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
   color: #17241f;
@@ -497,7 +506,7 @@ button:disabled { cursor: not-allowed; }
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
 }
 
-/* Model mapping assistants (Claude / Codex) */
+/* 模型映射助手（Claude / Codex） */
 .entry-banner {
   min-width: 0;
   display: flex;

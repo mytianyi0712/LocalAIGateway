@@ -1,17 +1,11 @@
-//! Desktop notification port implementation (P2-1): coalesced failover alerts.
+//! 桌面通知端口实现：把一次窗口内的故障转移合并成一条系统通知。
 //!
-//! `DesktopNotifier` queues failover notices on an unbounded channel; a single
-//! worker collects every notice that arrives within one `flush_window` (1s in
-//! production) and renders them into ONE system notification. A network blip
-//! that flips every channel in the pool therefore produces a single message
-//! instead of a notification storm, while every distinct failover is still
-//! reported — nothing is dropped by throttling, only batched.
-//!
-//! Delivery uses `notify-rust`: D-Bus `org.freedesktop.Notifications` on
-//! Linux (implemented by GNOME/KDE/XFCE/...), toast on Windows, osascript on
-//! macOS. When no notification daemon exists (headless server, missing D-Bus
-//! session) the send fails and is logged at debug level — the gateway keeps
-//! running, the alert is best-effort.
+//! 职责：`DesktopNotifier` 把故障转移通知投递到无界 channel，单个 worker 收集
+//! 一个 `flush_window`（生产 1 秒）内到达的全部通知并合并渲染成一条系统通知。
+//! 边界：仅做桌面通知；无通知守护进程（无头服务器、缺少 D-Bus 会话）时发送失败
+//! 只记 debug 日志，告警是尽力而为，绝不影响请求路径。
+//! 不变量：无界 channel 保证投递永不阻塞请求路径；限流只合并不丢弃；worker 在
+//! 生产路径由 `RuntimeSupervisor` 持有，测试/独立使用才用裸 task。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,49 +14,65 @@ use tokio::sync::mpsc;
 
 use crate::ports::{FailoverNotice, Notifier};
 
-/// Maximum failover entries rendered in one notification body.
+/// 一条通知正文中最多渲染的故障转移条目数。
 const MAX_LINES: usize = 4;
 
-/// Default collection window: failovers inside this span share one alert.
+/// 默认收集窗口：该时间跨度内的故障转移共用一个告警。
 pub const DEFAULT_FLUSH_WINDOW: Duration = Duration::from_secs(1);
 
-/// Renders and sends one coalesced notification.
+/// 渲染并发送一条合并后的通知。
 type SendFn = Box<dyn Fn(&str, &str) + Send>;
 
 pub struct DesktopNotifier {
     tx: mpsc::UnboundedSender<FailoverNotice>,
-    // Keep the handle alive so the worker is never dropped mid-loop; the
-    // worker exits on its own once the channel closes (all senders dropped).
-    _worker: tokio::task::JoinHandle<()>,
+    /// 生产路径由 [`crate::infrastructure::RuntimeSupervisor`] 持有 worker，
+    /// 因此这里是 `None`；测试与独立使用场景用 [`Self::new`] 的裸 task，句柄
+    /// 留在这里只为让 worker 不被提前 drop（channel 关闭后它会自行退出）。
+    _worker: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl DesktopNotifier {
-    /// Spawns the coalescing worker. Must be called from a Tokio runtime.
+    /// 起一个裸 worker task（测试/独立使用）。必须处于 Tokio 运行时内。
     pub fn new(flush_window: Duration) -> Arc<Self> {
         Self::with_sender(flush_window, Box::new(send_notification))
     }
 
-    /// Test seam: drive the same worker loop with a custom send function.
+    /// 构造并把 worker **注册进运行时监督器**：任务由 supervisor 持有，
+    /// `shutdown` 会等到它真正结束，不会留下一个无人等待的后台任务。
+    /// 已经进入关停流程时返回 [`crate::infrastructure::ShuttingDown`]。
+    pub async fn registered(
+        flush_window: Duration,
+        supervisor: &Arc<crate::infrastructure::RuntimeSupervisor>,
+    ) -> Result<Arc<Self>, crate::infrastructure::ShuttingDown> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        supervisor
+            .spawn(async move {
+                worker_loop(rx, flush_window, Box::new(send_notification)).await;
+            })
+            .await?;
+        Ok(Arc::new(Self { tx, _worker: None }))
+    }
+
+    /// 测试接缝：用自定义的发送函数驱动同一套 worker 循环。
     fn with_sender(flush_window: Duration, send: SendFn) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
         let worker = tokio::spawn(worker_loop(rx, flush_window, send));
         Arc::new(Self {
             tx,
-            _worker: worker,
+            _worker: Some(worker),
         })
     }
 }
 
 impl Notifier for DesktopNotifier {
     fn notify_failover(&self, notice: FailoverNotice) {
-        // Unbounded channel: the request path never blocks or waits.
+        // 无界 channel：请求路径永不阻塞或等待。
         let _ = self.tx.send(notice);
     }
 }
 
-/// Coalescing loop: receive the first notice, keep draining for one window,
-/// flush the batch, repeat. On channel close (all senders dropped) the
-/// remaining batch is flushed and the loop exits.
+/// 合并循环：收到第一条通知后，在一个窗口内持续排空，然后 flush 该批次，如此
+/// 往复。channel 关闭（所有发送端 drop）时，flush 剩余批次后退出循环。
 async fn worker_loop<F>(mut rx: mpsc::UnboundedReceiver<FailoverNotice>, window: Duration, send: F)
 where
     F: Fn(&str, &str) + Send + 'static,
@@ -76,7 +86,7 @@ where
                 _ = &mut deadline => break,
                 next = rx.recv() => match next {
                     Some(notice) => batch.push(notice),
-                    // Sender closed mid-window: flush what we have.
+                    // 窗口中途发送端关闭：把已收到的内容 flush 出去。
                     None => break,
                 },
             }
@@ -85,8 +95,7 @@ where
     }
 }
 
-/// Actual delivery on a blocking thread (D-Bus/toast round-trips must never
-/// touch the async request path).
+/// 在阻塞线程上实际投递（D-Bus/toast 往返绝不能触碰异步请求路径）。
 #[cfg(not(target_os = "windows"))]
 fn send_notification(title: &str, body: &str) {
     let title = title.to_owned();
@@ -98,16 +107,15 @@ fn send_notification(title: &str, body: &str) {
             .appname("Local AI Gateway")
             .show();
         if let Err(error) = result {
-            // No daemon available (headless server, no D-Bus session): the
-            // alert is best-effort, never surface it on the request path.
+            // 没有可用的通知守护进程（无头服务器、无 D-Bus 会话）：告警是尽力而为
+            // 的，绝不能让它出现在请求路径上。
             tracing::debug!(error = %error, "failover notification not delivered");
         }
     });
 }
 
-/// Windows toast delivery. `POWERSHELL_APP_ID` is a registered AUMID that
-/// every Windows 10/11 system has, so the toast renders without the gateway
-/// being a packaged app.
+/// Windows toast 投递。`POWERSHELL_APP_ID` 是每个 Windows 10/11 系统都注册的
+/// AUMID，因此即使网关不是打包应用，toast 也能正常渲染。
 #[cfg(target_os = "windows")]
 fn send_notification(title: &str, body: &str) {
     let title = title.to_owned();
@@ -133,7 +141,7 @@ fn render_title(entries: &[FailoverNotice]) -> String {
     }
 }
 
-/// One line per failover, truncated at `MAX_LINES` with a tail summary.
+/// 每次故障转移一行，超过 `MAX_LINES` 截断并附一行尾部汇总。
 fn render_body(entries: &[FailoverNotice]) -> String {
     let mut lines: Vec<String> = entries
         .iter()
@@ -166,6 +174,28 @@ mod tests {
         }
     }
 
+    /// `registered()` 的 worker 归监督器所有——计数 +1、shutdown 后归零。
+    #[tokio::test]
+    async fn registered_worker_is_owned_by_the_supervisor() {
+        let supervisor = Arc::new(crate::infrastructure::RuntimeSupervisor::new(
+            tokio_util::sync::CancellationToken::new(),
+        ));
+        let notifier = DesktopNotifier::registered(Duration::from_millis(20), &supervisor)
+            .await
+            .expect("supervisor accepts tasks before shutdown");
+        assert_eq!(
+            supervisor.active_task_count(),
+            1,
+            "the notifier worker must be visible to the supervisor"
+        );
+        // 释放发送端 → worker 的 channel 关闭 → worker 自行退出。
+        drop(notifier);
+        supervisor
+            .shutdown(Duration::from_secs(2))
+            .await;
+        assert_eq!(supervisor.active_task_count(), 0);
+    }
+
     #[test]
     fn single_entry_body_has_no_counter() {
         let entries = vec![notice("m1", "a", "b", Some("connect_timeout"))];
@@ -190,8 +220,8 @@ mod tests {
         assert!(body.ends_with("…等 6 条"));
     }
 
-    /// Two notices inside one window produce exactly one notification
-    /// carrying both entries; a later notice opens a second batch.
+    /// 同一窗口内的两条通知只产生一条通知、同时携带两条条目；
+    /// 之后到达的通知会开启第二个批次。
     #[tokio::test]
     async fn window_coalesces_and_new_window_flushes() {
         let sent: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -216,12 +246,12 @@ mod tests {
         assert_eq!(sent.len(), 2, "two windows -> two notifications");
         assert!(sent[0].0.contains("×2"));
         assert!(sent[0].1.contains("m1：a → b") && sent[0].1.contains("m2：c → d"));
-        // Single-entry batches carry no counter suffix.
+        // 单条目批次不带计数后缀。
         assert!(!sent[1].0.contains("×"));
         assert!(sent[1].1.contains("m3：e → f"));
     }
 
-    /// Closing the channel mid-window still flushes the partial batch.
+    /// 窗口尚未结束就关闭 channel，仍会 flush 出这批不完整的批次。
     #[tokio::test]
     async fn channel_close_flushes_partial_batch() {
         let sent: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));

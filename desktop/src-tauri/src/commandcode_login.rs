@@ -536,7 +536,7 @@ async fn validate_api_key(
         Err(_) => return ApiKeyVerdict::Server,
     };
     let mut headers = HeaderMap::new();
-    match HeaderValue::from_str(&format!("Bearer {api_key}")) {
+    match crate::protocol::bearer_header(api_key) {
         Ok(value) => {
             headers.insert(header::AUTHORIZATION, value);
         }
@@ -1126,7 +1126,7 @@ mod tests {
             other => panic!("expected success, got {other:?}"),
         }
         assert_eq!(whoami.keys(), vec!["user_login_key".to_owned()]);
-        // The loopback server is gone once the attempt settles.
+        // 尝试结束后回环服务即关闭。
         assert!(
             client
                 .post(&callback)
@@ -1159,7 +1159,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(flow.status().is_waiting(), "stale state must not kill the attempt");
 
-        // The real state still completes afterwards.
+        // 正确的 state 随后仍能完成登录。
         let response = client
             .post(&callback)
             .json(&json!({
@@ -1185,8 +1185,8 @@ mod tests {
             other => panic!("expected waiting, got {other:?}"),
         });
         let client = test_client();
-        // State-less denial (a CORS simple request any page could send) is
-        // refused and the attempt survives.
+        // 不带 state 的拒绝（任意页面都能发出的 CORS 简单请求）会被拒绝，
+        // 且该次尝试继续存活。
         let response = client
             .post(&callback)
             .header("content-type", "text/plain")
@@ -1276,7 +1276,7 @@ mod tests {
             LoginStatus::Failed { reason, .. } => assert_eq!(reason, LoginFailure::Timeout),
             other => panic!("expected timeout, got {other:?}"),
         }
-        // The callback server must be gone too.
+        // 回调服务也必须一并关闭。
         assert!(
             test_client()
                 .post(&callback)
@@ -1321,7 +1321,7 @@ mod tests {
         let client = test_client();
         let callback_url = url::Url::parse(&callback).unwrap();
 
-        // Preflight from an allowlisted Studio origin echoes CORS + PNA.
+        // 来自白名单 Studio Origin 的预检会回显 CORS + PNA。
         let preflight = client
             .request(reqwest::Method::OPTIONS, &callback)
             .header("origin", "https://commandcode.ai")
@@ -1343,7 +1343,7 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("true")
         );
-        // A foreign origin is not echoed.
+        // 非白名单 Origin 不回显。
         let foreign = client
             .request(reqwest::Method::OPTIONS, &callback)
             .header("origin", "https://evil.example")
@@ -1356,7 +1356,7 @@ mod tests {
                 .get("access-control-allow-origin")
                 .is_none_or(|value| value.is_empty())
         );
-        // Wrong path / method / JSON / fields.
+        // 路径 / 方法 / JSON / 字段错误的情形。
         let other = url::Url::parse(&format!(
             "http://{}:{}/other",
             callback_url.host_str().unwrap(),

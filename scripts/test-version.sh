@@ -9,6 +9,7 @@
 #   - 打包产物文件名中的版本可解析（Arch / NSIS / deb / AppImage 命名约定）
 #   - 历史 releases/ 产物列表在测试前后不变（未被改动）
 # 用法：./scripts/test-version.sh
+# 前提：需要 python3（或 python），第 7 步需要 cargo；所有写入都发生在 mktemp 沙箱内。
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 SANDBOX="$(mktemp -d)"
@@ -116,7 +117,7 @@ ok "Arch 文件名版本解析: 0.2.1 与预发布 0.3.0_rc.1"
 
 for name in \
   "Local AI Gateway_0.2.1_x64-setup.exe" \
-  "local-ai-gateway_0.2.1_amd64.deb" \
+  "Local AI Gateway_0.2.1_amd64.deb" \
   "Local AI Gateway_0.2.1_amd64.AppImage"; do
   [[ "$name" == *"0.2.1"* ]] || fail "打包文件名缺少 0.2.1: $name"
 done

@@ -1,14 +1,10 @@
-//! Background maintenance — port of backend/app/services/maintenance.py (C4).
+//! 后台维护循环：调度模型发现、收尾卡住的 pending 请求日志、按保留期清理。
 //!
-//! Runs a 60-second loop that:
-//! 1. schedules model discovery for channels whose last run is older than
-//!    `model_discovery_interval_hours`,
-//! 2. finalizes request logs stuck in `pending` (cancelled, with a computed
-//!    duration),
-//! 3. deletes logs/probes/runs older than `log_retention_days` (hourly).
-//!
-//! `reconcile_completed_stream_cancellations` repairs legacy rows where a
-//! fully completed stream was recorded as cancelled; it runs once at startup.
+//! 每 60 秒运行一次：①为上次运行早于 `model_discovery_interval_hours` 的渠道调度
+//! 模型发现；②把卡在 `pending` 的请求日志收尾为 cancelled 并补上计算出的耗时；
+//! ③删除超过 `log_retention_days` 的日志/探测/运行记录（每小时至多一次）。
+//! 边界：只做后台维护，不处理请求路径。`reconcile_completed_stream_cancellations`
+//! 修复历史上把已完整完成的流记成 cancelled 的记录，仅在启动时运行一次。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,30 +15,34 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::application::Context;
+use crate::state::AppState;
 use crate::settings;
 
-/// Final attempt bookkeeping read back from `request_attempts` for repair:
-/// (outcome, status_code, response_started, has_raw_usage, output_tokens).
+/// 从 `request_attempts` 读回、用于修复的最终尝试记账：
+/// (outcome, status_code, response_started, has_raw_usage, output_tokens)。
 type FinalAttempt = (String, Option<i64>, Option<i64>, bool, Option<i64>);
 
-/// Repair legacy cancellations that already captured a completed stream's
-/// usage (Python `reconcile_completed_stream_cancellations`).
-pub async fn reconcile_completed_stream_cancellations(state: &Context) -> anyhow::Result<i64> {
-    let rows: Vec<(String, String)> = sqlx::query(
+/// 修复历史上已捕获完整流用量、却被记成 cancelled 的取消记录。
+pub async fn reconcile_completed_stream_cancellations(state: &AppState) -> anyhow::Result<i64> {
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for row in sqlx::query(
         "SELECT rl.id, rl.response_bytes FROM request_logs rl \
          WHERE rl.outcome = 'cancelled' AND rl.final_status_code = 200 AND rl.response_bytes > 0",
     )
     .fetch_all(state.db.pool())
     .await?
-    .into_iter()
-    .map(|row| {
-        (
-            row.try_get("id").unwrap_or_default(),
-            row.try_get("response_bytes").unwrap_or_default(),
-        )
-    })
-    .collect();
+    {
+        // 读不出来的行直接跳过并告警：用 `unwrap_or_default()` 会伪造出一个空
+        // id，后续按 id 修复会命中错误的记录。
+        let (Ok(id), Ok(response_bytes)) = (
+            row.try_get::<String, _>("id"),
+            row.try_get::<String, _>("response_bytes"),
+        ) else {
+            tracing::warn!("cancelled-stream repair: skipping unreadable request_logs row");
+            continue;
+        };
+        rows.push((id, response_bytes));
+    }
     let mut repaired = 0i64;
     for (request_id, _) in rows {
         let final_attempt: Option<FinalAttempt> = sqlx::query(
@@ -93,14 +93,12 @@ pub async fn reconcile_completed_stream_cancellations(state: &Context) -> anyhow
     Ok(repaired)
 }
 
-/// Background supervisor loop (Python `MaintenanceSupervisor`, 60s cadence).
-/// This is the task body itself: the [`RuntimeSupervisor`] registers it
-/// directly, so no `tokio::spawn` boundary can detach it (P1-1). Scheduled
-/// discoveries are queued on the same supervisor via
-/// [`DiscoveryService::queue_scheduled`], so shutdown drains them with the
-/// rest of the runtime.
-pub async fn run_supervisor(state: Context, cancel: CancellationToken) {
-    // P2-8: a startup reconciliation failure must not end silently.
+/// 后台监督循环主体（60 秒节奏）：`RuntimeSupervisor` 直接注册这个任务体，
+/// 因此不存在可能让任务脱管的 `tokio::spawn` 边界。预定发现通过
+/// `DiscoveryService::queue_scheduled` 排进同一个监督器，关停时会与其余运行时
+/// 任务一起被排空。
+pub async fn run_supervisor(state: AppState, cancel: CancellationToken) {
+    // 启动期修复失败不能悄无声息地结束。
     if let Err(error) = reconcile_completed_stream_cancellations(&state).await {
         tracing::warn!(%error, "startup stream reconciliation failed");
     }
@@ -120,9 +118,10 @@ pub async fn run_supervisor(state: Context, cancel: CancellationToken) {
                 if let Err(error) = finalize_stale_pending_requests(&state).await {
                     tracing::warn!(%error, "stale request finalization failed");
                 }
-                // Balance refresh is default-off per channel: with no
-                // enabled config row this resolves to a single local SELECT
-                // and zero upstream requests.
+                // 余额刷新默认按渠道关闭：没有启用的配置行时，这里只解析成一次本地
+                // SELECT，不产生任何上游请求。
+                // 此处为已知的 fail-open 行为：读取运行时设置失败会退化为默认值继续运行
+                // （不改代码）。
                 let runtime = settings::runtime_settings(&state).await.unwrap_or_default();
                 if runtime.command_code_enabled {
                     let version_due = last_command_code_version.is_none_or(|last| {
@@ -156,9 +155,8 @@ pub async fn run_supervisor(state: Context, cancel: CancellationToken) {
                         last_command_code_version = Some(Instant::now());
                     }
                 }
-                // Command Code quota windows (5h) reset faster than the
-                // hourly balance cadence, so the configured quota interval
-                // shortens it while the integration is enabled.
+                // Command Code 的配额窗口（5h）重置得比每小时的余额节奏更快，
+                // 因此在集成启用时用配置的配额间隔缩短它。
                 let balance_interval = if runtime.command_code_enabled {
                     state.limits.balance_interval.min(Duration::from_secs(
                         runtime.command_code_quota_interval_minutes.max(1) as u64 * 60,
@@ -186,10 +184,10 @@ pub async fn run_supervisor(state: Context, cancel: CancellationToken) {
     }
 }
 
-/// Create `scheduled` discovery runs for enabled channels whose last run is
-/// older than `model_discovery_interval_hours` and spawn the background work.
+/// 为上次运行早于 `model_discovery_interval_hours` 的启用渠道创建 `scheduled`
+/// 发现运行，并启动后台工作。
 async fn schedule_discovery(
-    state: &Context,
+    state: &AppState,
     discovering: &Arc<Mutex<HashMap<String, String>>>,
 ) -> anyhow::Result<()> {
     let runtime = settings::runtime_settings(state).await?;
@@ -215,7 +213,7 @@ async fn schedule_discovery(
         }
     }
     let mut discovering = discovering.lock().await;
-    // Drop channels whose queued run already finished.
+    // 丢弃排队的运行已经结束的渠道。
     let mut finished = Vec::new();
     for (channel_id, run_id) in discovering.iter() {
         let done: Option<Option<String>> =
@@ -250,9 +248,8 @@ async fn schedule_discovery(
     Ok(())
 }
 
-/// Mark request logs stuck in `pending` as cancelled (Python
-/// `_finalize_stale_pending_requests`).
-async fn finalize_stale_pending_requests(state: &Context) -> anyhow::Result<()> {
+/// 把卡在 `pending` 的请求日志标记为 cancelled。
+async fn finalize_stale_pending_requests(state: &AppState) -> anyhow::Result<()> {
     let runtime = settings::runtime_settings(state).await?;
     let stale_seconds = runtime
         .stream_idle_timeout_seconds
@@ -297,9 +294,9 @@ async fn finalize_stale_pending_requests(state: &Context) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Delete requests, attempts, probes and discovery runs older than
-/// `log_retention_days` (Python `_cleanup_logs`, at most once per hour).
-async fn cleanup_logs(state: &Context) -> anyhow::Result<()> {
+/// 删除超过 `log_retention_days` 的请求、尝试、探测与发现运行记录
+/// （每小时至多一次）。
+async fn cleanup_logs(state: &AppState) -> anyhow::Result<()> {
     let runtime = settings::runtime_settings(state).await?;
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(runtime.log_retention_days.max(1)))
         .to_rfc3339();

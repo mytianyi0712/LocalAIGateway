@@ -211,7 +211,7 @@ erDiagram
 | 字段 | 类型 | 约束 | 说明 |
 | --- | --- | --- | --- |
 | `channel_id` | TEXT | PK, FK `channels.id` ON DELETE CASCADE | 所属渠道 |
-| `adapter` | TEXT | NOT NULL | `newapi` / `sub2api` / `opencode_go` / `deepseek` / `custom` |
+| `adapter` | TEXT | NOT NULL | `newapi` / `sub2api` / `opencode_go` / `deepseek` / `command_code` / `mimo` / `openrouter` / `siliconflow` / `stepfun` / `novita` / `moonshot` / `zhipu` / `minimax` / `kimi_code` / `custom` |
 | `enabled` | BOOLEAN | NOT NULL, 默认 0 | 手动/后台刷新的唯一开关 |
 | `method` | TEXT | NOT NULL, 默认 `GET` | 仅 `custom` 使用；内置适配器固定 `GET` |
 | `path` | TEXT | NULL | `custom` 必填；内置适配器保存其预置路径 |

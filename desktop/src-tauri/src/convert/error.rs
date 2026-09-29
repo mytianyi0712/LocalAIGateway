@@ -1,7 +1,15 @@
-//! 错误响应转换（error.rs）。
+//! 错误响应转换与流式内容判定。
+//!
+//! 职责：把上游错误体转成入口协议的错误响应；判定流式分片是否携带首个生成
+//! token（供 `first_token_ms` 遥测使用）。
+//! 边界：不负责重试、熔断与状态码选择，只做报文形态转换与内容判定。
+//! 关键不变量：转换后的错误体符合入口协议的错误结构；`chunk_has_content`
+//! 只看事件内容，不依赖上游正文。
 
 use super::*;
 
+// 与 scan.rs::stream_error_message 的差异：本函数处理非 2xx 错误体（含非 JSON 原文），
+// 产出入口协议的错误响应并可由 type/code/status 归类；后者只从 2xx 流事件取 message。不合并。
 pub(super) fn error_payload(entry: &str, upstream_protocol: &str, body: &[u8]) -> Vec<u8> {
     if entry == upstream_protocol {
         return body.to_vec();
@@ -28,8 +36,7 @@ pub(super) fn error_payload(entry: &str, upstream_protocol: &str, body: &[u8]) -
             message = raw;
         }
     }
-    // Text-expressed context overflow gets a stable classification while
-    // the upstream text stays in the message (plan §2.8).
+    // 用文本表达的上下文溢出给出稳定分类，同时把上游原文保留到 message 中。
     if is_context_overflow(&message) {
         error_type = "context_length_exceeded".to_owned();
     }
@@ -47,16 +54,14 @@ pub(super) fn error_payload(entry: &str, upstream_protocol: &str, body: &[u8]) -
     }
 }
 
-/// Entry-agnostic error conversion (convert_mapped_error_response).
+/// 与入口协议无关的错误转换入口。
 pub fn convert_error(entry: &str, upstream_protocol: &str, body: &[u8]) -> Vec<u8> {
     error_payload(entry, upstream_protocol, body)
 }
 
-/// Text-expressed context overflow (Command Code and several compatible
-/// upstreams carry no stable error code — plan §2.8). The pattern set
-/// mirrors the community `overflow.ts` implementation: a positive
-/// context/prompt/input-exceeds pattern that is NOT a rate-limit /
-/// capacity / availability error.
+/// 判定文本形式的上下文溢出：Command Code 及部分兼容上游没有稳定的错误码，
+/// 只能从错误文案判断。规则为「命中上下文/提示词/输入超限的正向模式，
+/// 且不属于限流/容量/不可用类错误」。
 pub fn is_context_overflow(message: &str) -> bool {
     const NON_OVERFLOW: &[&str] = &[
         "rate limit",
@@ -112,15 +117,14 @@ pub fn is_context_overflow(message: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// stream diagnostics used by the proxy pipeline
+// 代理流水线使用的流式诊断
 // ---------------------------------------------------------------------------
 
-/// True when a streamed chunk carries the first generated token.
+/// 流式分片是否携带首个生成 token。
 ///
-/// Counts visible text, reasoning/thinking, and tool-call deltas. Newer
-/// models (DeepSeek V4, GPT-5.x, Claude thinking) often emit those before
-/// any string `delta.content` / `delta.text`; treating only the latter as
-/// content left `first_token_ms` null on successful streams.
+/// 计入可见文本、推理/思考内容与工具调用增量。较新的模型（DeepSeek V4、
+/// GPT-5.x、Claude thinking）常在字符串 `delta.content` / `delta.text`
+/// 之前就发出这些内容，只认后者会让成功流的 `first_token_ms` 为空。
 pub fn chunk_has_content(protocol: &str, value: &Value) -> bool {
     match protocol {
         "claude" => claude_chunk_has_content(value),
@@ -230,7 +234,7 @@ mod tests {
 
     #[test]
     fn context_overflow_matches_text_patterns_and_rejects_rate_limits() {
-        // Positive patterns from docs/command-code-protocol.md §9.
+        // 应判为上下文溢出的正向样例。
         for message in [
             "Prompt is too long: context length exceeded (requested 300000 tokens)",
             "The model context window has been exceeded",
@@ -241,7 +245,7 @@ mod tests {
         ] {
             assert!(is_context_overflow(message), "{message}");
         }
-        // Rate-limit / capacity text must never be classified as overflow.
+        // 限流/容量类文案绝不能算作上下文溢出。
         for message in [
             "Rate limit exceeded, retry later",
             "too many requests",

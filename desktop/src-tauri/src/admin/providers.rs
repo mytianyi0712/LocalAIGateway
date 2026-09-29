@@ -1,8 +1,14 @@
-//! admin API 域模块：供应商 CRUD（provider 域，服务层已形式化）
-//! 每个域文件包含该资源的 handler（薄壳）与输入/输出类型；
-//! 所有 SQL 与响应组装都在 super::AdminService —— 这里只做 extractor/DTO。
+//! admin API 域模块：供应商 CRUD（provider 域）。
+//!
+//! handler 只做参数提取与响应透传；供应商的具名服务方法在 `admin/mod.rs` 的
+//! `impl AdminService` 里。本文件还保留 `load_provider` 查询助手，以及被该服务
+//! 复用的 `provider_json`、`validate_provider_kind` 等无状态函数。
 
-use super::*;
+use super::ApiResult;
+use crate::api_error::ApiError;
+use crate::auth::AdminAuth;
+use crate::db::Database;
+use crate::state::AppState;
 use axum::{
     Json,
     extract::{Path, State},
@@ -25,12 +31,11 @@ pub(super) fn provider_json(row: ProviderRow) -> Value {
     json!({"id":row.id,"name":row.name,"base_url":row.base_url,"kind":row.kind,"channel_count":row.channel_count,"created_at":row.created_at,"updated_at":row.updated_at})
 }
 
-/// Known non-default provider kinds. `command_code` opts a provider into
-/// Command Code CLI identity headers (plan decision 2); everything else is
-/// `None` and behaviorally identical to the pre-0005 gateway.
+/// 已知的非默认供应商类型。`command_code` 表示该供应商走 Command Code CLI
+/// 身份路径（请求头、协议绑定与探测都受影响）；其余取值一律为 `None`。
 pub(super) const KNOWN_PROVIDER_KINDS: [&str; 1] = ["command_code"];
 
-/// Normalize + validate the optional `kind` field: an empty string clears it.
+/// 规范化并校验可选的 `kind` 字段：空字符串视为清除。
 pub(super) fn validate_provider_kind(kind: Option<&str>) -> Result<Option<String>, ApiError> {
     let Some(kind) = kind else { return Ok(None) };
     let kind = kind.trim();
@@ -58,7 +63,7 @@ pub struct ProviderPatch {
     pub kind: Option<String>,
 }
 
-pub(super) async fn list_providers(_: AdminAuth, State(state): State<Context>) -> ApiResult {
+pub(super) async fn list_providers(_: AdminAuth, State(state): State<AppState>) -> ApiResult {
     state.admin.list_providers().await
 }
 pub(super) async fn load_provider(db: &Database, row_id: &str) -> Result<ProviderRow, ApiError> {
@@ -67,21 +72,21 @@ pub(super) async fn load_provider(db: &Database, row_id: &str) -> Result<Provide
 }
 pub(super) async fn create_provider(
     _: AdminAuth,
-    State(state): State<Context>,
+    State(state): State<AppState>,
     Json(input): Json<ProviderInput>,
 ) -> ApiResult {
     state.admin.create_provider(input).await
 }
 pub(super) async fn get_provider(
     _: AdminAuth,
-    State(state): State<Context>,
+    State(state): State<AppState>,
     Path(row_id): Path<String>,
 ) -> ApiResult {
     state.admin.get_provider(&row_id).await
 }
 pub(super) async fn patch_provider(
     _: AdminAuth,
-    State(state): State<Context>,
+    State(state): State<AppState>,
     Path(row_id): Path<String>,
     Json(input): Json<ProviderPatch>,
 ) -> ApiResult {
@@ -89,7 +94,7 @@ pub(super) async fn patch_provider(
 }
 pub(super) async fn delete_provider(
     _: AdminAuth,
-    State(state): State<Context>,
+    State(state): State<AppState>,
     Path(row_id): Path<String>,
 ) -> ApiResult {
     state.admin.delete_provider(&row_id).await

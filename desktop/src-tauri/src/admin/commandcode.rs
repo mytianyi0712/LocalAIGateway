@@ -4,9 +4,14 @@
 //! 这里只做输入规范化与状态透出；**密钥绝不经过这些端点**——成功时只返回
 //! 一次性 `login_id`，由 `POST /channels`（或 PATCH）在服务端取走并加密入库。
 
-use super::*;
-use axum::extract::State;
+use super::{ApiResult, ok};
+use crate::api_error::ApiError;
+use crate::auth::AdminAuth;
+use crate::protocol::normalize_base_url;
+use crate::state::AppState;
+use axum::{Json, extract::State};
 use serde::Deserialize;
+use serde_json::{Value, json};
 
 #[derive(Deserialize, Default)]
 pub struct CommandCodeLoginInput {
@@ -28,7 +33,7 @@ fn normalize_login_api_base(input: Option<String>) -> Result<String, ApiError> {
     }
 }
 
-fn login_json(state: &Context) -> Value {
+fn login_json(state: &AppState) -> Value {
     json!({
         "login": state.command_code_login.status(),
         "cli_key_available": state.command_code_login.cli_key_available(),
@@ -38,7 +43,7 @@ fn login_json(state: &Context) -> Value {
 /// 开始（或加入）一次浏览器登录；返回待打开的 Studio 授权 URL。
 pub(super) async fn command_code_login_begin(
     _: AdminAuth,
-    State(state): State<Context>,
+    State(state): State<AppState>,
     Json(input): Json<CommandCodeLoginInput>,
 ) -> ApiResult {
     let api_base = normalize_login_api_base(input.api_base)?;
@@ -55,14 +60,14 @@ pub(super) async fn command_code_login_begin(
 
 pub(super) async fn command_code_login_status(
     _: AdminAuth,
-    State(state): State<Context>,
+    State(state): State<AppState>,
 ) -> ApiResult {
     Ok(ok(login_json(&state)))
 }
 
 pub(super) async fn command_code_login_cancel(
     _: AdminAuth,
-    State(state): State<Context>,
+    State(state): State<AppState>,
 ) -> ApiResult {
     state.command_code_login.cancel();
     Ok(ok(login_json(&state)))
@@ -72,7 +77,7 @@ pub(super) async fn command_code_login_cancel(
 /// 走与网页登录相同的 whoami 校验与一次性交接。
 pub(super) async fn command_code_login_import_cli(
     _: AdminAuth,
-    State(state): State<Context>,
+    State(state): State<AppState>,
     Json(input): Json<CommandCodeLoginInput>,
 ) -> ApiResult {
     let api_base = normalize_login_api_base(input.api_base)?;

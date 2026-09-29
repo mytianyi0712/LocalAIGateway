@@ -1,13 +1,21 @@
+//! 协议注册表与边界助手：`ProtocolId` 枚举是受支持协议的权威标识，
+//! 每个协议通过 [`ProtocolAdapter`] 提供入口解析、目录发现、健康探测、
+//! 用量归一化与错误体形状；本模块同时集中协议字符串 ↔ 枚举的转换、
+//! 上游 URL 拼装、出站/响应头过滤，以及 Command Code / OpenCode 的专有头注入。
+//!
+//! 边界：本模块不发起网络请求，也不读写数据库，只做纯函数式的策略与编码。
+//! 关键不变量：字符串边界一律经 `ProtocolId::parse` 校验；`PROTOCOL_ORDER`
+//! 与 `PROTOCOL_ORDER_SQL` 的字面量必须与 `ProtocolId::as_str` 保持同步。
 use anyhow::{Context, Result, bail};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use serde_json::{Value, json};
 use url::Url;
 
-use crate::telemetry::Usage;
+use crate::domain::Usage;
 
-/// One health probe request: method, upstream path and optional JSON body.
-/// Most protocols probe with a tiny POST; Command Code probes its read-only
-/// `GET /alpha/whoami` (authentication only — no token spend, no generation).
+/// 一次健康探测请求：方法、上游路径与可选 JSON body。
+/// 多数协议用一次极小的 POST 探测；Command Code 探测其只读的
+/// `GET /alpha/whoami`（仅鉴权——不消耗 token，也不触发生成）。
 #[derive(Debug, Clone)]
 pub struct HealthProbe {
     pub method: http::Method,
@@ -23,52 +31,48 @@ fn post_probe(path: String, body: Value) -> HealthProbe {
     }
 }
 
-/// Per-protocol behavior bundle (P2-3): authentication, entry parsing,
-/// discovery, health probes, usage observation and the public error shape.
-/// One implementation per protocol, obtained from [`ProtocolId::adapter`];
-/// adding a protocol extends the enum AND provides an adapter — the
-/// registry replaces the scattered string `match` dispatch.
+/// 单个协议的行为包：鉴权、入口解析、目录发现、健康探测、用量观测
+/// 与对外错误体形状。每个协议一份实现，经 [`ProtocolId::adapter`] 获取；
+/// 新增协议需同时扩展枚举并提供适配器——该注册表取代了散落的字符串
+/// `match` 分派。
 ///
-/// Protocol *conversion* (the `(entry, upstream) -> strategy` matrix in
-/// convert.rs) is intentionally separate and stays string-keyed for now.
+/// 协议*转换*（`convert.rs` 中的 `(entry, upstream) -> strategy` 矩阵）
+/// 有意保持独立，目前仍以字符串为键。
 pub trait ProtocolAdapter {
-    /// Entry-path model/stream extraction from the raw request.
+    /// 从原始请求的入口路径中提取 model / stream。
     fn inspect_request(
         &self,
         path: &str,
         query: Option<&str>,
         body: &[u8],
     ) -> (Option<String>, bool);
-    /// Upstream model-catalog path.
+    /// 上游模型目录路径。
     fn discovery_path(&self) -> &'static str;
-    /// Parse one catalog page; returns (items, optional next-page URL).
+    /// 解析一页目录；返回 (条目列表, 可选的下一页 URL)。
     fn parse_catalog(&self, body: &[u8], current_url: &Url) -> Result<(Vec<Value>, Option<Url>)>;
-    /// Minimal health-probe request for `model`.
+    /// 针对 `model` 的最小健康探测请求。
     fn health_probe(&self, model: &str) -> HealthProbe;
-    /// Whether a probe response body counts as healthy.
+    /// 判断探测响应体是否算作健康。
     fn probe_body_ok(&self, body: &[u8]) -> bool;
-    /// Raw usage object inside a streamed event or response root.
+    /// 流式事件或响应根节点内的原始用量对象。
     fn usage_value(&self, value: &Value) -> Option<Value>;
-    /// Normalize a raw usage object into the gateway's Usage model.
+    /// 把原始用量对象归一化为网关的 Usage 模型。
     fn normalize_usage(&self, usage: &Value) -> Usage;
-    /// Public gateway-error body shape for this protocol.
+    /// 本协议对外暴露的网关错误体形状。
     fn error_shape(&self, status: StatusCode, code: &str, message: &str, request_id: &str)
     -> Value;
-    /// Rewrite the outbound model id for a single candidate. Returns the
-    /// (possibly unchanged) request path and, only when the body actually
-    /// changed, the new body — `None` means "keep the original bytes".
+    /// 为单个候选重写出站 model id。返回（可能未变的）请求路径，以及
+    /// 仅在 body 确实变化时才给出的新 body——`None` 表示“保留原始字节”。
     ///
-    /// Callers invoke this **only** when the gateway-facing model differs from
-    /// the candidate's upstream `channel_models.model_id`, so the ordinary
-    /// byte-exact passthrough never re-serializes the request.
+    /// 仅当面向网关的 model 与候选上游 `channel_models.model_id` 不同时，
+    /// 调用方才调用本方法，因此常规的逐字节透传永远不会重新序列化请求。
     fn retarget_model(&self, path: &str, body: &[u8], model: &str) -> (String, Option<Vec<u8>>) {
         (path.to_owned(), set_json_model(body, model))
     }
 }
 
-/// Set the top-level `model` field of a JSON request body, preserving every
-/// other field. `None` when the body is not a JSON object (callers then keep
-/// the original bytes).
+/// 设置 JSON 请求体顶层的 `model` 字段，保留其它所有字段。
+/// 当 body 不是 JSON 对象时返回 `None`（调用方此时保留原始字节）。
 fn set_json_model(body: &[u8], model: &str) -> Option<Vec<u8>> {
     let mut value: Value = serde_json::from_slice(body).ok()?;
     value.as_object_mut()?;
@@ -76,8 +80,8 @@ fn set_json_model(body: &[u8], model: &str) -> Option<Vec<u8>> {
     serde_json::to_vec(&value).ok()
 }
 
-/// Percent-encode characters reserved in the Gemini `/models/{model}` path
-/// segment, mirroring the `percent_decode_str` used in `inspect_request`.
+/// 对 Gemini `/models/{model}` 路径段中需要保留的字符做百分号编码，
+/// 与 `inspect_request` 中使用的 `percent_decode_str` 相对应。
 fn encode_path_segment(model: &str) -> String {
     const UNRESERVED: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
         .remove(b'-')
@@ -87,8 +91,8 @@ fn encode_path_segment(model: &str) -> String {
     percent_encoding::utf8_percent_encode(model, UNRESERVED).to_string()
 }
 
-/// Replace the `{model}` segment of `/…/models/{model}:action`, preserving the
-/// action suffix and any inline query. Unknown shapes return the path unchanged.
+/// 替换 `/…/models/{model}:action` 中的 `{model}` 段，保留 action 后缀
+/// 与内联查询串。无法识别的路径形状原样返回。
 fn rewrite_path_model(path: &str, model: &str) -> String {
     let Some(marker) = path.find("/models/") else {
         return path.to_owned();
@@ -99,7 +103,7 @@ fn rewrite_path_model(path: &str, model: &str) -> String {
     format!("{}{}{}", &path[..start], encode_path_segment(model), &rest[end..])
 }
 
-/// Shared OpenAI-family behaviors (chat completions and Responses).
+/// OpenAI 系（chat completions 与 Responses）共用的行为。
 fn openai_usage_value(value: &Value) -> Option<Value> {
     value.get("usage").cloned().or_else(|| {
         value
@@ -126,10 +130,7 @@ fn openai_normalize_usage(usage: &Value) -> Usage {
                 .or_else(|| item.get("cached_write_tokens"))
         })
         .and_then(Value::as_i64);
-    let miss = match (total_input, cache_read) {
-        (Some(total), Some(read)) => Some((total - read - cache_write.unwrap_or(0)).max(0)),
-        _ => None,
-    };
+    let miss = crate::domain::cache_miss_input(total_input, cache_read, cache_write);
     let output = usage
         .get("completion_tokens")
         .and_then(Value::as_i64)
@@ -166,7 +167,7 @@ fn openai_inspect(path: &str, query: Option<&str>, body: &[u8]) -> (Option<Strin
     )
 }
 
-/// OpenAI chat/completions (also /completions, /embeddings).
+/// OpenAI chat/completions（也覆盖 /completions、/embeddings）。
 pub struct OpenaiChatAdapter;
 
 impl ProtocolAdapter for OpenaiChatAdapter {
@@ -223,7 +224,7 @@ impl ProtocolAdapter for OpenaiChatAdapter {
     }
 }
 
-/// OpenAI Responses API.
+/// OpenAI Responses API。
 pub struct OpenaiResponsesAdapter;
 
 impl ProtocolAdapter for OpenaiResponsesAdapter {
@@ -278,7 +279,7 @@ impl ProtocolAdapter for OpenaiResponsesAdapter {
     }
 }
 
-/// Claude native (/v1/messages).
+/// Claude 原生协议（/v1/messages）。
 pub struct ClaudeAdapter;
 
 impl ProtocolAdapter for ClaudeAdapter {
@@ -317,8 +318,7 @@ impl ProtocolAdapter for ClaudeAdapter {
             .into_iter()
             .filter(|item| item.get("id").and_then(Value::as_str).is_some())
             .collect();
-        // Claude paginates only when the response explicitly says
-        // `has_more` and carries `last_id`.
+        // Claude 仅在响应显式给出 `has_more` 并带有 `last_id` 时才分页。
         let next = if value.get("has_more").and_then(Value::as_bool) == Some(true) {
             value.get("last_id").and_then(Value::as_str).map(|last_id| {
                 let mut next = current_url.clone();
@@ -387,7 +387,7 @@ impl ProtocolAdapter for ClaudeAdapter {
     }
 }
 
-/// Gemini native (/v1beta/models/...).
+/// Gemini 原生协议（/v1beta/models/...）。
 pub struct GeminiAdapter;
 
 impl ProtocolAdapter for GeminiAdapter {
@@ -410,7 +410,7 @@ impl ProtocolAdapter for GeminiAdapter {
             || query.unwrap_or_default().contains("alt=sse");
         (model, stream)
     }
-    /// Gemini carries the model in the URL path, not the body.
+    /// Gemini 把 model 放在 URL 路径里，而非 body。
     fn retarget_model(&self, path: &str, _body: &[u8], model: &str) -> (String, Option<Vec<u8>>) {
         (rewrite_path_model(path, model), None)
     }
@@ -441,7 +441,7 @@ impl ProtocolAdapter for GeminiAdapter {
                 None => continue,
             }
         }
-        // Gemini continues on `nextPageToken`.
+        // Gemini 通过 `nextPageToken` 续页。
         let next = value
             .get("nextPageToken")
             .and_then(Value::as_str)
@@ -477,7 +477,7 @@ impl ProtocolAdapter for GeminiAdapter {
     fn normalize_usage(&self, usage: &Value) -> Usage {
         let total = usage.get("promptTokenCount").and_then(Value::as_i64);
         let cache = usage.get("cachedContentTokenCount").and_then(Value::as_i64);
-        let miss = total.map(|value| (value - cache.unwrap_or(0)).max(0));
+        let miss = crate::domain::cache_miss_input(total, cache, None);
         Usage {
             input_tokens: total,
             cache_read_tokens: cache,
@@ -498,10 +498,9 @@ impl ProtocolAdapter for GeminiAdapter {
     }
 }
 
-/// Command Code CLI upstream: `/alpha/generate` (NDJSON) on the reverse
-/// path, official Provider API for paid plans. Upstream-only protocol — it
-/// has no client-facing entry endpoints, so `endpoints()` is empty and the
-/// model catalog never advertises it.
+/// Command Code CLI 上游：反向路径为 `/alpha/generate`（NDJSON），
+/// 付费计划走官方 Provider API。它是仅上游协议——没有面向客户端的入口端点，
+/// 因此 `endpoints()` 为空，模型目录也从不对外公布它。
 pub struct CommandCodeAdapter;
 
 impl ProtocolAdapter for CommandCodeAdapter {
@@ -514,9 +513,9 @@ impl ProtocolAdapter for CommandCodeAdapter {
         let Ok(value) = serde_json::from_slice::<Value>(body) else {
             return (None, false);
         };
-        // `/alpha/generate` bodies nest the fields under `params`; the
-        // provider API body is plain OpenAI chat (`model` / `stream`). Accept
-        // both so one adapter serves the transport router.
+        // `/alpha/generate` 的 body 把字段嵌在 `params` 下；Provider API 的
+        // body 则是普通 OpenAI chat（`model` / `stream`）。两者都接受，
+        // 这样一个适配器即可服务传输路由。
         let model = value
             .pointer("/params/model")
             .or_else(|| value.get("model"))
@@ -536,8 +535,8 @@ impl ProtocolAdapter for CommandCodeAdapter {
         let Some(object) = value.as_object_mut() else {
             return (path.to_owned(), None);
         };
-        // `/alpha/generate` nests the fields under `params`; the provider API
-        // body keeps `model` at the root (mirrors `inspect_request`).
+        // `/alpha/generate` 把字段嵌在 `params` 下；Provider API 的 body
+        // 则把 `model` 放在根层（与 `inspect_request` 一致）。
         if let Some(params) = object.get_mut("params").and_then(Value::as_object_mut) {
             params.insert("model".to_owned(), Value::String(model.to_owned()));
         } else {
@@ -545,15 +544,14 @@ impl ProtocolAdapter for CommandCodeAdapter {
         }
         (path.to_owned(), serde_json::to_vec(&value).ok())
     }
-    /// Official Provider API catalog (OpenAI shape).
+    /// 官方 Provider API 目录（OpenAI 形状）。
     fn discovery_path(&self) -> &'static str {
         "/provider/v1/models"
     }
     fn parse_catalog(&self, body: &[u8], _current_url: &Url) -> Result<(Vec<Value>, Option<Url>)> {
         parse_openai_catalog(body)
     }
-    /// Read-only account probe: authentication only, no token spend and no
-    /// generation request (plan decision 5).
+    /// 只读账户探测：仅鉴权，不消耗 token，也不发起生成请求。
     fn health_probe(&self, _model: &str) -> HealthProbe {
         HealthProbe {
             method: http::Method::GET,
@@ -571,9 +569,9 @@ impl ProtocolAdapter for CommandCodeAdapter {
                 || value.get("orgId").is_some())
     }
     fn usage_value(&self, value: &Value) -> Option<Value> {
-        // Raw CC usage lives in `finish.totalUsage` / `finish-step.usage`;
-        // the stream decoder converts it to OpenAI usage before conversion,
-        // but accept the raw shape for non-stream observability.
+        // CC 原始用量位于 `finish.totalUsage` / `finish-step.usage`；流式解码器
+        // 会在转换前把它转成 OpenAI usage，但这里也接受原始形状，
+        // 以便非流式场景可观测。
         value
             .get("totalUsage")
             .or_else(|| value.get("usage"))
@@ -593,9 +591,9 @@ impl ProtocolAdapter for CommandCodeAdapter {
     }
 }
 
-/// Normalize a raw Command Code usage object. `inputTokens` is the TOTAL
-/// (cache hits included); the Anthropic/cache accounting needs the
-/// non-cached part (`inputTokenDetails.noCacheTokens`, or a subtraction).
+/// 归一化 Command Code 的原始用量对象。`inputTokens` 是总量（含缓存命中）；
+/// Anthropic/缓存计费需要非缓存部分（`inputTokenDetails.noCacheTokens`，
+/// 或用减法得出）。
 pub fn commandcode_usage(usage: &Value) -> Usage {
     let details = usage.get("inputTokenDetails");
     let total_input = usage.get("inputTokens").and_then(Value::as_i64);
@@ -643,7 +641,7 @@ fn parse_openai_catalog(body: &[u8]) -> Result<(Vec<Value>, Option<Url>)> {
 }
 
 impl ProtocolId {
-    /// Registry (P2-3): the per-protocol behavior bundle.
+    /// 注册表：单个协议的行为包。
     pub fn adapter(self) -> &'static dyn ProtocolAdapter {
         match self {
             ProtocolId::OpenaiCompatible => &OpenaiChatAdapter,
@@ -655,10 +653,9 @@ impl ProtocolId {
     }
 }
 
-/// Typed protocol identity (P2-3): one enum is the single source of truth
-/// for the supported protocol list, entry endpoints and discovery paths —
-/// adding a protocol extends exactly this type, and every string boundary
-/// (validation, routing, catalog, discovery) derives from it.
+/// 带类型的协议标识：该枚举是受支持协议列表、入口端点与发现路径的
+/// 权威来源——新增协议只需扩展此类型，所有字符串边界
+/// （校验、路由、目录、发现）都从它派生。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProtocolId {
@@ -666,7 +663,7 @@ pub enum ProtocolId {
     OpenaiResponses,
     Claude,
     Gemini,
-    /// Upstream-only: Command Code CLI reverse path / official Provider API.
+    /// 仅上游：Command Code CLI 反向路径 / 官方 Provider API。
     CommandCode,
 }
 
@@ -700,7 +697,7 @@ impl ProtocolId {
         }
     }
 
-    /// Entry endpoints served for this protocol (client-facing).
+    /// 本协议对外（面向客户端）提供的入口端点。
     pub fn endpoints(self) -> &'static [&'static str] {
         match self {
             ProtocolId::OpenaiCompatible => {
@@ -712,22 +709,35 @@ impl ProtocolId {
                 "/v1beta/models/{model}:generateContent",
                 "/v1beta/models/{model}:streamGenerateContent",
             ],
-            // Upstream-only: reachable through claude/codex model mappings,
-            // never as a client entry endpoint.
+            // 仅上游：只能经 claude/codex 模型映射抵达，绝不作为客户端入口端点。
             ProtocolId::CommandCode => &[],
         }
     }
 
-    /// Upstream model-catalog path for this protocol (delegates to the
-    /// adapter so the registry stays the single source).
+    /// 本协议的上游模型目录路径（委托给适配器，使注册表保持唯一来源）。
     pub fn discovery_path(self) -> &'static str {
         self.adapter().discovery_path()
     }
 }
 
-/// Ordered string view of the supported protocols, kept for call sites that
-/// serialize the list (system status/protocols endpoints). Literals mirror
-/// [`ProtocolId::as_str`] — the enum is the single source of additions.
+/// 协议的「主路径」：目录公布与映射入口的上游改写共用同一张表（[`ProtocolId::endpoints`]）。
+///
+/// `stream` 只影响 gemini 的动词（`generateContent` / `streamGenerateContent`）；
+/// 其它协议取端点清单的第一项。未知协议或没有上游入口的协议（`command_code`）
+/// 返回 `None`，由调用方决定回退路径。
+pub fn main_path(protocol: &str, model: &str, stream: bool) -> Option<String> {
+    let id = ProtocolId::parse(protocol)?;
+    let endpoints = id.endpoints();
+    let template = match id {
+        ProtocolId::Gemini if stream => *endpoints.get(1)?,
+        _ => *endpoints.first()?,
+    };
+    Some(template.replace("{model}", model))
+}
+
+/// 受支持协议的有序字符串视图，供需要序列化该列表的调用点使用
+/// （system status / protocols 端点）。这里的字面量只是 [`ProtocolId::as_str`] 的
+/// 镜像，并非唯一来源——枚举才是新增协议的权威来源，字符串需手工同步。
 pub const PROTOCOL_ORDER: [&str; 5] = [
     "openai_compatible",
     "openai_responses",
@@ -735,6 +745,47 @@ pub const PROTOCOL_ORDER: [&str; 5] = [
     "gemini",
     "command_code",
 ];
+
+/// 目录查询按协议排序时使用的 `ORDER BY` 子句：数组顺序与 [`PROTOCOL_ORDER`] 一致；
+/// `PROTOCOL_ORDER_SQL` 里未知协议与 `gemini` 同为 3，`command_code` 为 4 排在最后。
+///
+/// 只有在**列名正好是 `protocol`**（不带表限定符）的查询里才能直接插值；
+/// `infrastructure` 的路由查询用到 `mr.protocol`，因此那里保留自己的字面量。
+pub const PROTOCOL_ORDER_SQL: &str = "ORDER BY CASE protocol WHEN 'openai_compatible' THEN 0 WHEN 'openai_responses' THEN 1 WHEN 'claude' THEN 2 WHEN 'command_code' THEN 4 ELSE 3 END";
+
+/// 单个渠道的模型级协议绑定：配置的协议集合，外加——对 Command Code 提供商
+/// （`providers.kind = 'command_code'`）——转换层能以 `command_code` 服务的
+/// 每个客户端入口协议。这类渠道接受它们全部，因为网关会在出站前转换请求体
+/// （见 proxy 中逐候选的协议覆盖），所以路由候选池不得把它过滤掉。
+///
+/// 刻意**不**扩展渠道级 [`PROTOCOL_ORDER`] 绑定（`channel_protocols`，供
+/// 健康/发现探测使用）：只有路由查询所连接的目录绑定会增长。
+pub fn model_binding_protocols(provider_kind: Option<&str>, configured: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = configured.to_vec();
+    if !requires_command_code_identity(provider_kind) {
+        return out;
+    }
+    for entry in COMMAND_CODE_ENTRY_CANDIDATES {
+        if converts_to_command_code(entry) && !out.iter().any(|bound| bound == entry) {
+            out.push(entry.to_owned());
+        }
+    }
+    out
+}
+
+/// 请求转换层能用 `command_code` 驱动的客户端入口协议。
+///
+/// 这里只是候选集合：所有调用点都会再用 [`converts_to_command_code`] 过滤一遍，
+/// `convert::scan` 的注册表测试保证它与 [`crate::convert::ConversionStrategy`] 同步，
+/// 因此新增转换方向不会被静默漏掉。
+pub const COMMAND_CODE_ENTRY_CANDIDATES: [&str; 4] =
+    ["openai_compatible", "openai_responses", "claude", "gemini"];
+
+/// `entry` 是否存在指向 `command_code` 的请求转换。
+/// 判定完全来自转换注册表（唯一事实来源），不额外维护白名单。
+pub fn converts_to_command_code(entry: &str) -> bool {
+    crate::convert::ConversionStrategy::for_pair(entry, "command_code").is_some()
+}
 
 const HOP_BY_HOP: &[&str] = &[
     "connection",
@@ -816,6 +867,15 @@ pub fn upstream_url(
     Ok(base)
 }
 
+/// 构造 `Authorization: Bearer <token>` 头。
+///
+/// 上游凭据来自运行时输入，含非法头字符时返回错误而不是 panic；
+/// 各调用方自行把错误映射到本地错误类型（代理路径是 `anyhow`，
+/// 余额/登录探测各有自己的失败分类）。
+pub fn bearer_header(token: &str) -> Result<HeaderValue, http::header::InvalidHeaderValue> {
+    HeaderValue::from_str(&format!("Bearer {token}"))
+}
+
 pub fn outbound_headers(inbound: &HeaderMap, protocol: &str, api_key: &str) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
     for (name, value) in inbound {
@@ -832,10 +892,7 @@ pub fn outbound_headers(inbound: &HeaderMap, protocol: &str, api_key: &str) -> R
     }
     match protocol {
         "openai_compatible" | "openai_responses" => {
-            headers.insert(
-                axum::http::header::AUTHORIZATION,
-                HeaderValue::from_str(&format!("Bearer {api_key}"))?,
-            );
+            headers.insert(axum::http::header::AUTHORIZATION, bearer_header(api_key)?);
         }
         "claude" => {
             headers.insert(
@@ -852,29 +909,24 @@ pub fn outbound_headers(inbound: &HeaderMap, protocol: &str, api_key: &str) -> R
                 HeaderValue::from_str(api_key)?,
             );
         }
-        // Command Code keys are `user_...` bearer tokens. Identity headers
-        // (session/fingerprint/version) are injected separately by
-        // `apply_command_code_identity`, only for `kind='command_code'`
-        // providers (plan decision 2).
+        // Command Code 的 key 是 `user_...` 形式的 Bearer token。身份头
+        // （session/fingerprint/version）由 `apply_command_code_identity` 单独注入，
+        // 且仅对 `kind='command_code'` 的提供商注入。
         "command_code" => {
-            headers.insert(
-                axum::http::header::AUTHORIZATION,
-                HeaderValue::from_str(&format!("Bearer {api_key}"))?,
-            );
+            headers.insert(axum::http::header::AUTHORIZATION, bearer_header(api_key)?);
         }
         _ => bail!("不支持的协议 {protocol}"),
     }
     Ok(headers)
 }
 
-/// Session header OpenCode Zen/Go requires on every request since 2026-09
-/// (missing it makes the upstream reject the request before routing).
+/// OpenCode Zen/Go 自 2026-09 起要求每个请求都携带的 session 头
+/// （缺失会让上游在路由前就拒绝请求）。
 pub const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
 
-/// Whether `base_url` points at an OpenCode Zen/Go upstream. Zen is
-/// identified by its canonical host (`opencode.ai`) or by a `zen` path
-/// segment (`/zen/go`, `/zen/v1`), so relays that keep the canonical path
-/// are covered as well.
+/// 判断 `base_url` 是否指向 OpenCode Zen/Go 上游。Zen 通过其规范主机名
+/// （`opencode.ai`）或 `zen` 路径段（`/zen/go`、`/zen/v1`）来识别，
+/// 因此保留规范路径的中转也能被覆盖。
 pub fn requires_opencode_session(base_url: &str) -> bool {
     let Ok(url) = Url::parse(base_url) else {
         return false;
@@ -890,10 +942,9 @@ pub fn requires_opencode_session(base_url: &str) -> bool {
     host_matches || path_matches
 }
 
-/// Ensures [`OPENCODE_SESSION_HEADER`] is present for OpenCode upstreams.
-/// A non-empty value forwarded from the client always wins (duplicates are
-/// collapsed to one); the gateway's stable fallback is only used when the
-/// client supplied nothing usable.
+/// 确保 OpenCode 上游请求带有 [`OPENCODE_SESSION_HEADER`]。客户端转发的非空值
+/// 始终优先（重复值折叠为一个）；只有在客户端未提供可用值时，
+/// 才使用网关的稳定兜底值。
 pub fn apply_opencode_session(
     headers: &mut HeaderMap,
     base_url: &str,
@@ -917,25 +968,22 @@ pub fn apply_opencode_session(
     Ok(())
 }
 
-/// Headers the Command Code CLI sends on every request. Injected ONLY for
-/// providers whose `kind = 'command_code'` (plan decision 2) — base_url is
-/// never sniffed, so a self-hosted bridge can never receive a fingerprint by
-/// accident.
+/// Command Code CLI 在每个请求上发送的头部。仅对 `kind = 'command_code'` 的
+/// 提供商注入——绝不嗅探 base_url，因此自建中转永远不会意外收到指纹。
 pub struct CommandCodeIdentity {
     pub cli_version: String,
     pub session_id: String,
     pub project_slug: String,
-    /// ZDR opt-in (`x-cmd-zdr: 1`).
+    /// ZDR 选用开关（`x-cmd-zdr: 1`）。
     pub zdr: bool,
 }
 
-/// Whether a provider row opts into Command Code identity headers.
+/// 判断某提供商行是否选用 Command Code 身份头。
 pub fn requires_command_code_identity(provider_kind: Option<&str>) -> bool {
     provider_kind == Some("command_code")
 }
 
-/// Applies the CLI identity headers. The caller has already set
-/// `Authorization` via [`outbound_headers`].
+/// 应用 CLI 身份头。调用方已通过 [`outbound_headers`] 设置好 `Authorization`。
 pub fn apply_command_code_identity(
     headers: &mut HeaderMap,
     identity: &CommandCodeIdentity,
@@ -978,16 +1026,15 @@ pub fn apply_command_code_identity(
     Ok(())
 }
 
-/// One W3C trace context per request: `00-<32hex trace-id>-<16hex span>-01`.
+/// 每个请求一个 W3C trace context：`00-<32hex trace-id>-<16hex span>-01`。
 pub fn generate_traceparent() -> String {
     let trace = uuid::Uuid::new_v4().simple().to_string();
     let span = &uuid::Uuid::new_v4().simple().to_string()[..16];
     format!("00-{trace}-{span}-01")
 }
 
-/// Deterministic `x-project-slug` derived from the session id (plan §2.4):
-/// hex session ids are parsed for an index, anything else falls back to a
-/// stable character hash. Never reveals the raw session id.
+/// 由 session id 确定性派生的 `x-project-slug`：十六进制的 session id 会
+/// 解析出一个索引，其它情况回退到稳定的字符哈希。绝不泄露原始 session id。
 pub fn derive_project_slug(session_id: &str) -> String {
     let hex_index = session_id
         .trim_start_matches("sess_")
@@ -1003,7 +1050,7 @@ pub fn derive_project_slug(session_id: &str) -> String {
             format!("{}-{}", WORDS[(index as usize) % WORDS.len()], index % 9973)
         }
         None => {
-            // FNV-1a over the session id: stable, cheap, non-reversible.
+            // 对 session id 做 FNV-1a：稳定、廉价、不可逆。
             let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
             for byte in session_id.as_bytes() {
                 hash ^= u64::from(*byte);
@@ -1032,9 +1079,9 @@ pub fn inspect_request(
     query: Option<&str>,
     body: &[u8],
 ) -> (Option<String>, bool) {
-    // Registry dispatch (P2-3): every protocol — including the nested
-    // Command Code body (`params.model` / `params.stream`) — is inspected by
-    // its own adapter instead of an inline OpenAI-shaped match.
+    // 注册表分派：每个协议——包括嵌套的 Command Code body
+    // （`params.model` / `params.stream`）——都由各自的适配器解析，
+    // 而不是内联的 OpenAI 形状 match。
     ProtocolId::parse(protocol)
         .map(|id| id.adapter().inspect_request(path, query, body))
         .unwrap_or((None, false))
@@ -1046,8 +1093,8 @@ pub fn discovery_path(protocol: &str) -> &'static str {
         .unwrap_or("/v1/models")
 }
 
-/// Per-candidate upstream model rewrite (custom models). `None` body means the
-/// body is unchanged and the caller keeps its original bytes.
+/// 逐候选的上游 model 重写（自定义模型）。body 为 `None` 表示 body 未变，
+/// 调用方保留原始字节。
 pub fn retarget_model(
     protocol: &str,
     path: &str,
@@ -1059,7 +1106,7 @@ pub fn retarget_model(
         .unwrap_or_else(|| (path.to_owned(), None))
 }
 
-/// Catalog parsing via the protocol adapter (P2-3).
+/// 经协议适配器解析目录。
 pub fn parse_catalog(
     protocol: &str,
     body: &[u8],
@@ -1071,25 +1118,24 @@ pub fn parse_catalog(
     id.adapter().parse_catalog(body, current_url)
 }
 
-/// Health-probe request via the protocol adapter (P2-3); `None` for an
-/// unknown protocol.
+/// 经协议适配器构造健康探测请求；未知协议返回 `None`。
 pub fn health_probe(protocol: &str, model: &str) -> Option<HealthProbe> {
     ProtocolId::parse(protocol).map(|id| id.adapter().health_probe(model))
 }
 
-/// Health-probe verdict via the protocol adapter (P2-3).
+/// 经协议适配器判定健康探测结果。
 pub fn probe_body_ok(protocol: &str, body: &[u8]) -> bool {
     ProtocolId::parse(protocol)
         .map(|id| id.adapter().probe_body_ok(body))
         .unwrap_or(false)
 }
 
-/// Raw usage object via the protocol adapter (P2-3).
+/// 经协议适配器取原始用量对象。
 pub fn usage_value(protocol: &str, value: &Value) -> Option<Value> {
     ProtocolId::parse(protocol).and_then(|id| id.adapter().usage_value(value))
 }
 
-/// Usage normalization via the protocol adapter (P2-3).
+/// 经协议适配器归一化用量。
 pub fn normalize_usage(protocol: &str, usage: &Value) -> Usage {
     ProtocolId::parse(protocol)
         .map(|id| id.adapter().normalize_usage(usage))
@@ -1100,9 +1146,57 @@ pub fn normalize_usage(protocol: &str, usage: &Value) -> Usage {
 mod tests {
     use super::*;
 
-    /// The inspect registry understands Command Code's nested body (and the
-    /// flat Provider API body), so route-model/stream inspection works for
-    /// both transports.
+    /// cache-miss 只有一个来源：适配器归一化与 [`crate::domain::cache_miss_input`]
+    /// 在同一输入上必须给出同一个 `cache_miss_input_tokens`。
+    #[test]
+    fn cache_miss_input_matches_adapter_normalization() {
+        let openai = serde_json::json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 10,
+            "prompt_tokens_details": {"cached_tokens": 400, "cache_write_tokens": 100},
+        });
+        let normalized = normalize_usage("openai_compatible", &openai);
+        assert_eq!(
+            normalized.cache_miss_input_tokens,
+            crate::domain::cache_miss_input(
+                normalized.input_tokens,
+                normalized.cache_read_tokens,
+                normalized.cache_write_tokens,
+            )
+        );
+        assert_eq!(normalized.cache_miss_input_tokens, Some(500));
+
+        let gemini = serde_json::json!({
+            "promptTokenCount": 900,
+            "cachedContentTokenCount": 300,
+            "candidatesTokenCount": 7,
+        });
+        let normalized = normalize_usage("gemini", &gemini);
+        assert_eq!(
+            normalized.cache_miss_input_tokens,
+            crate::domain::cache_miss_input(
+                normalized.input_tokens,
+                normalized.cache_read_tokens,
+                normalized.cache_write_tokens,
+            )
+        );
+        assert_eq!(normalized.cache_miss_input_tokens, Some(600));
+
+        // 缺缓存读数：miss 未知（None），而不是把总量当成 miss。
+        let without_cache = serde_json::json!({"prompt_tokens": 42});
+        assert_eq!(
+            normalize_usage("openai_compatible", &without_cache).cache_miss_input_tokens,
+            None
+        );
+        // 缓存读超过总量：钳到 0。
+        assert_eq!(
+            crate::domain::cache_miss_input(Some(10), Some(25), None),
+            Some(0)
+        );
+    }
+
+    /// 解析注册表同时理解 Command Code 的嵌套 body 与扁平的 Provider API body，
+    /// 因此两种传输的路由 model / stream 解析都能工作。
     #[test]
     fn command_code_inspect_reads_nested_and_flat_bodies() {
         let (model, stream) = inspect_request(
@@ -1121,7 +1215,7 @@ mod tests {
         );
         assert_eq!(model.as_deref(), Some("cc-model"));
         assert!(!stream);
-        // Command Code advertises no client-facing endpoints.
+        // Command Code 不对外公布任何客户端入口端点。
         assert!(ProtocolId::CommandCode.endpoints().is_empty());
         assert_eq!(
             ProtocolId::CommandCode.discovery_path(),
@@ -1129,8 +1223,8 @@ mod tests {
         );
     }
 
-    /// Per-candidate model rewrite: body-carried protocols patch only `model`,
-    /// gemini patches the path segment, command code patches `params.model`.
+    /// 逐候选 model 重写：body 携带 model 的协议只改 `model`，gemini 改路径段，
+    /// command code 则改 `params.model`。
     #[test]
     fn retarget_model_rewrites_body_per_protocol() {
         let body = br#"{"model":"my-gpt","messages":[],"temperature":0.5}"#;
@@ -1205,21 +1299,20 @@ mod tests {
 
     #[test]
     fn retarget_model_leaves_non_object_bodies_untouched() {
-        // Non-JSON / non-object bodies keep the original bytes (byte-exact
-        // passthrough path must never be broken).
+        // 非 JSON / 非对象 body 保留原始字节（逐字节透传路径绝不能被破坏）。
         let (path, rewritten) = retarget_model("openai_compatible", "/v1/chat/completions", b"not json", "x");
         assert_eq!(path, "/v1/chat/completions");
         assert!(rewritten.is_none());
         let (_, rewritten) = retarget_model("openai_compatible", "/v1/chat/completions", b"[1,2]", "x");
         assert!(rewritten.is_none());
-        // Unknown protocols never touch the request.
+        // 未知协议绝不改动请求。
         let (path, rewritten) = retarget_model("bogus", "/x", br#"{"model":"a"}"#, "b");
         assert_eq!(path, "/x");
         assert!(rewritten.is_none());
     }
 
-    /// Identity headers are complete, W3C-shaped and kind-gated: a provider
-    /// without `kind='command_code'` can never trigger them (decision 2).
+    /// 身份头完整、符合 W3C 形状且按 kind 门禁：`kind='command_code'` 之外的
+    /// 提供商永远不会触发它们。
     #[test]
     fn command_code_identity_headers_are_complete_and_kind_gated() {
         assert!(!requires_command_code_identity(None));
@@ -1263,7 +1356,7 @@ mod tests {
         assert!(traceparent.ends_with("-01"), "{traceparent}");
         assert_ne!(generate_traceparent(), generate_traceparent());
 
-        // ZDR off omits the optional header.
+        // 关闭 ZDR 时省略该可选头。
         let mut headers = HeaderMap::new();
         apply_command_code_identity(
             &mut headers,
@@ -1282,8 +1375,8 @@ mod tests {
         );
     }
 
-    /// Inline `?query` in a path must reach the URL as a real query string —
-    /// `Url::set_path` would percent-encode the `?` and hit a 404 path.
+    /// 路径内联的 `?query` 必须以真正的查询串抵达 URL——
+    /// `Url::set_path` 会把 `?` 百分号转义，从而打到 404 路径。
     #[test]
     fn upstream_url_splits_inline_query_strings() {
         let url = upstream_url(
@@ -1321,9 +1414,8 @@ mod tests {
         );
     }
 
-    /// Command Code probes the read-only `whoami` endpoint with GET (no
-    /// token spend), and its verdict accepts the account shapes the CLI
-    /// returns while rejecting error bodies.
+    /// Command Code 用 GET 探测只读的 `whoami` 端点（不消耗 token），
+    /// 其判定接受 CLI 返回的账户形状，同时拒绝错误体。
     #[test]
     fn command_code_health_probe_is_read_only_get() {
         let probe = health_probe("command_code", "ignored-model").expect("probe");
@@ -1355,6 +1447,45 @@ mod tests {
         assert!(!requires_opencode_session("not a url"));
     }
 
+    /// Command Code 提供商把其目录行暴露给网关能转换的每个入口协议
+    /// （以便路由候选池找到它们），而其它提供商则严格保持配置的绑定。
+    #[test]
+    fn command_code_model_bindings_cover_convertible_entries() {
+        let configured = vec!["command_code".to_owned()];
+        assert_eq!(
+            model_binding_protocols(Some("command_code"), &configured),
+            [
+                "command_code",
+                "openai_compatible",
+                "openai_responses",
+                "claude"
+            ]
+        );
+        // 幂等：已绑定的入口不会重复。
+        let already = vec![
+            "command_code".to_owned(),
+            "claude".to_owned(),
+            "openai_compatible".to_owned(),
+        ];
+        let expanded = model_binding_protocols(Some("command_code"), &already);
+        assert_eq!(
+            expanded,
+            [
+                "command_code",
+                "claude",
+                "openai_compatible",
+                "openai_responses"
+            ]
+        );
+        // gemini 没有指向 command_code 的转换器：永不加入。
+        assert!(!expanded.iter().any(|protocol| protocol == "gemini"));
+
+        let openai = ["openai_compatible".to_owned(), "openai_responses".to_owned()];
+        assert_eq!(model_binding_protocols(None, &openai), openai);
+        assert_eq!(model_binding_protocols(Some("other"), &openai), openai);
+        assert_eq!(model_binding_protocols(Some(""), &configured), configured);
+    }
+
     fn values(headers: &HeaderMap) -> Vec<String> {
         headers
             .get_all(OPENCODE_SESSION_HEADER)
@@ -1369,7 +1500,7 @@ mod tests {
         apply_opencode_session(&mut headers, "https://opencode.ai/zen/go", "install-1").unwrap();
         assert_eq!(values(&headers), ["install-1"]);
 
-        // A valid client value wins, exactly once even when duplicated.
+        // 有效的客户端值优先，即使重复也只保留一个。
         let mut headers = HeaderMap::new();
         headers.append(
             HeaderName::from_static(OPENCODE_SESSION_HEADER),
@@ -1382,7 +1513,7 @@ mod tests {
         apply_opencode_session(&mut headers, "https://opencode.ai/zen/go", "install-1").unwrap();
         assert_eq!(values(&headers), ["client-1"]);
 
-        // An empty client value is unusable: the fallback replaces it.
+        // 空的客户端值不可用：由兜底值替换。
         let mut headers = HeaderMap::new();
         headers.insert(
             HeaderName::from_static(OPENCODE_SESSION_HEADER),

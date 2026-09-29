@@ -1,18 +1,22 @@
-//! 流扫描器：StreamScan 与流完成/错误判定（scan.rs）。
+//! 流扫描器：SSE/JSON 流的增量解析与完成/错误判定。
+//!
+//! 职责：按序喂入上游分片，解析出事件并识别首个生成 token、完成信号与错误对象。
+//! 边界：只做解析与判定，不产出响应体、不转换报文（转换见 `stream.rs`）。
+//! 关键不变量：分片可跨块到达，解析必须容忍不完整数据并缓冲到下一片。
 
 use super::stream::*;
 use super::*;
 
-/// Incremental scanner over an upstream SSE/JSON stream used for the mapped
-/// streaming prelude and mid-stream error detection. Feeds chunks in order;
-/// returns the upstream error message when a chunk carries an error object.
+/// 上游 SSE/JSON 流的增量扫描器，供映射流式前缀与流中错误检测使用。
+/// 按序喂入分片：识别首个生成 token 与完成信号，并在事件携带错误对象时
+/// 返回上游错误文案。
 pub struct StreamScan {
     buffer: Vec<u8>,
     gemini: bool,
     first_token_latched: bool,
-    /// True when the most recent feed() saw a content signal.
+    /// 最近一次 feed() 是否看到了内容信号。
     pub first_token_now: bool,
-    /// True once a completion signal (finish_reason / message_stop / …) was seen.
+    /// 是否已看到完成信号（finish_reason / message_stop 等）。
     pub saw_completion: bool,
 }
 
@@ -34,7 +38,7 @@ impl StreamScan {
         } else {
             self.buffer.extend_from_slice(&normalize_crlf(chunk));
             let mut events = Vec::new();
-            for block in split_sse_blocks(&mut self.buffer) {
+            for block in crate::sse::split_blocks(&mut self.buffer) {
                 if let Some(event) = sse_block_events(&block) {
                     events.push(event);
                 }
@@ -67,8 +71,10 @@ impl StreamScan {
     }
 }
 
-/// Detect an error object inside a 2xx streamed event (mirror of the Python
-/// `StreamObserver.stream_error_status` heuristics). Returns the message.
+/// 检测 2xx 流式事件中的错误对象（沿用既有 stream_error 判定启发式），
+/// 返回错误文案。
+// 与 error.rs::error_payload 的差异：只从 2xx 流式事件提取 message（按上游协议回退），
+// 不产出响应体、不做错误类型归类；两处语义不同，不合并。
 pub fn stream_error_message(upstream: &str, value: &Value) -> Option<String> {
     if let Some(error) = value.get("error").filter(|error| error.is_object()) {
         let message = error
@@ -109,7 +115,11 @@ pub fn stream_error_message(upstream: &str, value: &Value) -> Option<String> {
     None
 }
 
-/// True when a streamed event signals the completion of the generation.
+/// 流式事件是否表示生成已结束。
+///
+/// 判定一律要求字段**携带非空值**：中间分片常带 `"finish_reason": null`
+/// 占位，只判断「键存在」会把未完成的流误判成终态——透明转发路径据此
+/// 提前终结并停止扫描，尾部 usage 会丢失。
 pub fn stream_completed(upstream: &str, value: &Value) -> bool {
     match upstream {
         "claude" => value.get("type").and_then(Value::as_str) == Some("message_stop"),
@@ -122,10 +132,19 @@ pub fn stream_completed(upstream: &str, value: &Value) -> bool {
                     == Some("completed")
         }
         "gemini" => {
-            value.pointer("/candidates/0/finishReason").is_some()
-                || value.pointer("/candidates/0/finish_reason").is_some()
+            value
+                .pointer("/candidates/0/finishReason")
+                .and_then(Value::as_str)
+                .is_some()
+                || value
+                    .pointer("/candidates/0/finish_reason")
+                    .and_then(Value::as_str)
+                    .is_some()
         }
-        _ => value.pointer("/choices/0/finish_reason").is_some(),
+        _ => value
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            .is_some(),
     }
 }
 
@@ -137,8 +156,7 @@ mod tests {
         serde_json::from_slice(body).unwrap()
     }
 
-    /// P2-3: the conversion matrix covers every supported entry/upstream
-    /// pair exactly once and rejects anything else.
+    /// 转换矩阵覆盖每一种受支持的入口/上游组合且仅一次，其余一律拒绝。
     #[test]
     fn conversion_strategy_registry_is_exhaustive() {
         use ConversionStrategy::*;
@@ -178,6 +196,46 @@ mod tests {
                 "{entry} -> {upstream}"
             );
         }
+    }
+
+    /// Command Code 入口清单不得与转换注册表脱节：新增一个
+    /// `entry -> command_code` 转换器时，必须出现在
+    /// [`crate::protocol::COMMAND_CODE_ENTRY_CANDIDATES`] 中（所有绑定/覆盖
+    /// 调用点都经 `crate::protocol::converts_to_command_code` 过滤）。
+    #[test]
+    fn command_code_entry_candidates_track_the_registry() {
+        for id in crate::protocol::ProtocolId::ALL {
+            if crate::protocol::converts_to_command_code(id.as_str()) {
+                assert!(
+                    crate::protocol::COMMAND_CODE_ENTRY_CANDIDATES.contains(&id.as_str()),
+                    "{} converts into command_code but is not a listed entry",
+                    id.as_str()
+                );
+            }
+        }
+        for entry in crate::protocol::COMMAND_CODE_ENTRY_CANDIDATES {
+            assert!(
+                crate::protocol::valid_protocol(entry),
+                "{entry} is not a registered protocol"
+            );
+        }
+        assert!(!crate::protocol::converts_to_command_code("gemini"));
+        assert!(crate::protocol::converts_to_command_code("openai_compatible"));
+        assert!(crate::protocol::converts_to_command_code("openai_responses"));
+        assert!(crate::protocol::converts_to_command_code("claude"));
+        assert_eq!(
+            crate::routing::fallback_upstream_protocol("claude"),
+            Some("command_code")
+        );
+        assert_eq!(
+            crate::routing::fallback_upstream_protocol("openai_responses"),
+            Some("command_code")
+        );
+        assert_eq!(
+            crate::routing::fallback_upstream_protocol("openai_compatible"),
+            Some("command_code")
+        );
+        assert_eq!(crate::routing::fallback_upstream_protocol("gemini"), None);
     }
 
     #[test]
@@ -424,7 +482,7 @@ data: [DONE]
         let codex = String::from_utf8(convert_error("openai_responses", "claude", body)).unwrap();
         assert!(codex.contains("\"code\":\"server_error\""));
         assert!(codex.contains("\"param\":null"));
-        // same-protocol passthrough
+        // 同协议透传
         assert_eq!(convert_error("claude", "claude", body), body);
     }
 
@@ -449,12 +507,20 @@ data: [DONE]
             "openai_compatible",
             &json!({"choices":[{"delta":{"content":"x"}}]})
         ));
+        // 中间分片带 `finish_reason: null` 占位，不得算作终态。
+        assert!(!stream_completed(
+            "openai_compatible",
+            &json!({"choices":[{"delta":{"content":"x"},"finish_reason":null}]})
+        ));
+        assert!(!stream_completed(
+            "gemini",
+            &json!({"candidates":[{"finishReason":null}]})
+        ));
     }
 
     #[test]
     fn dsml_fullwidth_bars_do_not_panic() {
-        // Regression: byte-offset slicing inside the 3-byte fullwidth bar '｜'
-        // used to panic.
+        // 回归用例：按字节偏移切到 3 字节全角竖线 '｜' 中间时曾触发 panic。
         let mut converter =
             MappedStreamConverter::new("openai_responses", "openai_compatible", "codex-model")
                 .unwrap();

@@ -1,58 +1,66 @@
-//! Protocol conversion between the gateway entry formats and the upstream
-//! gateway protocols — faithful port of backend/app/adapters/convert.py.
+//! 入口协议与上游协议之间的请求/响应转换。
 //!
-//! Two client entry formats are supported:
-//! * `claude`            - Claude /v1/messages (Claude Code / claudecode)
-//! * `openai_responses`  - OpenAI Responses API /v1/responses (Codex / codex)
-//!
-//! Requests are converted as whole JSON documents before being forwarded;
-//! streaming responses are converted event-by-event while the upstream stream
-//! is being read (see [`MappedStreamConverter`]), so the client always sees a
-//! valid SSE stream. Tool calls, images and usage numbers are translated
-//! between the formats, and model identifiers are substituted with the
-//! upstream model name.
+//! 职责：入口报文 → 上游报文，并把上游响应（含流式事件）转回入口协议。
+//! 支持四种入口协议：`claude`（`/v1/messages`）、`openai_responses`
+//! （`/v1/responses`）、`openai_compatible`（`/v1/chat/completions`）、`gemini`。
+//! 边界：只做报文形态转换，不管路由/渠道选择、鉴权与密钥。
+//! 关键不变量：请求整体转换为 JSON，流式响应逐事件转换（见
+//! [`MappedStreamConverter`]），客户端始终收到合法 SSE；模型标识替换为上游模型名。
 
 use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
+// ---------------------------------------------------------------------------
+// 子模块与再导出
+// ---------------------------------------------------------------------------
+
+mod commandcode;
+mod error;
+mod request;
+mod response;
+mod scan;
+mod stream;
+pub use commandcode::{CommandCodeDecoder, ndjson_to_chat_completion};
+pub use error::chunk_has_content;
+pub use error::convert_error;
+pub use request::convert_request;
+pub use response::convert_response;
+pub use scan::{StreamScan, stream_completed, stream_error_message};
+pub use stream::MappedStreamConverter;
+
 const GATEWAY_ERROR_TYPE: &str = "gateway_error";
 
-/// Conversion direction between an entry format and an upstream protocol
-/// (P2-3): the `(entry, upstream) -> strategy` matrix is a registry, so
-/// adding a conversion direction touches exactly this enum (plus the
-/// converter functions) instead of scattered pair matches. The streamed
-/// variant of the matrix is [`ConverterKind`]; upstream-only behaviors
-/// (SSE scanning, completion detection) stay one-axis dispatch.
+/// Command Code usage 根部的标记：`prompt_tokens` 是含缓存命中的总数。
+/// 流式/非流式转换据此换算 Anthropic 的 `input_tokens`（只算未命中部分）；
+/// 其它上游不带这个标记，语义不受影响。
+pub const INPUT_INCLUDES_CACHE: &str = "prompt_tokens_includes_cache";
+
+/// 一条转换方向，由 `(入口协议, 上游协议)` 唯一确定。
+///
+/// `(entry, upstream) -> strategy` 矩阵以本枚举为注册表：新增一个方向只需在此
+/// 加一个变体并补上对应的转换函数，无需在各处散落成对的 `match`；覆盖完备性
+/// 由 `scan.rs` 的 `conversion_strategy_registry_is_exhaustive` 测试守护。
+/// 流式转换对应的枚举是 [`ConverterKind`]；仅与上游有关的行为（SSE 扫描、
+/// 完成判定）仍按单轴分发。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConversionStrategy {
-    /// Same protocol both sides: only the model name is substituted.
+    /// 两端协议相同：只替换模型名。
     Passthrough,
     ClaudeToChat,
     ClaudeToResponses,
     ClaudeToGemini,
-    /// Entry → Command Code `/alpha/generate` body (upstream-only protocol).
+    /// 入口报文 → Command Code `/alpha/generate` 请求体（仅上游侧协议）。
     ClaudeToCommandCode,
-    /// OpenAI chat entry → Command Code `/alpha/generate` body (silent
-    /// conversion for direct `/v1/chat/completions` requests; no mapping).
+    /// OpenAI chat 入口 → Command Code `/alpha/generate` 请求体
+    /// （直连 `/v1/chat/completions` 请求的静默转换；不经映射）。
     ChatToCommandCode,
     ResponsesToChat,
     ResponsesToClaude,
     ResponsesToGemini,
-    /// Entry → Command Code `/alpha/generate` body (upstream-only protocol).
+    /// 入口报文 → Command Code `/alpha/generate` 请求体（仅上游侧协议）。
     ResponsesToCommandCode,
-}
-
-/// Upstream protocol a client entry may silently fall back to when it has no
-/// route of its own. Today this is OpenAI chat → Command Code: the request and
-/// stream converters exist, so `/v1/chat/completions` can drive a
-/// `command_code` route without a Claude/Codex mapping.
-pub fn fallback_upstream_protocol(entry: &str) -> Option<&'static str> {
-    match entry {
-        "openai_compatible" => Some("command_code"),
-        _ => None,
-    }
 }
 
 fn new_id(prefix: &str) -> String {
@@ -84,10 +92,12 @@ fn sse_data(payload: &Value) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// text helpers
+// 文本助手
 // ---------------------------------------------------------------------------
 
-/// Array of `text`/`output_text` blocks joined, object `.text`, string as-is.
+/// 拼接 `text`/`output_text` 块数组；对象取 `.text`，字符串原样返回。
+// 与 content_text/chat_message_text/openai_content_text 的差异：多认 output_text 块、
+// 用 "" 连接、独有 Object→.text 分支；四处块类型集与连接符各不相同，故不合并。
 fn text(value: &Value) -> String {
     match value {
         Value::String(value) => value.clone(),
@@ -116,7 +126,8 @@ fn system_text(value: Option<&Value>) -> Option<String> {
     value.map(text).filter(|value| !value.is_empty())
 }
 
-/// Text of a Claude `content` value (string or list of `text` blocks).
+/// 取 Claude `content` 的文本（字符串或 `text` 块列表）。
+// 与 chat_message_text 的差异：只认 type=="text" 的对象块、不做空文本过滤；不合并。
 fn content_text(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
@@ -136,8 +147,9 @@ fn content_text(value: &Value) -> String {
     }
 }
 
-/// Plain text from chat-completions `message.content` / stream `delta.content`
-/// (string or a list of content parts, e.g. GPT-5.x style).
+/// 取 chat-completions `message.content` / 流式 `delta.content` 的纯文本
+/// （字符串或内容块数组，如 GPT-5.x 风格）。
+// 与 content_text 的差异：额外接受裸字符串元素与 output_text 来源、丢弃空文本；不合并。
 pub(super) fn chat_message_text(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
@@ -161,7 +173,7 @@ pub(super) fn chat_message_text(value: &Value) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// tool helpers (Claude -> OpenAI directions)
+// 工具助手（Claude → OpenAI 方向）
 // ---------------------------------------------------------------------------
 
 fn tool_choice_to_openai(tool_choice: &Value) -> Option<Value> {
@@ -177,6 +189,8 @@ fn tool_choice_to_openai(tool_choice: &Value) -> Option<Value> {
     }
 }
 
+// 与 request.rs 的 responses_tools_to_* 及 commandcode.rs 的 *_to_cc 差异：
+// 不过滤 tool.type，参数取自 input_schema 并写成 OpenAI 的 parameters；不合并。
 fn tools_to_openai(tools: &Value) -> Option<Vec<Value>> {
     let mut result = Vec::new();
     for tool in tools.as_array()? {
@@ -200,6 +214,7 @@ fn tools_to_openai(tools: &Value) -> Option<Vec<Value>> {
     }
 }
 
+// 与 request.rs::responses_text 的差异：只读 block.text（不判别 String/Object、不处理数组）；不合并。
 fn claude_block_text(block: &Value) -> Option<String> {
     block.get("text").and_then(Value::as_str).map(str::to_owned)
 }
@@ -212,21 +227,3 @@ fn image_data_url(source: &Value, default_media_type: &str) -> String {
     let data = source.get("data").and_then(Value::as_str).unwrap_or("");
     format!("data:{media_type};base64,{data}")
 }
-
-// ---------------------------------------------------------------------------
-// Claude entry -> upstream request conversion
-// ---------------------------------------------------------------------------
-
-mod commandcode;
-mod error;
-mod request;
-mod response;
-mod scan;
-mod stream;
-pub use commandcode::{CommandCodeDecoder, ndjson_to_chat_completion};
-pub use error::chunk_has_content;
-pub use error::convert_error;
-pub use request::convert_request;
-pub use response::convert_response;
-pub use scan::{StreamScan, stream_completed, stream_error_message};
-pub use stream::MappedStreamConverter;

@@ -1,3 +1,11 @@
+-- 初始数据库结构：providers / channels / channel_protocols / channel_health / channel_models /
+-- channel_model_protocols / model_routes / capability_profiles / model_caps / route_candidates /
+-- request_logs / request_attempts / settings / discovery_runs / health_probe_logs /
+-- claude_model_mappings / codex_model_mappings，以及查询所需的索引。
+--
+-- 幂等性：全部是 `IF NOT EXISTS` 的建表/建索引语句，且由 sqlx::migrate! 按版本号只应用一次。
+-- 回滚注意：没有 down 脚本，回滚只能靠数据库备份；已升级的库会校验本文件内容，
+--           所以不要改动它——结构变更请新增编号更大的迁移。
 CREATE TABLE IF NOT EXISTS providers (
   id TEXT PRIMARY KEY NOT NULL,
   name TEXT NOT NULL UNIQUE,

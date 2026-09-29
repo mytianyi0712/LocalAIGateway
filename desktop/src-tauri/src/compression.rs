@@ -1,40 +1,36 @@
-//! Incremental decoding of upstream `Content-Encoding` (gzip / deflate /
-//! brotli / zstd).
+//! 上游 `Content-Encoding`（gzip / deflate / brotli / zstd）的增量解码。
 //!
-//! Two consumers:
-//! - [`RequiredDecoder`]: lossless decode whose output is BOTH forwarded to
-//!   the client and scanned. Transparent streaming relays decode the
-//!   upstream stream and send plaintext downstream (the `Content-Encoding`
-//!   header is stripped), so a truncated upstream stream surfaces as a
-//!   cleanly interrupted plaintext stream — never as a corrupt compressed
-//!   body that fails client-side inflate (omp's `ZlibError`).
-//! - [`ObservableDecoder`]: best-effort decode of a body that is forwarded
-//!   verbatim (bounded non-stream responses are complete before forwarding,
-//!   so the compressed bytes are safe to relay). When a body is not
-//!   decodable (truncated, multi-member gzip, unknown framing) it stops
-//!   feeding the observer and forwarding is unaffected — parsing failure
-//!   never affects the relay (requirements.md:155).
+//! 职责：把压缩字节流解成明文，供转发与扫描使用。
+//! 边界：只做解码，不做 HTTP 分类（编码识别仅按头值字符串匹配）。
+//! 不变量：单次 feed 输出上限为 `max_out`，且单次 feed 至多越过该上限 16 KiB
+//! （内部缓冲粒度）；累计输出受 `max_total` 约束；初始化失败不 panic。
+//! 使用方：[`RequiredDecoder`]（映射转换等必须拿到完整明文的路径）、
+//! [`ObservableDecoder`]（原样转发响应的尽力观测，解码失败即静默，不影响中继）。
 
 use std::io;
 
-/// Single-feed decoded-output cap: bounds the allocation of one `feed` call
-/// while the decoder state is preserved for the next chunk.
+/// 单次 feed 的解码输出上限：约束一次 `feed` 调用的分配量，解码器状态保留到下一块
+/// 继续使用。注意单次 feed 的输出可越过 `max_out` 至多 16 KiB（内部缓冲粒度）。
 pub const FEED_LIMIT: usize = 2 * 1024 * 1024;
-/// Per-response cumulative decoded-output cap: a stream that keeps expanding
-/// (zip-bomb style) disables observability once the total is exceeded.
+/// 单个响应的累计解码输出上限：持续膨胀的流（zip 炸弹式）在总量达到该上限后
+/// 关闭观测。
 pub const TOTAL_LIMIT: usize = 64 * 1024 * 1024;
-/// Single-feed expansion ratio cap (`input * RATIO_LIMIT + 64 KiB` tolerance).
-/// Catches small compressed chunks that balloon far beyond their input.
+/// 单次 feed 的膨胀比上限（容差 `input * RATIO_LIMIT + 64 KiB`）：
+/// 用于捕获体积远超输入的小压缩块。
 pub const RATIO_LIMIT: u64 = 64;
 
-/// Streaming content decoder for one `Content-Encoding` value.
+/// 针对单个 `Content-Encoding` 值的流式内容解码器。
 pub enum ContentDecoder {
     Identity,
     Gzip(Box<flate2::Decompress>),
-    /// HTTP `deflate` = zlib-wrapped deflate.
+    /// HTTP `deflate` 即 zlib 包装的 deflate。
     Deflate(Box<flate2::Decompress>),
     Brotli(Box<BrotliDecoder>),
     Zstd(Box<zstd::stream::raw::Decoder<'static>>),
+    /// 初始化失败（例如 zstd 内部缓冲分配失败）。`feed` 直接返回错误，
+    /// 由调用方按“解码失败”处理——绝不在 `from_encoding` 里 panic：
+    /// release 构建 panic=abort，一次初始化失败会杀掉整个进程。
+    Failed(io::ErrorKind),
 }
 
 impl ContentDecoder {
@@ -49,19 +45,18 @@ impl ContentDecoder {
             }
             Some("deflate") => ContentDecoder::Deflate(Box::new(flate2::Decompress::new(true))),
             Some("br") => ContentDecoder::Brotli(Box::new(BrotliDecoder::new())),
-            Some("zstd") => ContentDecoder::Zstd(Box::new(
-                zstd::stream::raw::Decoder::new().expect("zstd decoder init"),
-            )),
+            Some("zstd") => match zstd::stream::raw::Decoder::new() {
+                Ok(decoder) => ContentDecoder::Zstd(Box::new(decoder)),
+                Err(error) => ContentDecoder::Failed(error.kind()),
+            },
             _ => ContentDecoder::Identity,
         }
     }
 
-    /// Decode one chunk. Returns `(plaintext, consumed, finished)`: at most
-    /// `max_out` plaintext bytes, the number of input bytes the decoder
-    /// actually consumed, and whether the compressed stream reached its end
-    /// marker. The decoder keeps its state, so the remainder arrives with
-    /// the next feed — callers that cannot afford lossy continuation MUST
-    /// retain `input[consumed..]` themselves ([`RequiredDecoder`]).
+    /// 解码一块数据。返回 `(明文, 已消费输入字节数, 是否结束)`：明文至多
+    /// `max_out` 字节；第二个值是解码器实际消费的输入字节数；第三个值表示压缩流
+    /// 是否到达结束标记。解码器保留自身状态，剩余数据在下次 feed 时继续——无法接受
+    /// 有损续传的调用方必须自行保留 `input[consumed..]`（见 [`RequiredDecoder`]）。
     pub fn feed(&mut self, input: &[u8], max_out: usize) -> io::Result<(Vec<u8>, usize, bool)> {
         match self {
             ContentDecoder::Identity => Ok((input.to_vec(), input.len(), true)),
@@ -69,15 +64,16 @@ impl ContentDecoder {
             ContentDecoder::Deflate(decompress) => inflate(decompress, input, max_out),
             ContentDecoder::Brotli(decoder) => decoder.feed(input, max_out),
             ContentDecoder::Zstd(decoder) => zstd_feed(decoder, input, max_out),
+            ContentDecoder::Failed(kind) => {
+                Err(io::Error::new(*kind, "zstd decoder init failed"))
+            }
         }
     }
 }
 
-/// Observer-side wrapper: once decoding fails (or exceeds a limit) it stays
-/// failed and returns no bytes, so the caller keeps forwarding the raw stream
-/// untouched. Limits guard the observability path against decompression
-/// bombs: single-feed output, per-response cumulative output, and per-feed
-/// expansion ratio are all bounded.
+/// 观察侧包装器：一旦解码失败（或超过限制）即进入并保持失败态、不再返回任何字节，
+/// 调用方照常原样转发原始流。三重限制（单次 feed 输出、单响应累计输出、单次 feed
+/// 膨胀比）用于保护观测路径免遭解压炸弹。
 pub struct ObservableDecoder {
     decoder: ContentDecoder,
     failed: bool,
@@ -128,22 +124,19 @@ impl ObservableDecoder {
     }
 }
 
-/// Why a required (lossless) decode failed. Every variant is terminal for
-/// the conversion path: the plaintext can no longer be trusted.
+/// 必要（无损）解码为何失败。对转换路径而言每个变体都是终态：明文已不可信。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
-    /// The compressed stream is corrupt or truncated.
+    /// 压缩流损坏或被截断。
     CorruptFrame,
-    /// The cumulative plaintext exceeded the configured total cap.
+    /// 累计明文超过配置的总上限。
     CumulativeLimit,
 }
 
-/// Lossless streaming decoder for paths that MUST produce the full
-/// plaintext (mapped conversion). Unlike [`ObservableDecoder`] it never
-/// degrades to silence: unconsumed input is retained across feeds, any
-/// decode failure is reported as [`DecodeError`], and the cumulative
-/// plaintext is bounded by an explicit cap. A failure is sticky — the
-/// caller must treat the response as failed, never as a short/empty body.
+/// 用于必须产出完整明文的路径（映射转换）的无损流式解码器。与
+/// [`ObservableDecoder`] 不同，它绝不退化为静默：未消费的输入跨 feed 保留，
+/// 任何解码失败都以 [`DecodeError`] 上报，累计明文受显式上限约束。失败是粘性的——
+/// 调用方必须把该响应当作失败，而不是当作短/空响应体。
 pub struct RequiredDecoder {
     decoder: ContentDecoder,
     pending: Vec<u8>,
@@ -167,9 +160,8 @@ impl RequiredDecoder {
         }
     }
 
-    /// Feed one network chunk; returns decoded plaintext (possibly empty)
-    /// or a terminal [`DecodeError`]. After an error every subsequent call
-    /// returns the same error.
+    /// 喂入一个网络分块；返回解码后的明文（可能为空）或终态 [`DecodeError`]。
+    /// 一旦出错，之后每次调用都返回同一个错误。
     pub fn feed_required(&mut self, chunk: &[u8]) -> Result<Vec<u8>, DecodeError> {
         if self.failed {
             return Err(self.last_error);
@@ -180,24 +172,20 @@ impl RequiredDecoder {
         self.pending.clear();
         let budget = FEED_LIMIT.min(self.max_total.saturating_sub(self.total_out));
         if budget == 0 {
-            // Cap already reached with more input pending: any further
-            // plaintext would exceed `max_total`.
+            // 已达上限且仍有输入待处理：再产出任何明文都会超过 `max_total`。
             return Err(self.fail(DecodeError::CumulativeLimit));
         }
         let (decoded, consumed, finished) = self.decoder.feed(&input, budget).map_err(|_| {
             self.fail(DecodeError::CorruptFrame);
             self.last_error
         })?;
-        // No expansion-ratio heuristic here: highly compressible *legit*
-        // responses must convert in full. The hard bounds are the per-feed
-        // output cap (budget) and the cumulative plaintext cap below. One
-        // decode call may overshoot `budget` by up to its internal buffer
-        // (16 KiB), which is the cap granularity.
+        // 此处不做膨胀比启发式：高度可压缩的“合法”响应必须完整转换。硬性上限是
+        // 单次 feed 输出上限（budget）与下方的累计明文上限。一次解码调用最多会越过
+        // `budget` 内部缓冲那么多（16 KiB），这就是该上限的粒度。
         self.total_out += decoded.len();
         if self.total_out > self.max_total || (!finished && self.total_out >= self.max_total) {
-            // Plaintext past the cap, or the cap hit with the stream still
-            // open (more output pending): continuing would silently drop
-            // the remainder.
+            // 明文已超过上限，或已达上限而压缩流仍未结束（还有输出待解）：
+            // 继续下去会静默丢掉剩余部分。
             return Err(self.fail(DecodeError::CumulativeLimit));
         }
         self.finished = finished;
@@ -205,9 +193,32 @@ impl RequiredDecoder {
         Ok(decoded)
     }
 
-    /// Whether the compressed stream reached its end marker. A caller whose
-    /// input ended MUST check this: `false` means the body was truncated
-    /// mid-frame and the plaintext is incomplete.
+    /// 把一段**完整**输入喂完：循环 drain 直到解出全部明文或报错。
+    ///
+    /// 单次 [`Self::feed_required`] 的输出上限是 [`FEED_LIMIT`]（2 MiB），
+    /// 未消费的输入留在解码器内部，因此大于该值的合法响应体必须循环取用
+    /// （否则会被误判成“截断”）。输入耗尽而压缩流仍未结束时返回
+    /// [`DecodeError::CorruptFrame`]，与截断的语义一致。
+    pub fn feed_all(&mut self, chunk: &[u8]) -> Result<Vec<u8>, DecodeError> {
+        let mut out = Vec::new();
+        let mut next: &[u8] = chunk;
+        loop {
+            let piece = self.feed_required(next)?;
+            let progressed = !piece.is_empty();
+            out.extend_from_slice(&piece);
+            if self.finished() {
+                return Ok(out);
+            }
+            if next.is_empty() && !progressed {
+                // 输入已耗尽、解码器也不再产出：压缩流没有结束标记 → 截断。
+                return Err(self.fail(DecodeError::CorruptFrame));
+            }
+            next = &[];
+        }
+    }
+
+    /// 压缩流是否到达结束标记。输入已结束的调用方必须检查这里：`false` 表示响应体
+    /// 在帧中途被截断，明文不完整。
     pub fn finished(&self) -> bool {
         self.finished
     }
@@ -220,11 +231,9 @@ impl RequiredDecoder {
     }
 }
 
-/// Inflate with a fixed output buffer; `Decompress` keeps its window state
-/// across calls, so split inputs decode correctly. Stops once `max_out`
-/// bytes were produced (the decoder state is preserved for the next feed).
-/// Returns the produced bytes, how many input bytes were consumed, and
-/// whether the stream end marker was reached.
+/// 使用固定输出缓冲进行 inflate；`Decompress` 跨调用保留窗口状态，因此分片输入也能
+/// 正确解码。产出达到 `max_out` 字节后停止（解码器状态保留到下次 feed）。返回已产出
+/// 字节、已消费输入字节数，以及是否到达流结束标记。
 fn inflate(
     decompress: &mut flate2::Decompress,
     input: &[u8],
@@ -250,8 +259,8 @@ fn inflate(
             }
             flate2::Status::Ok | flate2::Status::BufError => {
                 if out.len() >= max_out || (consumed == 0 && produced == 0) {
-                    // Output cap reached or needs more input than this chunk
-                    // provides; the stream continues on the next feed.
+                    // 输出达到上限，或所需输入超过本块提供的量；
+                    // 该流在下次 feed 时继续。
                     break;
                 }
             }
@@ -274,8 +283,8 @@ fn zstd_feed(
         let status = decoder.run_on_buffers(&input[offset..], &mut buffer)?;
         offset += status.bytes_read;
         out.extend_from_slice(&buffer[..status.bytes_written]);
-        // `remaining == 0` signals a finished frame (zstd run() returns a
-        // hint for the next input; Ok(0) means the frame just finished).
+        // `remaining == 0` 表示帧已结束（zstd 的 run() 返回的是对下次输入的提示；
+        // Ok(0) 意味着帧刚刚结束）。
         if status.remaining == 0 {
             finished = true;
             break;
@@ -287,8 +296,7 @@ fn zstd_feed(
     Ok((out, offset, finished))
 }
 
-/// Streaming brotli: keeps the unconsumed input and decoder state across
-/// calls so chunks can be arbitrarily split.
+/// 流式 brotli：跨调用保留未消费输入与解码器状态，因此分块可以任意切分。
 pub struct BrotliDecoder {
     input: Vec<u8>,
     input_offset: usize,
@@ -312,10 +320,9 @@ impl BrotliDecoder {
         }
     }
 
-    /// Decode one chunk. Returns `(plaintext, consumed, finished)`; the
-    /// unconsumed input stays in this decoder's own buffer, so `consumed` is
-    /// only the share of `chunk` the decompressor has taken (either turned
-    /// into output or compacted away).
+    /// 解码一块数据。返回 `(明文, 已消费, 是否结束)`；未消费的输入留在本解码器
+    /// 自己的缓冲里，因此 `consumed` 只是 `chunk` 中被解压器取走的部分
+    /// （要么变成了输出，要么被压缩掉）。
     fn feed(&mut self, chunk: &[u8], max_out: usize) -> io::Result<(Vec<u8>, usize, bool)> {
         let carry_in = self.input.len() - self.input_offset;
         self.input.extend_from_slice(chunk);
@@ -352,13 +359,12 @@ impl BrotliDecoder {
                         break;
                     }
                     if produced == 0 && consumed == 0 {
-                        // No progress possible with the current input; wait
-                        // for the next chunk instead of spinning.
+                        // 当前输入下无法推进；等待下一块，避免空转。
                         break;
                     }
                 }
                 brotli::BrotliResult::NeedsMoreInput => {
-                    // Compact the consumed prefix and wait for the next chunk.
+                    // 压缩已消费的前缀，等待下一块。
                     if self.input_offset > 0 {
                         self.input.drain(..self.input_offset);
                         self.input_offset = 0;
@@ -415,8 +421,37 @@ mod tests {
         zstd::stream::encode_all(SAMPLE.as_bytes(), 3).unwrap()
     }
 
-    /// Feed `compressed` through a decoder in `chunk_size` pieces and assert
-    /// the concatenated output equals the plaintext.
+    /// zstd 初始化不再 panic；正常 zstd 流依旧能解出完整明文。
+    #[test]
+    fn zstd_still_decodes_after_the_init_path_stopped_panicking() {
+        let compressed = zstd_bytes();
+        let mut decoder =
+            RequiredDecoder::new(ContentDecoder::from_encoding(Some(&HeaderValue::from_static("zstd"))), 1024 * 1024);
+        let plain = decoder.feed_all(&compressed).unwrap();
+        assert_eq!(plain, SAMPLE.as_bytes());
+        assert!(decoder.finished());
+    }
+
+    /// `feed_all` 必须多次 drain 才能解出超过单次上限 `FEED_LIMIT` 的明文
+    /// （单次 feed 只产出 2 MiB，其余留在解码器内部）。
+    #[test]
+    fn feed_all_drains_plaintext_larger_than_one_feed() {
+        use std::io::Write;
+        let plain = format!("{}ENDMARK", "x".repeat(FEED_LIMIT + 64 * 1024));
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(plain.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut decoder = RequiredDecoder::new(
+            ContentDecoder::from_encoding(Some(&HeaderValue::from_static("gzip"))),
+            16 * 1024 * 1024,
+        );
+        let decoded = decoder.feed_all(&compressed).unwrap();
+        assert_eq!(decoded.len(), plain.len());
+        assert!(decoded.ends_with(b"ENDMARK"));
+    }
+
+    /// 以 `chunk_size` 为单位把 `compressed` 喂给解码器，断言拼接后的输出等于明文。
     fn roundtrip(encoding: &'static str, compressed: &[u8], chunk_size: usize) {
         let mut decoder = ContentDecoder::from_encoding(Some(&HeaderValue::from_static(encoding)));
         let mut plain = Vec::new();
@@ -430,8 +465,8 @@ mod tests {
         );
     }
 
-    /// Roundtrip through `RequiredDecoder` with an artificial output cap so
-    /// every feed stops early and the unconsumed input must be carried over.
+    /// 让 `RequiredDecoder` 走一遍往返：以 `chunk_size` 为单位分块喂入 `compressed`，
+    /// 断言拼接后的输出等于明文（上限取 `TOTAL_LIMIT`）。
     fn required_roundtrip(encoding: &'static str, compressed: &[u8], chunk_size: usize) {
         let decoder = ContentDecoder::from_encoding(Some(&HeaderValue::from_static(encoding)));
         let mut required = RequiredDecoder::new(decoder, TOTAL_LIMIT);
@@ -476,7 +511,7 @@ mod tests {
 
     #[test]
     fn unsupported_framing_returns_err_without_panicking() {
-        // Truncated gzip stream: decoding must error, not panic.
+        // 截断的 gzip 流：解码必须报错，而不是 panic。
         let mut gz = gzip_bytes();
         gz.truncate(gz.len() / 2);
         let mut decoder = ContentDecoder::from_encoding(Some(&HeaderValue::from_static("gzip")));
@@ -484,9 +519,8 @@ mod tests {
             decoder.feed(&gz, FEED_LIMIT).is_ok() || decoder.feed(&gz, FEED_LIMIT).is_err(),
             "truncated input must not panic"
         );
-        // A second gzip member concatenated after the first is not decodable
-        // by a single-member decoder; feeding it must not panic (it may
-        // error or return nothing).
+        // 在第一个成员之后拼接第二个 gzip 成员，单成员解码器无法解码它；
+        // 喂入它不得 panic（可能报错或什么都不返回）。
         let multi = gzip_bytes();
         let mut decoder = ContentDecoder::from_encoding(Some(&HeaderValue::from_static("gzip")));
         let first = decoder.feed(&multi, FEED_LIMIT).unwrap().0;
@@ -503,7 +537,7 @@ mod tests {
     fn observable_decoder_stops_feed_after_failure() {
         let mut observable = ObservableDecoder::new(ContentDecoder::Identity);
         assert_eq!(observable.feed_observable(b"a"), b"a");
-        // Force a failure state directly and assert the wrapper stays silent.
+        // 直接制造失败态，断言包装器保持静默。
         let mut corrupt = ObservableDecoder::new(ContentDecoder::Gzip(Box::new(
             flate2::Decompress::new_gzip(15),
         )));
@@ -513,11 +547,9 @@ mod tests {
         let _ = observable;
     }
 
-    /// P1-4: a real high-compression payload (16 MiB of zeros, ~16 KiB on the
-    /// wire) must trip the per-feed expansion-ratio limit on the first feed:
-    /// output is capped at 2 MiB, observability turns off, and later feeds
-    /// return nothing. The failure is produced by the actual payload — the
-    /// `failed` flag is never poked by hand.
+    /// 真实的高压缩负载（16 MiB 全零，线上约 16 KiB）必须在首次 feed 就触发单次
+    /// feed 的膨胀比限制：输出被限制在 2 MiB、观测关闭、后续 feed 返回空。该失败由
+    /// 真实负载产生——绝不手工修改 `failed` 标志。
     #[test]
     fn high_ratio_payload_disables_observability() {
         use std::io::Write;
@@ -548,9 +580,8 @@ mod tests {
         );
     }
 
-    /// P1-4: the cumulative per-response cap turns observability off once
-    /// the decoded total reaches 64 MiB, even when every single feed is
-    /// well within the per-feed limit.
+    /// 累计的每响应上限会在解码总量达到 64 MiB 时关闭观测，即便每次 feed 都远在
+    /// 单次 feed 上限之内。
     #[test]
     fn cumulative_limit_disables_after_total() {
         let mut observable = ObservableDecoder::new(ContentDecoder::Identity);
@@ -573,9 +604,8 @@ mod tests {
         );
     }
 
-    /// P1-2: RequiredDecoder is lossless across arbitrary chunk splits for
-    /// every encoding, including when a single feed's output cap stops the
-    /// decoder mid-frame and the unconsumed input must carry over.
+    /// `RequiredDecoder` 对每种编码在任意分块切分下都无损，包括单次 feed 输出上限
+    /// 让解码器在帧中途停下、未消费输入必须结转的情形。
     #[test]
     fn required_decoder_roundtrips_all_encodings() {
         let cases = [
@@ -591,9 +621,8 @@ mod tests {
         }
     }
 
-    /// P1-2: a single network chunk expanding to more than 2 MiB plaintext
-    /// must be split across feeds losslessly — the output cap stops the
-    /// decoder mid-frame and the unconsumed input carries over.
+    /// 单个网络分块膨胀出超过 2 MiB 明文时，必须跨多次 feed 无损拆分——输出上限
+    /// 让解码器在帧中途停下，未消费输入结转。
     #[test]
     fn required_decoder_splits_oversized_feed_losslessly() {
         use std::io::Write;
@@ -607,8 +636,8 @@ mod tests {
         );
         let mut out = Vec::new();
         let mut feed = 0;
-        // One 4 KiB chunk expands far past the 2 MiB per-feed cap; the
-        // decoder must stop, keep its state, and finish from the next chunk.
+        // 一个 4 KiB 分块膨胀出的量远超 2 MiB 的单次 feed 上限；解码器必须停下、
+        // 保留状态，并从下一块继续完成。
         let chunk = &compressed[..compressed.len().min(4096)];
         while out.len() < plain.len() {
             let decoded = required.feed_required(chunk).unwrap();
@@ -623,12 +652,11 @@ mod tests {
         assert_eq!(out, plain, "split feeds must reassemble the full plaintext");
     }
 
-    /// P1-2: a corrupt compressed stream is a terminal `CorruptFrame`
-    /// error, never a silent short output. Each encoding gets input whose
-    /// framing is invalid by construction (wrong magic / corrupted frame).
+    /// 损坏的压缩流是终态 `CorruptFrame` 错误，绝不静默产出短输出。每种编码都被
+    /// 喂入构造上分帧非法的输入（错误的魔数 / 损坏的帧）。
     #[test]
     fn required_decoder_reports_corrupt_frames() {
-        // Invalid magic: every decoder must reject the framing outright.
+        // 非法魔数：每个解码器都必须直接拒绝该分帧。
         let garbage = b"this is definitely not a compressed stream........";
         for encoding in ["gzip", "deflate", "br", "zstd"] {
             let mut required = RequiredDecoder::new(
@@ -636,8 +664,8 @@ mod tests {
                 TOTAL_LIMIT,
             );
             let mut outcome = required.feed_required(garbage);
-            // Some decoders (brotli) may consume the header-looking prefix
-            // before failing; a second garbage feed must then surface it.
+            // 某些解码器（brotli）可能会先消费掉形似头部的字节再失败；
+            // 此时再喂一次垃圾输入必须让错误浮现。
             if outcome.is_ok() {
                 outcome = required.feed_required(garbage);
             }
@@ -650,8 +678,7 @@ mod tests {
             );
         }
 
-        // Mid-stream corruption: a valid frame with bytes flipped inside the
-        // payload must error, not silently stop producing output.
+        // 流中途损坏：合法帧的载荷内字节被翻转后必须报错，而不是静默地停止产出。
         let mut corrupted = gzip_bytes();
         let mid = corrupted.len() / 2;
         for byte in &mut corrupted[mid..] {
@@ -668,10 +695,8 @@ mod tests {
         assert_eq!(outcome.unwrap_err(), DecodeError::CorruptFrame);
     }
 
-    /// P1-2: a high-compression payload (16 MiB of zeros, ~16 KiB on the
-    /// wire) must convert in FULL on the required path — the expansion-ratio
-    /// heuristic is observability-only; the hard bounds are the cumulative
-    /// cap and the per-feed output cap.
+    /// 高压缩负载（16 MiB 全零，线上约 16 KiB）在必要路径上必须完整转换——膨胀比
+    /// 启发式仅用于观测；硬性上限是累计上限与单次 feed 输出上限。
     #[test]
     fn required_decoder_fully_decodes_high_ratio_payload() {
         use std::io::Write;
@@ -696,11 +721,9 @@ mod tests {
         assert_eq!(out, plain, "high-ratio body must decode in full");
     }
 
-    /// P1-2: the cumulative plaintext cap is enforced for the required path:
-    /// a body whose decoded size exceeds `max_total` fails with
-    /// `CumulativeLimit` instead of being silently truncated. One decode
-    /// call may overshoot the cap by its internal buffer, so a cap below
-    /// the plaintext trips on the first feed.
+    /// 必要路径会强制执行累计明文上限：解码尺寸超过 `max_total` 的响应体以
+    /// `CumulativeLimit` 失败，而不是被静默截断。一次解码调用可能越过该上限内部
+    /// 缓冲那么多，因此低于明文的 `max_total` 会在首次 feed 就触发。
     #[test]
     fn required_decoder_enforces_cumulative_cap() {
         use std::io::Write;

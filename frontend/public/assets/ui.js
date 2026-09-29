@@ -1,5 +1,12 @@
-// UI 渲染助手（P2-4 模块拆分）：无状态 DOM 片段构造与交互原语。
-// 由 app.js 以 ES module 方式导入。
+/**
+ * UI 渲染助手：DOM 片段构造与交互原语（弹窗/抽屉/确认/提示）。
+ *
+ * 职责：为 app.js 提供纯字符串模板与通用交互组件；不访问管理 API。
+ * 边界：不持有业务数据，仅模块内保存少量交互状态——当前弹窗模式
+ * `uiState.modalMode` 与待决确认 `uiState.confirmResolve`，由 app.js 经
+ * `getModalMode` 只读。
+ * 关键不变量：任何插入页面的用户数据都必须经 `escapeHtml`/`escapeAttr` 转义。
+ */
 
 // UI 交互状态（模块内自持，app.js 经 getModalMode 只读）。
 const uiState = { modalMode: '', confirmResolve: null };
@@ -16,7 +23,7 @@ export const elements = {
   sideStatus: document.getElementById('side-status'),
   sideMode: document.getElementById('side-mode'),
   topStatus: document.getElementById('top-status'),
-  topEndpoint: document.querySelector('.topbar-endpoint'),
+  topEndpoint: document.getElementById('top-endpoint'),
   lockButton: document.getElementById('lock-button'),
   sidebar: document.getElementById('sidebar'),
   sidebarScrim: document.getElementById('sidebar-scrim'),

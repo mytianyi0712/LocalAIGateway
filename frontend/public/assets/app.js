@@ -1,4 +1,13 @@
-// P2-4：UI 渲染助手与 API 请求层已拆分为独立 ES module。
+/**
+ * 管理界面主控模块：应用外壳、路由调度与各页面渲染与交互。
+ *
+ * 职责：维护全局 `state`，按 `pageMeta` 分发页面渲染，处理所有表单提交、
+ * 轮询与 DOM 事件，并调用 `api.js` 访问管理 API。
+ * 边界：只做展示与交互；鉴权、协议转换、熔断等一律由后端决定，前端仅按
+ * 后端返回值呈现。
+ * 关键不变量：所有异步渲染都以「页面上下文」（renderVersion + 当前路径）
+ * 校验，过期动作不得覆盖新页面。
+ */
 import {
   elements, icon, escapeHtml, escapeAttr, number, tokenCount, percent,
   parseStandardTime, formatTime, formatLogTime, duration, protocols,
@@ -10,9 +19,10 @@ import {
 import { getToken, setToken, api, get, post, put, patch, remove, setUnauthorizedHandler } from './api.js';
 import { rankModelMatches } from './model-search.js';
 
-// P2-3: the protocol list is data-driven from /system/protocols (populated
-// into state.protocols at boot); this constant is only the offline fallback
-// so the UI still renders before/without the gateway.
+// 协议列表以 /system/protocols 为准（启动时写入 state.protocols）。
+// 此常量是 state.protocols 为空时的兜底：注册表尚未取到或网关返回空时，
+// protocolOptions() 仍能渲染渠道表单与日志筛选里的协议选项。
+// 须与 `protocol.rs::ProtocolId::ALL` 同步（新增协议时两处一起改）。
 const FALLBACK_PROTOCOLS = ['openai_compatible', 'openai_responses', 'claude', 'gemini', 'command_code'];
 function protocolOptions() {
   return (state.protocols && state.protocols.length ? state.protocols : FALLBACK_PROTOCOLS);
@@ -160,13 +170,12 @@ async function checkConnection({ renderAfter = false } = {}) {
   try {
     const system = await get('/system/status');
     state.system = system;
-    // P2-3: protocol registry comes from the gateway; failures keep the
-    // fallback constant.
+    // 协议注册表来自网关；取不到时保留 FALLBACK_PROTOCOLS 兜底。
     try {
       const registry = await get('/system/protocols');
       if (registry.items?.length) state.protocols = registry.items.map((item) => item.id);
     } catch {
-      // Gateway too old or unreachable: the fallback list still works.
+      // 网关过旧或不可达：继续使用兜底协议列表。
     }
     if (elements.topEndpoint) {
       elements.topEndpoint.textContent =
@@ -287,9 +296,33 @@ const BALANCE_ADAPTERS = [
   ['sub2api', 'Sub2API'],
   ['opencode_go', 'OpenCode Go'],
   ['deepseek', 'DeepSeek'],
+  ['mimo', '小米 MiMo（Token Plan）'],
+  ['openrouter', 'OpenRouter'],
+  ['siliconflow', 'SiliconFlow'],
+  ['stepfun', 'StepFun 阶跃星辰'],
+  ['novita', 'Novita AI'],
+  ['moonshot', 'Moonshot Kimi 开放平台'],
+  ['zhipu', '智谱 GLM Coding Plan'],
+  ['minimax', 'MiniMax Coding Plan'],
+  ['kimi_code', 'Kimi For Coding'],
   ['command_code', 'Command Code'],
   ['custom', '自定义'],
 ];
+
+// 「独立令牌」字段的含义各适配器不同（缺省 = New API 文案）。
+const DEFAULT_BALANCE_TOKEN_HELP = 'New API（如 CCTQ）：留空时查询该 sk- 令牌额度；填入面板「系统访问令牌 / PAT」后改为查询账户余额。';
+const BALANCE_ADAPTER_HELP = {
+  mimo: '小米 MiMo：Token Plan 没有 API Key 查询接口，请粘贴浏览器 Cookie（约 1 天过期，过期后重新复制）。',
+  openrouter: 'OpenRouter：填普通 API Key 看该 Key 的额度；填 Management Key 看账户余额（credits - usage）。',
+  zhipu: '智谱 GLM Coding Plan：填控制台 API Key，展示 5 小时 / 周配额窗口（不是账户余额）。',
+  minimax: 'MiniMax Coding Plan：填订阅的 API Key，展示 5 小时 / 周剩余百分比窗口。',
+  kimi_code: 'Kimi For Coding：填订阅的 API Key，展示 5 小时 / 周配额窗口。',
+  stepfun: 'StepFun：填 API Key，展示账户余额（CNY）；Step Plan 的月度 Credit 无公开查询接口。',
+  moonshot: 'Moonshot 开放平台：填 API Key，展示账户余额（CNY）。',
+  novita: 'Novita AI：填 API Key，展示账户余额（USD）。',
+  siliconflow: 'SiliconFlow：填 API Key，展示账户余额（.cn 为 CNY、.com 为 USD）。',
+  command_code: 'Command Code：留空时用渠道 API Key 查询 Go 套餐额度（whoami → credits → usage）。',
+};
 
 function balanceAmount(snapshot) {
   const amount = Number(snapshot.remaining);
@@ -315,8 +348,8 @@ function balanceSnapshotText(snapshot) {
     return `<span class="balance-error" title="${escapeAttr(snapshot.error_kind || 'error')}">查询失败：${escapeHtml(friendlyError(snapshot.error_kind) || 'error')}</span><span class="subtle-text">${escapeHtml(when)}</span>`;
   }
   const parts = [];
-  // Windows first; a concrete credit balance still shows next to them
-  // (Command Code reports 5h/周 windows AND credits).
+  // 先显示额度窗口；具体余额数值随后并列显示
+  //（Command Code 会同时报告 5h/周 窗口与可用额度）。
   if (snapshot.windows?.length) parts.push(snapshot.windows.map((window) => `${window.label} ${balancePercent(window.remaining_percent)}`).join(' / '));
   if (snapshot.remaining !== null && snapshot.remaining !== undefined) parts.push(balanceAmount(snapshot));
   else if (!snapshot.windows?.length && snapshot.unlimited) parts.push('不限额');
@@ -344,8 +377,8 @@ function balanceCellContent(channel) {
       : '';
     return `<div class="balance-windows">${rows}${credits}</div>`;
   }
-  // A concrete number always wins: some upstreams set an unlimited flag
-  // while still reporting a usable balance (even a negative/overdrawn one).
+  // 只要有具体数值就优先显示：部分上游会设置「不限额」标记，
+  // 同时仍返回可用余额（甚至是负数/透支）。
   if (snapshot.remaining !== null && snapshot.remaining !== undefined) {
     const title = snapshot.checked_at ? `查询于 ${formatTime(snapshot.checked_at)}` : '';
     const negative = Number(snapshot.remaining) < 0 ? ' is-negative' : '';
@@ -561,8 +594,8 @@ function renderDashboard() {
 
 async function loadProviders(version) {
   const [providerData, channelData, modelData, presetData] = await Promise.all([get('/providers'), get('/channels'), get('/channel-models'), get('/provider-presets')]);
-  // P2-9: this loader paints the providers page; it must never paint onto
-  // another page, even when the version counter somehow still matches.
+  // 本加载器只负责绘制供应商页；即使版本计数意外仍然相等，
+  // 也绝不能绘制到其它页面。
   if (version !== state.renderVersion || currentPath() !== '/providers') return;
   state.providers = providerData.items;
   state.channels = channelData.items;
@@ -611,9 +644,8 @@ function renderProvidersMarkup() {
 function providerForm(editing = null) {
   const presets = state.providerPresets || [];
   const presetOptions = presets.map((preset) => `<option value="${escapeAttr(preset.id)}" data-warning="${escapeAttr(preset.warning || '')}" data-base-url="${escapeAttr(preset.base_url)}" data-protocol="${escapeAttr(preset.protocol)}" data-kind="${escapeAttr(preset.kind || '')}">${escapeHtml(preset.name)}</option>`).join('');
-  // A Command Code provider carries `kind='command_code'` and stays
-  // default-off; the reverse path is only entered after the server itself
-  // answers 403 upgrade_required. The preset warning is mandatory reading.
+  // Command Code 供应商带 `kind='command_code'` 且默认关闭；只有服务端
+  // 自己返回 403 upgrade_required 后才会进入反向路径。预设风险提示必须阅读。
   const presetField = editing ? '' : `<div class="field"><label for="provider-preset">供应商预设</label><select class="select" id="provider-preset" name="preset" data-provider-preset><option value="">自定义（不套用预设）</option>${presetOptions}</select><span class="field-help">选择预设会自动填充名称与 API 根地址；Command Code Go 预设会启用 CLI 兼容身份，其渠道凭据需通过「网页登录授权」获取（Go 套餐无法在面板创建 API Key）。</span></div>`;
   const warning = editing ? '' : `<div class="notice is-error" id="provider-preset-warning" hidden></div>
       <label class="checkbox-row" id="provider-preset-confirm-row" hidden><input type="checkbox" id="provider-preset-confirm" data-provider-preset-confirm> <span>我已阅读并知悉上述风险，确认创建该供应商</span></label>`;
@@ -664,7 +696,7 @@ function channelBalanceSection(editing, balance) {
         </div>
       </div>
       <div class="form-grid is-two">
-        <div class="field"><label for="balance-token">独立令牌（留空保持不变）</label><input class="input" id="balance-token" type="password" name="balance_token" autocomplete="new-password" placeholder="${escapeAttr(balance?.token_hint || '')}"><span class="field-help">New API（如 CCTQ）：留空时查询该 sk- 令牌额度；填入面板「系统访问令牌 / PAT」后改为查询账户余额。</span></div>
+        <div class="field"><label for="balance-token">独立令牌（留空保持不变）</label><input class="input" id="balance-token" type="password" name="balance_token" autocomplete="new-password" placeholder="${escapeAttr(balance?.token_hint || '')}"><span class="field-help" data-balance-token-help>${escapeHtml(BALANCE_ADAPTER_HELP[adapter] || DEFAULT_BALANCE_TOKEN_HELP)}</span></div>
         <div class="field"><label>&nbsp;</label><label class="checkbox-row"><input type="checkbox" name="balance_clear_token"> 清除已保存的独立令牌</label></div>
       </div>
       <div class="balance-snapshot" data-balance-snapshot>${balanceSnapshotText(balance?.snapshot)}</div>
@@ -758,9 +790,19 @@ function applyCommandCodeLoginStatus(login) {
   paintCommandCodeLogin();
 }
 
+// 轮询 Command Code 登录授权状态。总时长上限为 1.2s × 75 = 90s，
+// 超时后回到 idle 并提示重试，避免按钮被永久锁定在 waiting。
 function pollCommandCodeLogin() {
   stopCommandCodeLoginPolling();
+  const deadline = Date.now() + 1200 * 75;
   const tick = async () => {
+    if (Date.now() >= deadline) {
+      stopCommandCodeLoginPolling();
+      state.ccLogin = { status: 'idle' };
+      toast('登录授权超时，请重试', 'error');
+      paintCommandCodeLogin();
+      return;
+    }
     try {
       const data = await get('/command-code/login');
       applyCommandCodeLoginStatus(data.login || { state: 'idle' });
@@ -883,8 +925,8 @@ async function saveProvider(form) {
 }
 
 async function saveChannel(form) {
-  // P2-9: captured before any await — the reload after the write must only
-  // paint while the providers page is still the current page.
+  // 在任何 await 之前捕获上下文：写入后的重新加载只能在本页仍是
+  // 当前页面时绘制。
   const ctx = captureContext();
   const values = new FormData(form);
   const protocolsValue = values.getAll('protocols');
@@ -905,14 +947,14 @@ async function saveChannel(form) {
   if (channelId) {
     const original = JSON.parse(form.dataset.originalProtocols || '[]');
     const protocolsChanged = original.length !== protocolsValue.length || original.some((value) => !protocolsValue.includes(value));
-    // P2-3: the API key is part of ONE atomic PATCH — fields and key either
-    // all commit or none do; a rejected key can no longer leave the channel
-    // half-updated.
+    // 渠道字段与 API Key 在同一个 PATCH 中提交，二者要么一起成功要么一起
+    // 失败，被拒的 Key 不会留下只改了一半的渠道。注意：随后的余额配置是
+    // 单独的 PUT/DELETE，不在这一原子范围内。
     if (manualApiKey) payload.api_key = manualApiKey;
     if (commandCodeLoginId) payload.login_id = commandCodeLoginId;
     await patch(`/channels/${channelId}`, payload);
-    // Balance config is saved together with the channel form. Choosing "请选择"
-    // (empty adapter) removes an existing config, back to default-off.
+    // 余额配置随渠道表单一起保存。选择「请选择」（适配器为空）会删除
+    // 已有配置，回到默认关闭状态。
     if (form.querySelector('[data-balance-section]')) {
       const balancePayload = balancePayloadFromForm(form);
       if (balancePayload) await put(`/channels/${channelId}/balance-config`, balancePayload);
@@ -958,9 +1000,8 @@ async function toggleChannel(channelId, enabled) {
 }
 
 async function discoverChannel(channelId, { quiet = false } = {}) {
-  // P2-9: the write (starting the run) always completes; the poll only
-  // continues while the providers page is still current, and the final
-  // reload never paints onto another page.
+  // 写入（启动探测）总会完成；轮询只在本页仍是当前页面时继续，
+  // 最终的重新加载也不会绘制到其它页面。
   const ctx = captureContext();
   const version = ctx.renderVersion;
   const result = await post(`/channels/${channelId}/discover-models`);
@@ -994,8 +1035,8 @@ async function queryChannelBalance(channelId) {
     toast('请先选择余额适配器', 'warning');
     return;
   }
-  // "Query now" saves the current form first so the request reflects what
-  // the user just edited, then performs the one-off query.
+  // 「立即查询」会先把表单里的余额配置单独保存（PUT /balance-config），
+  // 使查询反映用户刚编辑的余额设置，然后再执行一次性查询。
   await put(`/channels/${channelId}/balance-config`, payload);
   form.dataset.balanceConfigured = '1';
   const result = await post(`/channels/${channelId}/balance`);
@@ -1036,8 +1077,8 @@ async function refreshChannelBalance(channelId, button) {
     button.classList.add('is-loading');
   }
   try {
-    // `enabled=0` channels are still queried here: a per-row click is the
-    // same explicit intent as the form's "立即查询".
+    // 这里连 `enabled=0` 的渠道也会查询：逐行点击与表单里的
+    // 「立即查询」是同等明确的意图。
     const result = await post(`/channels/${channelId}/balance`);
     channel.balance = { ...(channel.balance || {}), configured: true, snapshot: result };
     if (result.status === 'ok') toast(`${channel.name} 余额已刷新`);
@@ -1046,7 +1087,7 @@ async function refreshChannelBalance(channelId, button) {
       elements.page.innerHTML = renderProvidersMarkup();
     });
   } finally {
-    // The row may have been repainted; only restore a button still in DOM.
+    // 该行可能已被重绘；只恢复仍在 DOM 中的按钮。
     if (button && document.contains(button)) {
       button.disabled = false;
       button.classList.remove('is-loading');
@@ -1083,15 +1124,13 @@ async function deleteChannel(channelId) {
   renderIfCurrent(version, renderPage);
 }
 
-// A channel model counts as "supplied" only when the upstream still returns it
-// (available), its channel is manually enabled and it is not circuit-open.
-// Models without a supplier are hidden from the add-route list; already
-// configured routes are never deleted and stay in the routes table.
+// 判断渠道模型是否「在用」：上游仍报可用（available）、所属渠道未被手动
+// 禁用，且未处于熔断打开状态。
 function isLiveModel(model) {
   return Boolean(model.available) && model.channel_enabled !== false && (model.health_state ?? 'active') === 'active';
 }
 
-// model_id -> protocols, unioned across every live supplier channel.
+// model_id → protocols：跨所有「在用」供应方渠道取并集。
 function liveModelProtocols() {
   const map = new Map();
   for (const model of state.channelModels) {
@@ -1103,6 +1142,8 @@ function liveModelProtocols() {
   return map;
 }
 
+// 没有可用供应方的模型不会出现在「新建路由」的可选列表中；已配置的路由
+// 不会被删除，仍留在路由表里。
 function routeOptions() {
   const routed = new Set(state.routes.map((route) => route.requested_model_id));
   return [...liveModelProtocols().keys()]
@@ -1110,8 +1151,8 @@ function routeOptions() {
     .sort();
 }
 
-// Protocols offered by default for a custom model (Command Code is
-// upstream-only and opt-in, matching the mapping form).
+// 为自定义模型默认勾选的协议（Command Code 没有客户端入口端点，
+// 需显式开启，与映射表单一致）。
 const ROUTE_DEFAULT_PROTOCOLS = ['openai_compatible', 'openai_responses', 'claude', 'gemini'];
 
 function syncRouteProtocols() {
@@ -1168,7 +1209,7 @@ function routeForm() {
     mode: 'route',
     body: `<form class="form-stack" id="route-form" data-form="route">
       <div class="field"><label for="route-model">模型 ID</label><input class="input" id="route-model" name="requested_model_id" list="route-model-options" required maxlength="255" placeholder="填写自定义模型 ID，或选择已探测模型" autocomplete="off"><datalist id="route-model-options">${options.map((model) => `<option value="${escapeAttr(model)}"></option>`).join('')}</datalist><span class="field-help">可自由填写网关对外暴露的模型 ID；创建后在候选抽屉中选择「渠道 + 模型」作为请求源，多个 ID 不同的来源可合并到同一个模型。</span></div>
-      <div class="field"><label>请求格式</label><div class="checkbox-grid">${protocolBoxes}</div><span class="field-help">网关按候选各自支持的协议自动过滤；输入已探测模型 ID 时会自动勾选它支持的协议。Command Code 为上游专用，仅在需要映射到此协议时勾选。</span></div>
+      <div class="field"><label>请求格式</label><div class="checkbox-grid">${protocolBoxes}</div><span class="field-help">网关按候选各自支持的协议自动过滤；输入已探测模型 ID 时会自动勾选它支持的协议。Command Code 渠道可直接服务 Claude / OpenAI Chat / Responses 三种入口（网关自动转换），无需额外映射。</span></div>
     </form>`,
     footer: `${button({ action: 'close-modal', label: '取消' })}${button({ action: 'submit-route', label: '创建', iconName: 'plus', primary: true })}`,
   });
@@ -1184,8 +1225,7 @@ async function saveRoute(form) {
   const created = await post('/routes', { requested_model_id: requestedModelId, protocols });
   closeModal();
   toast('模型路由已创建');
-  // P2-9: the reload and the drawer only run on the page this mutation
-  // started from.
+  // 重新加载与抽屉只在本变更发起的页面里执行。
   if (!isCurrent(ctx)) return;
   await loadRoutes(ctx.renderVersion);
   openCandidates(created.id);
@@ -1255,16 +1295,16 @@ function refreshCapsPreview() {
   const reas = bool('reasoning');
   if (reas === true) parts.push('思考');
   if (reas === false) parts.push('无思考');
-  const rawMap = String(values.get('thinking_level_map') || '').trim();
-  if (rawMap) {
-    try {
-      const map = JSON.parse(rawMap);
-      const keys = Object.keys(map);
-      if (keys.length) parts.push(`思考档 ${keys.join('/')}`);
-    } catch {
-      parts.push('思考档 JSON 无效');
-    }
+  let mapKeys = null;
+  let mapInvalid = false;
+  try {
+    const map = parseThinkingLevelMap(values);
+    mapKeys = map ? Object.keys(map) : null;
+  } catch {
+    mapInvalid = true;
   }
+  if (mapKeys && mapKeys.length) parts.push(`思考档 ${mapKeys.join('/')}`);
+  if (mapInvalid) parts.push('思考档 JSON 无效');
   const costParts = [];
   for (const [name, label] of [['cost_input', '输入'], ['cost_output', '输出'], ['cost_cache_read', '缓存读'], ['cost_cache_write', '缓存写']]) {
     const value = num(name);
@@ -1274,6 +1314,18 @@ function refreshCapsPreview() {
   const chips = parts.length ? parts.map((item) => `<span>${escapeHtml(item)}</span>`).join('') : '<span class="subtle-text">未配置能力字段</span>';
   const costRow = costParts.length ? `<div class="capability-summary caps-preview-cost">${costParts.map((item) => `<span>${escapeHtml(item)}</span>`).join('')}</div>` : '';
   container.innerHTML = `<div class="caps-preview-head">应用后预览${sourceChip}</div><div class="capability-summary">${chips}</div>${costRow}`;
+}
+
+// thinkingLevelMap 表单字段的唯一解析点：空值 → null；非法 JSON → 抛错
+// （调用方决定是提示还是中断提交）。
+function parseThinkingLevelMap(values) {
+  const raw = String(values.get('thinking_level_map') || '').trim();
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new Error('thinkingLevelMap 必须是有效 JSON');
+  }
 }
 
 function formNumberOrNull(values, name) {
@@ -1293,15 +1345,7 @@ async function saveCapabilities(form) {
   const route = state.drawerRoute;
   if (!route) return;
   const values = new FormData(form);
-  const rawMap = String(values.get('thinking_level_map') || '').trim();
-  let thinkingLevelMap = null;
-  if (rawMap) {
-    try {
-      thinkingLevelMap = JSON.parse(rawMap);
-    } catch {
-      throw new Error('thinkingLevelMap 必须是有效 JSON');
-    }
-  }
+  const thinkingLevelMap = parseThinkingLevelMap(values);
   const payload = {
     source: values.get('source') || 'manual',
     profile_id: values.get('profile_id') || null,
@@ -1318,7 +1362,7 @@ async function saveCapabilities(form) {
   await put(`/model-capabilities/${encodeURIComponent(route.requested_model_id)}`, payload);
   closeDrawer();
   toast('模型能力已保存');
-  // P2-9: the reload never paints onto a page the user navigated to.
+  // 重新加载绝不绘制到用户已经导航离开的页面。
   if (isCurrent(ctx)) await loadRoutes(ctx.renderVersion);
 }
 
@@ -1584,15 +1628,7 @@ async function saveProfile(form) {
   const values = new FormData(form);
   const name = String(values.get('name') || '').trim();
   if (!name) throw new Error('请填写档案名称');
-  const rawMap = String(values.get('thinking_level_map') || '').trim();
-  let thinkingLevelMap = null;
-  if (rawMap) {
-    try {
-      thinkingLevelMap = JSON.parse(rawMap);
-    } catch {
-      throw new Error('thinkingLevelMap 必须是有效 JSON');
-    }
-  }
+  const thinkingLevelMap = parseThinkingLevelMap(values);
   const payload = {
     name,
     description: String(values.get('description') || '').trim() || null,
@@ -1678,15 +1714,7 @@ async function submitSaveAsProfile(form) {
   const capsForm = document.getElementById('caps-form');
   if (!capsForm) throw new Error('能力表单已关闭');
   const values = new FormData(capsForm);
-  const rawMap = String(values.get('thinking_level_map') || '').trim();
-  let thinkingLevelMap = null;
-  if (rawMap) {
-    try {
-      thinkingLevelMap = JSON.parse(rawMap);
-    } catch {
-      throw new Error('thinkingLevelMap 必须是有效 JSON');
-    }
-  }
+  const thinkingLevelMap = parseThinkingLevelMap(values);
   const created = await post('/capability-profiles', {
     name,
     description: null,
@@ -1709,7 +1737,7 @@ const PROTOCOL_LABELS = {
   openai_responses: 'OpenAI Responses',
   claude: 'Claude 原生',
   gemini: 'Gemini',
-  command_code: 'Command Code（CLI 兼容，上游专用）',
+  command_code: 'Command Code（CLI 兼容，无客户端入口）',
 };
 
 function protocolLabel(protocol) {
@@ -1829,7 +1857,7 @@ async function deleteMapping(mappingId) {
   renderPage();
 }
 
-// 预设刷新去重:一次刷新流程进行中时忽略重复点击 (P1-5)。
+// 预设刷新去重：一次刷新流程进行中时忽略重复点击。
 let presetRefreshInFlight = false;
 
 async function refreshPresets() {
@@ -1843,15 +1871,15 @@ async function refreshPresets() {
     try {
       queued = await post(`${config.presetsApi}/refresh`);
     } catch (error) {
-      // 无可用渠道时后端返回明确 409,不得假装 queued (P1-5)。
+      // 无可用渠道时后端返回明确 409，不得假装已排队。
       toast(error.message || '预设刷新失败', 'error');
       return;
     }
     const runIds = queued?.run_ids || [];
     if (!runIds.length) return;
     toast(`已排队 ${runIds.length} 个渠道的模型探测，完成后自动更新预设…`);
-    // 轮询每个 run 的终态;用户导航离开或关闭弹窗后立即放弃,
-    // 不覆盖新页面 (P1-5)。
+    // 轮询每个 run 的终态；用户导航离开或关闭弹窗后立即放弃，
+    // 不覆盖新页面。
     const results = await pollDiscoveryRuns(runIds, () =>
       version !== state.renderVersion || !document.getElementById('mapping-form'));
     if (results === null) return;
@@ -1891,8 +1919,16 @@ function presetOptionsOf(presetData) {
 // 弹窗)时返回 null。
 async function pollDiscoveryRuns(runIds, gone) {
   const terminal = new Map();
+  // 最多轮询 600 次(每次间隔 1s,合计 10 分钟);超出后提示并退出,
+  // 避免 run 永不终结时页面无限挂起。
+  let attempts = 0;
   while (terminal.size < runIds.length) {
     if (gone()) return null;
+    if (attempts >= 600) {
+      toast('探测任务轮询超时，请在列表中稍后查看结果', 'error');
+      return null;
+    }
+    attempts += 1;
     await Promise.all(runIds.filter((id) => !terminal.has(id)).map(async (id) => {
       try {
         const run = await get(`/discovery-runs/${id}`);
@@ -1994,8 +2030,8 @@ async function loadSettings(version) {
   } catch (error) {
     if (version !== state.renderVersion || currentPath() !== '/settings') return;
     if (error.body?.code === 'config_corrupted') {
-      // P1-3: 管理面因持久化配置损坏而 fail-closed。区分两种来源:
-      // 访问密钥损坏 → 密钥恢复页;运行时设置损坏 → 修复表单。
+      // 管理面因持久化配置损坏而 fail-closed。区分两种来源：
+      // 访问密钥损坏 → 密钥恢复页；运行时设置损坏 → 修复表单。
       try {
         const status = await get('/settings/access-keys/status');
         if (version !== state.renderVersion || currentPath() !== '/settings') return;
@@ -2030,8 +2066,8 @@ function renderRecoveryPage(status) {
   </div>`;
 }
 
-/// P1-3: 运行时设置损坏时的修复表单——经恢复模式端点(loopback + nonce)
-/// 原子重写损坏行,不接收访问密钥。初始值取默认值并明确提示。
+// 运行时设置损坏时的修复表单：经恢复模式端点（loopback + nonce）原子重写
+// 损坏行，不接收访问密钥。初始值取默认值并明确提示。
 function renderSettingsRepairPage() {
   const settings = { ...SETTINGS_DEFAULTS };
   const corruptKeys = (state.settingsCorruptKeys || []).map(escapeHtml).join('、');
@@ -2044,8 +2080,9 @@ function renderSettingsRepairPage() {
 }
 
 
-// 设置表单 schema (P1-7): 一份定义同时驱动渲染、提交载荷与前端范围
-// 校验——新增字段不可能只接入一半。
+// 设置表单 schema：一份定义同时驱动渲染、提交载荷与前端范围校验，
+// 新增字段不可能只接入一半。
+// 范围值须与后端 `settings.rs::setting_ranges` 同步（非同一来源）。
 const SETTINGS_SECTIONS = [
   { id: 'fault', title: '故障转移', note: '优先级路由与自动熔断', grid: '',
     fields: [['failure_threshold', '连续失败阈值', 1, 20], ['circuit_open_seconds', '熔断时间（秒）', 30, 86400], ['max_failover_attempts', '最大渠道尝试', 1, 20]] },
@@ -2060,8 +2097,8 @@ const SETTINGS_SECTIONS = [
     fields: [['command_code_idle_timeout_seconds', '流空闲超时（秒）', 10, 3600], ['command_code_init_interval_hours', '指纹刷新周期（小时）', 1, 168], ['command_code_version_check_interval_hours', '版本探测周期（小时）', 1, 720], ['command_code_quota_interval_minutes', '额度刷新周期（分钟）', 1, 1440], ['command_code_max_concurrency', '单账号并发上限', 1, 32]] },
 ];
 
-// 设置损坏修复表单的初始值,与后端 RuntimeSettings::default() 一致
-// (P1-3)。损坏行无法安全读取,因此修复表单从这些默认值开始。
+// 设置损坏修复表单的初始值，与后端 RuntimeSettings::default() 一致。
+// 损坏行无法安全读取，因此修复表单从这些默认值开始。
 const SETTINGS_DEFAULTS = {
   trust_local_network: true,
   failure_threshold: 3,
@@ -2104,7 +2141,7 @@ function commandCodePanel(settings) {
     : (status.cli_version ? `<div class="notice">CLI 版本 ${escapeHtml(status.cli_version)}（协议基准 ${escapeHtml(status.verified_baseline || '?')}）${status.version_checked_at ? ` · 探测于 ${escapeHtml(status.version_checked_at)}` : ''}</div>` : '');
   const warning = 'Go 套餐没有官方 API 访问：网关默认先请求官方 Provider API，服务端以 403 upgrade_required 拒绝后，仅对该账号降级到 CLI 兼容路径（/alpha/generate），并使用 CLI 身份头（会话、指纹、版本）。这是对服务端明确拒绝路径的绕过，可能违反服务条款并导致账号封禁；启用即表示已知晓并自行承担全部风险。';
   return panel('Command Code（Go 套餐）', '默认关闭；关闭时零上游请求', `<div class="section-body"><div class="form-stack">
-    <div class="switch-row"><div class="switch-copy"><strong>启用 Command Code 集成</strong><p>${enabled ? '已启用：Command Code 渠道的映射请求可路由（先官方 API，403 后降级）' : '已关闭：Command Code 渠道的请求会被拒绝，探测/发现/额度也都不会发出'}</p></div><input class="switch-control" id="command-code-enabled" name="command_code_enabled" type="checkbox" aria-label="启用 Command Code 集成" ${enabled ? 'checked' : ''}></div>
+    <div class="switch-row"><div class="switch-copy"><strong>启用 Command Code 集成</strong><p>${enabled ? '已启用：Command Code 渠道的请求可路由（先官方 API，403 后降级）' : '已关闭：Command Code 渠道的请求会被拒绝，探测/发现/额度也都不会发出'}</p></div><input class="switch-control" id="command-code-enabled" name="command_code_enabled" type="checkbox" aria-label="启用 Command Code 集成" ${enabled ? 'checked' : ''}></div>
     <div class="notice is-error" data-command-code-warning ${enabled ? '' : 'hidden'}>${warning}</div>
     <label class="checkbox-row" data-command-code-confirm-row ${enabled ? 'hidden' : ''}><input type="checkbox" data-command-code-confirm> <span>我已阅读并知悉上述风险，确认启用</span></label>
     ${driftNotice}
@@ -2149,9 +2186,8 @@ async function saveSettings(form) {
     trust_local_network: values.get('trust_local_network') === 'on',
     command_code_enabled: commandCodeEnabled,
   };
-  // P1-7: the payload is generated from the SAME schema that renders the
-  // fields, and each value is range-checked client-side before the PATCH
-  // (the backend 422 stays as the second gate).
+  // 提交载荷由渲染这些字段的同一份 schema 生成，且每个值在 PATCH 前
+  // 都做前端范围校验（后端的 422 仍作为第二道关卡）。
   for (const [name, , min, max] of SETTINGS_SECTIONS.flatMap((section) => section.fields)) {
     const raw = values.get(name);
     const number = Number(raw);
@@ -2166,7 +2202,7 @@ async function saveSettings(form) {
   if (adminKey) payload.admin_access_key = adminKey;
   if (gatewayKey) payload.gateway_access_key = gatewayKey;
   if (state.settingsRepair) {
-    // P1-3: 设置损坏修复——loopback + 一次性 nonce 门控,不接收访问密钥。
+    // 设置损坏修复：经 loopback + 一次性 nonce 门控，不接收访问密钥。
     try {
       await patch('/settings/recovery-repair', payload, {
         headers: { 'x-recovery-nonce': state.recovery?.recovery_nonce },
@@ -2202,9 +2238,8 @@ async function saveSettings(form) {
 
 async function generateKeys() {
   const version = state.renderVersion;
-  // P1-4: while in recovery mode the generate endpoint demands the
-  // one-time challenge issued with the recovery status; it is single-use,
-  // so a failure means re-entering recovery and getting a fresh one.
+  // 恢复模式下，生成端点要求携带随恢复状态下发的一次性挑战值；该值
+  // 单次有效，因此失败意味着需重新进入恢复流程以获取新的值。
   const nonce = state.recovery?.recovery_nonce;
   const options = nonce ? { headers: { 'x-recovery-nonce': nonce } } : {};
   let result;
@@ -2221,8 +2256,8 @@ async function generateKeys() {
   }
   state.generatedKeys = result;
   if (state.recovery) {
-    // Recovery mode: the keys are valid again — adopt the fresh admin key
-    // and reload the full settings page.
+    // 恢复模式：密钥已重新有效——采用新生成的管理密钥并重新加载
+    // 完整的设置页面。
     state.recovery = null;
     setToken(result.admin_access_key);
     await loadSettings(version);
@@ -2252,10 +2287,9 @@ function renderIfCurrent(version, render) {
   if (version === state.renderVersion) render();
 }
 
-// P2-9: a mutation captures the page context when it starts; navigation
-// invalidates it. The data write still completes, but any reload/render the
-// mutation triggers afterwards only runs while the same page is still
-// current — a stale action can never paint its markup onto another page.
+// 变更在发起时捕获页面上下文，导航会使其失效。数据写入仍会完成，但变更
+// 之后触发的重新加载/渲染只在同一页面仍为当前页面时执行——过期的动作
+// 绝不会把它的标记绘制到另一个页面上。
 function captureContext() {
   return { path: currentPath(), renderVersion: state.renderVersion };
 }
@@ -2486,6 +2520,8 @@ function handleChange(event) {
     const section = target.closest('[data-balance-section]');
     const custom = section?.querySelector('[data-balance-custom]');
     if (custom) custom.hidden = target.value !== 'custom';
+    const help = section?.querySelector('[data-balance-token-help]');
+    if (help) help.textContent = BALANCE_ADAPTER_HELP[target.value] || DEFAULT_BALANCE_TOKEN_HELP;
   }
 }
 

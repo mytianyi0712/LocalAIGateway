@@ -1,4 +1,13 @@
-// 管理 API 请求层（P2-4 模块拆分）：token 存储与 fetch 封装。
+/**
+ * 管理 API 请求层：访问令牌存储与 fetch 封装。
+ *
+ * 职责：拼接 `/api/admin/v1` 前缀、注入 `Authorization` 头，统一解析 JSON
+ * 响应并把非 2xx 转成带 `status`/`code` 的 Error。
+ * 边界：只处理 HTTP 层；401 的具体处置（恢复模式不弹窗）交由 app.js 注册
+ * 的处理器决定，避免模块循环依赖。
+ * 关键不变量：令牌存于 `sessionStorage`；除 204 无响应体外，响应体一律按
+ * JSON 解析，解析失败按可读错误抛出而非静默返回 null。
+ */
 
 
 export const API_ROOT = '/api/admin/v1';
@@ -35,9 +44,8 @@ export async function api(path, options = {}) {
     error.status = response.status;
     error.code = body?.code;
     error.body = body;
-    // Recovery mode runs without a valid key: a 401 there is the recovery
-    // challenge failing, not a missing login. The app decides via the
-    // registered handler (it knows whether recovery mode is active).
+    // 恢复模式本就没有有效密钥：此处 401 表示恢复挑战校验失败，而不是
+    // 缺少登录。具体如何处置交给注册的处理器（它才知道恢复模式是否开启）。
     if (response.status === 401) unauthorizedHandler?.();
     throw error;
   }

@@ -1,3 +1,12 @@
+//! 内嵌前端静态资源的处理器：把 `frontend/public` 打进二进制并提供服务。
+//!
+//! 职责：按请求路径返回内嵌资源；对非 API、且路径末段不含 `.` 的请求回退到
+//! `index.html`（SPA 前端路由）。
+//! 边界：只处理静态资源与 SPA 回退，不涉及 `/api`、`/v1`、`/v1beta`、
+//! `/claudecode`、`/codex` 等由 API 路由负责的请求。
+//! 关键不变量：任意路径都不会 panic——命中就返回资源，未命中返回 404 JSON，
+//! 构造响应失败时回落 500。
+
 use axum::{
     body::Body,
     http::{StatusCode, Uri, header},
@@ -49,7 +58,11 @@ fn asset_response(path: &str, data: Vec<u8>) -> Response {
         .header(header::CONTENT_TYPE, mime.as_ref())
         .header(header::CACHE_CONTROL, cache)
         .body(Body::from(data))
-        .expect("static response")
+        // 头部值全部来自常量/mime 表，理论不会失败；真失败也只回一个 500，
+        // 不在请求路径 panic。
+        .unwrap_or_else(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "static response error").into_response()
+        })
 }
 
 fn is_api_path(path: &str) -> bool {

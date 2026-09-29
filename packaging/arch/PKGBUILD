@@ -1,4 +1,9 @@
-# Maintainer: Local AI Gateway contributors
+# 维护者: Local AI Gateway contributors
+# Arch Linux 打包配方：构建并安装 local-ai-gateway 桌面端（Rust 后端 + webview 前端）。
+#
+# 前提：由 packaging/build-arch.sh 调用，且 ${startdir}/repo 已符号链接到仓库根目录；
+#       构建需要 Rust 工具链，运行时依赖 webkit2gtk-4.1 与 libayatana-appindicator。
+# 注意：本文件不负责版本同步——pkgver 由 scripts/version.sh 与 build-arch.sh 覆盖。
 pkgname=local-ai-gateway
 # 项目版本唯一来源是仓库根目录 VERSION；本行由 scripts/version.sh sync 自动同步。
 # Arch pkgver 不允许连字符，预发布段映射为下划线（如 0.3.0-rc.1 -> 0.3.0_rc.1）；
@@ -11,7 +16,7 @@ url='https://github.com/mytianyi0712/LocalAIGateway'
 license=('MIT')
 depends=('webkit2gtk-4.1' 'libayatana-appindicator')
 makedepends=('rust')
-# Cargo controls Rust LTO; makepkg's C LTO breaks the bundled SQLite archive.
+# Rust 侧 LTO 由 Cargo 控制；makepkg 的 C LTO 会破坏随包内置的 SQLite 归档，故禁用。
 options=('!lto' '!debug')
 source=()
 sha256sums=()

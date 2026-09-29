@@ -1,20 +1,17 @@
-//! Application layer: the shared request/runtime context (P2-2).
+//! 应用层：承载共享的请求/运行时上下文（`Context`）。
 //!
-//! `Context` used to be `server::AppState` — a service locator defined by
-//! the composition root and depended on by every business module, creating
-//! a crate-level cycle (`server -> admin/proxy -> server::AppState`). The
-//! context now lives here: business modules depend on `application`, and
-//! `server` only assembles it. The next step (per the architecture report)
-//! replaces this wide context with narrow per-handler services.
+//! `Context` 只承载端口与不可变值：配置、数据库、密钥库、上游端口、遥测、
+//! 后台监管、路由/渠道/时钟/通知端口与运行限额。具体服务实例
+//! （`proxy` / `admin` / `balance` / `discovery` / `command_code_login` /
+//! `recovery`）在 `state::AppState`。两者分开是为了让业务服务只依赖 `Context`
+//! 这一组端口，而不反向依赖组合根——否则 application ↔ 服务会成环。
 //!
-//! `HttpClients` and `RuntimeSupervisor` are still defined in `server` and
-//! imported here for now; they move to `infrastructure` when the split
-//! continues.
+//! `RuntimeSupervisor` 与 HTTP 客户端池位于 `infrastructure`，此处经
+//! `crate::infrastructure` 导入使用。
 
 use std::sync::Arc;
 
 use crate::{
-    auth::RecoverySession,
     config::AppConfig,
     crypto::SecretStore,
     db::Database,
@@ -24,43 +21,25 @@ use crate::{
     telemetry::Telemetry,
 };
 
-/// Shared state handed to every handler. Clonable: each task clones the
-/// context and drops it when it finishes, which is also how the telemetry
-/// sender gets released during shutdown.
+/// 交给每个 handler 的共享状态。可克隆：每个任务克隆一份上下文并在结束时丢弃，
+/// 这也是关闭期间 telemetry 发送端被释放的方式。
 #[derive(Clone)]
 pub struct Context {
     pub config: Arc<AppConfig>,
     pub db: Database,
     pub secrets: SecretStore,
-    /// Upstream HTTP port (P2-1); the reqwest pool lives in infrastructure.
+    /// 上游 HTTP 端口；reqwest 连接池位于 infrastructure。
     pub http: Arc<dyn UpstreamClient>,
     pub telemetry: Telemetry,
     pub background: Arc<RuntimeSupervisor>,
-    /// Model-route port (P2-1).
+    /// 模型路由端口。
     pub routes: Arc<dyn RouteRepository>,
-    /// Channel port (P2-1).
+    /// 渠道端口。
     pub channels: Arc<dyn ChannelRepository>,
-    /// Time port (P2-1).
+    /// 时间端口。
     pub clock: Arc<dyn Clock>,
-    /// Desktop-notification port (P2-1): coalesced failover alerts.
+    /// 桌面通知端口：合并后的故障转移告警。
     pub notifier: Arc<dyn crate::ports::Notifier>,
-    /// Discovery service (P2-1).
-    pub discovery: Arc<crate::discovery::DiscoveryService>,
-    /// Proxy service (P2-1): request orchestration entry for the proxy
-    /// handlers. Constructed after the context, as it holds a clone.
-    pub proxy: Arc<crate::proxy::ProxyService>,
-    /// Admin service (P2-1): provider/channel domain operations; other
-    /// subdomains migrate progressively. Also constructed after the
-    /// context.
-    pub admin: Arc<crate::admin::AdminService>,
-    /// Channel balance/usage sidecar: default-off per-channel adapter
-    /// queries plus the hourly background refresh.
-    pub balance: Arc<crate::balance::BalanceService>,
-    /// Immutable operational limits shared by every supervisor (P2-10).
+    /// 各 supervisor 共享的不可变运行限额。
     pub limits: Arc<RuntimeLimits>,
-    /// One-time challenge store for corrupt-key recovery (P1-4).
-    pub recovery: Arc<RecoverySession>,
-    /// Command Code 网页登录授权流程（等价 `cmd login` 的 loopback 回调；
-    /// 每 Context 一份，密钥只在服务端内存与加密库之间流转）。
-    pub command_code_login: Arc<crate::commandcode_login::CommandCodeLogin>,
 }

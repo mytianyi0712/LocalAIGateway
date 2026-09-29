@@ -1,3 +1,6 @@
+# 桌面入口定义：由 PKGBUILD 安装到 /usr/share/applications，供桌面环境启动 local-ai-gateway。
+# 边界：只描述启动方式与图标，不参与构建，也不含任何配置。
+# 关键不变量：Exec 与 Icon 的名称必须与 PKGBUILD 的安装路径保持一致。
 [Desktop Entry]
 Type=Application
 Name=Local AI Gateway

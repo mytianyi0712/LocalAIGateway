@@ -1,10 +1,11 @@
-//! Model discovery — port of backend/app/services/discovery.py.
+//! 模型目录探测：按协议拉取上游模型目录，快照后一次性原子落库。
 //!
-//! Fixes over the original port: per-protocol pagination (Claude `after_id`,
-//! Gemini `pageToken`), per-protocol metadata merge inside
-//! `channel_models.metadata_json` (instead of overwriting the whole dict),
-//! stale protocol-binding cleanup with `available` recomputation, and
-//! discovery runs that record `status_code` / aggregated `error_kind`.
+//! 职责：逐个协议分组拉取模型目录（Claude `after_id`、Gemini `pageToken` 等
+//! 按协议翻页），合并各协议在 `channel_models.metadata_json` 下的元数据，
+//! 并清理过期协议绑定、重算 `available`。
+//! 边界：网络阶段只读上游、绝不写库；调用方在单事务内应用快照（模型、绑定、
+//! `available` 与运行终态），任一写入失败整体回滚。关键不变量：失败按协议聚合
+//! 记录 `status_code` / `error_kind`，目录兜底与探测不确定作为诊断附加其中。
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -48,27 +49,25 @@ fn bundled_catalog_map() -> HashMap<String, Value> {
         .collect()
 }
 
-/// Immutable outcome of the network phase (P2-5): nothing is written to the
-/// DB while upstreams are being called. The caller applies the snapshot to
-/// the catalog — models, bindings, `available` recomputation and the run
-/// terminal state — in ONE transaction, so a mid-write failure can never
-/// leave a half-applied discovery.
+/// 网络阶段产出的不可变结果：调用上游期间不向数据库写任何内容。调用方把该
+/// 快照应用到目录——模型、绑定、`available` 重算与运行终态——且只在**一个事务**
+/// 内完成，因此写入中途失败绝不会留下半应用的探测结果。
 pub struct DiscoverySnapshot {
-    /// Protocols whose catalog fetch succeeded.
+    /// 目录拉取成功的协议集合。
     succeeded: HashSet<String>,
-    /// Per-protocol model catalogs (model_id -> item).
+    /// 各协议各自的模型目录（model_id -> item）。
     seen_by_protocol: HashMap<String, HashMap<String, Value>>,
-    /// Distinct model ids seen across all succeeded protocols.
+    /// 所有成功协议中出现过的去重模型 id 数量。
     model_count: i64,
-    /// Last upstream status code observed (any protocol).
+    /// 观测到的最后一个上游状态码（任意协议）。
     status_code: Option<i64>,
-    /// Aggregated failure detail when at least one protocol failed.
+    /// 至少一个协议失败时聚合出的错误细节；也承载目录兜底、探测不确定等诊断。
     error_kind: Option<String>,
-    /// Remote-compaction capability probe result for `openai_responses`.
+    /// `openai_responses` 的远程压缩能力探测结果。
     remote_compaction: Option<RemoteCompactionProbe>,
 }
 
-/// Outcome of probing one channel's remote-compaction endpoints.
+/// 探测某渠道远程压缩端点得到的结果。
 #[derive(Debug, Clone)]
 pub struct RemoteCompactionProbe {
     pub v1: ProbeVerdict,
@@ -76,8 +75,8 @@ pub struct RemoteCompactionProbe {
     pub probed_at: String,
 }
 
-/// A remote-compaction probe verdict. `Inconclusive` preserves the previously
-/// persisted value and only adds a discovery-run diagnostic.
+/// 远程压缩探测的判定结论。`Inconclusive` 会保留此前持久化的值，仅在探测运行
+/// 上追加一条诊断。
 #[derive(Debug, Clone)]
 pub enum ProbeVerdict {
     Supported,
@@ -85,9 +84,8 @@ pub enum ProbeVerdict {
     Inconclusive(String),
 }
 
-/// Discovery service (P2-1): network phase + atomic apply, depending only on
-/// ports and storage. Handlers and the maintenance supervisor reach it
-/// through [`Context::discovery`].
+/// 发现服务：网络阶段 + 原子应用，仅依赖端口与存储。处理器与维护 supervisor
+/// 通过 `AppState::discovery` 访问它。
 pub struct DiscoveryService {
     db: Database,
     secrets: SecretStore,
@@ -123,7 +121,7 @@ impl DiscoveryService {
         self.queue_with_trigger(state, channel_id, "manual").await
     }
 
-    /// Used by the maintenance supervisor for the scheduled re-discovery cycle.
+    /// 供维护 supervisor 周期性重新发现时调用。
     pub async fn queue_scheduled(&self, state: &Context, channel_id: String) -> Result<String> {
         self.queue_with_trigger(state, channel_id, "scheduled")
             .await
@@ -166,9 +164,8 @@ impl DiscoveryService {
             let mut task_failed = false;
             match result {
                 Ok(Ok(snapshot)) => {
-                    // P2-5: catalog + run terminal commit atomically. A
-                    // persistence failure must NOT end silently — the UI
-                    // waits on this run (P2-8).
+                    // 目录与运行终态在同一事务内提交。持久化失败绝不能静默收场——
+                    // UI 会一直等待这次运行的终态。
                     if let Err(error) = service
                         .apply_discovery(&task_channel_id, &snapshot, &task_run_id, &finished)
                         .await
@@ -230,15 +227,15 @@ impl DiscoveryService {
     .await
     .is_err()
     {
-        // Shutdown already started: the run row stays pending; the UI will
-        // surface it as a persistence_error (P2-8).
+        // 关闭流程已启动：运行记录保持 pending，UI 会把它呈现为
+        // persistence_error 状态。
         tracing::warn!(run_id = %run_id, channel_id = %channel_id, "discovery not started: runtime shutting down");
     }
         Ok(run_id)
     }
 
-    /// Fetch one model catalog with per-protocol pagination, up to 50 pages.
-    /// Returns (model_id -> item, last status code).
+    /// 按协议翻页拉取单个模型目录，页数上限为 `discovery_max_pages`（默认 50）。
+    /// 返回 (model_id -> item, 最后一次状态码)。
     async fn fetch_models(
         &self,
         state: &Context,
@@ -303,7 +300,7 @@ impl DiscoveryService {
                     message: format!("{protocol_name} discovery returned {status_code}"),
                 }));
             }
-            // Catalogs are bounded like upstream responses (P1-1).
+            // 目录体与上游响应一样按上限截断。
             let (body, truncated) = response
                 .body
                 .read_capped((self.limits.discovery_max_pages * 1024 * 1024).max(16 * 1024 * 1024))
@@ -323,8 +320,7 @@ impl DiscoveryService {
         Ok((models, status_code))
     }
 
-    /// Run a discovery for one channel: network + parse ONLY (P2-5). Returns the
-    /// immutable snapshot for the caller to apply atomically.
+    /// 执行单个渠道的发现：仅做网络请求与解析。返回不可变快照，供调用方原子应用。
     async fn discover(&self, state: &Context, channel_id: &str) -> Result<DiscoverySnapshot> {
         let channel = state
             .channels
@@ -332,19 +328,13 @@ impl DiscoveryService {
             .await?
             .context("Channel not found")?;
         let primary = channel.protocol;
-        let configured: Vec<String> = sqlx::query_scalar(
-            "SELECT protocol FROM channel_protocols WHERE channel_id=? ORDER BY protocol",
-        )
-        .bind(channel_id)
-        .fetch_all(self.db.pool())
-        .await?;
+        let configured = self.channels.protocols(channel_id).await?;
         let protocols = if configured.is_empty() {
             vec![primary]
         } else {
             configured
         };
-        // Plan phase 7: a disabled integration performs zero upstream
-        // requests, so Command Code discovery is skipped entirely.
+        // 被全局关掉的集成不发任何上游请求，因此完全跳过 Command Code 探测。
         let command_code_enabled = settings::runtime_settings(state)
             .await
             .map(|runtime| runtime.command_code_enabled)
@@ -365,8 +355,8 @@ impl DiscoveryService {
         let api_key = self.secrets.decrypt(&channel.api_key_encrypted)?;
         let base_url = channel.base_url;
 
-        // Group protocols sharing one discovery URL + auth (the openai family
-        // shares /v1/models with the same Bearer header, mirroring Python).
+        // 把共用同一发现 URL + 认证头的协议归为一组（openai 家族共用
+        // /v1/models 与同一个 Bearer 头，因此一次抓取即可覆盖）。
         let mut groups: Vec<(String, String, Vec<String>)> = Vec::new();
         let opencode_session = if protocol::requires_opencode_session(&base_url) {
             Some(settings::opencode_session_id(&state.db).await)
@@ -556,9 +546,8 @@ impl DiscoveryService {
         })
     }
 
-    /// Probes both remote-compaction protocols on an `openai_responses`
-    /// channel. The probe never fails discovery: inconclusive outcomes are
-    /// recorded as diagnostics and preserve previously stored capability.
+    /// 在 `openai_responses` 渠道上探测两种远程压缩协议。探测绝不让发现失败：
+    /// 判定不确定的结果记录为诊断，并保留此前存储的能力值。
     async fn probe_remote_compaction(
         &self,
         state: &Context,
@@ -590,6 +579,11 @@ impl DiscoveryService {
         channel_id: &str,
     ) -> ProbeVerdict {
         let _ = channel_id;
+        // 连接超时取自运行时设置 `connect_timeout_seconds`。
+        let connect_timeout = match settings::runtime_settings(state).await {
+            Ok(runtime) => std::time::Duration::from_secs(runtime.connect_timeout_seconds.max(1) as u64),
+            Err(error) => return ProbeVerdict::Inconclusive(format!("settings:{error}")),
+        };
         let url = match protocol::upstream_url(
             base_url,
             "/v1/responses/compact",
@@ -630,7 +624,7 @@ impl DiscoveryService {
                 headers,
                 method: http::Method::POST,
                 body: Some(bytes::Bytes::from(payload)),
-                connect_timeout: std::time::Duration::from_secs(10),
+                connect_timeout,
                 deadline: self.limits.probe_timeout,
             })
             .await
@@ -639,10 +633,14 @@ impl DiscoveryService {
             Err(error) => return ProbeVerdict::Inconclusive(format!("transport:{error:?}")),
         };
         let status = response.status.as_u16();
-        let (body, _truncated) = match timeout(self.limits.probe_timeout, response.body.read_capped(self.limits.error_body_max)).await {
+        let (body, truncated) = match timeout(self.limits.probe_timeout, response.body.read_capped(self.limits.error_body_max)).await {
             Ok(result) => result,
             Err(_) => return ProbeVerdict::Inconclusive("timeout".into()),
         };
+        // 撞上读取上限时判定依据不完整，不能据此断言 Supported/Unsupported。
+        if truncated {
+            return ProbeVerdict::Inconclusive("truncated".into());
+        }
         if response.status.is_success() && remote_compaction::validate_v1_response(&body) {
             ProbeVerdict::Supported
         } else if matches!(status, 404 | 405 | 501) {
@@ -661,6 +659,11 @@ impl DiscoveryService {
         channel_id: &str,
     ) -> ProbeVerdict {
         let _ = channel_id;
+        // 连接超时取自运行时设置 `connect_timeout_seconds`。
+        let connect_timeout = match settings::runtime_settings(state).await {
+            Ok(runtime) => std::time::Duration::from_secs(runtime.connect_timeout_seconds.max(1) as u64),
+            Err(error) => return ProbeVerdict::Inconclusive(format!("settings:{error}")),
+        };
         let url = match protocol::upstream_url(base_url, "/v1/responses", None, "openai_responses")
         {
             Ok(url) => url,
@@ -705,7 +708,7 @@ impl DiscoveryService {
                 headers,
                 method: http::Method::POST,
                 body: Some(bytes::Bytes::from(payload)),
-                connect_timeout: std::time::Duration::from_secs(10),
+                connect_timeout,
                 deadline: self.limits.probe_timeout,
             })
             .await
@@ -714,30 +717,44 @@ impl DiscoveryService {
             Err(error) => return ProbeVerdict::Inconclusive(format!("transport:{error:?}")),
         };
         let status = response.status.as_u16();
-        let (body, _truncated) = match timeout(
+        // 与代理路径共用同一套读取/判读骨架：校验器一确认完整就停止读取，
+        // 因此上游发完事件后保持连接也不会把探测拖到超时。
+        let mut validator = remote_compaction::CompactionV2Validator::new();
+        match crate::remote_compaction::read_validated_compaction_stream(
+            response.body.into_stream(),
             self.limits.probe_timeout,
-            response
-                .body
-                .read_capped((self.limits.error_body_max * 4).max(4 * 1024 * 1024)),
+            (self.limits.error_body_max * 4).max(4 * 1024 * 1024),
+            &mut validator,
+            None,
         )
         .await
         {
-            Ok(result) => result,
-            Err(_) => return ProbeVerdict::Inconclusive("timeout".into()),
-        };
-        let mut validator = remote_compaction::CompactionV2Validator::new();
-        validator.feed(&body);
+            crate::remote_compaction::ValidatedCompactionStream::Read { truncated, .. } => {
+                // 撞上读取上限时判定依据不完整，不能据此断言 Supported/Unsupported。
+                if truncated {
+                    return ProbeVerdict::Inconclusive("truncated".into());
+                }
+            }
+            crate::remote_compaction::ValidatedCompactionStream::Transport { .. } => {
+                return ProbeVerdict::Inconclusive("timeout".into());
+            }
+            // 探测路径不传解码器，因此不会出现解码失败；真出现也按不确定处理。
+            crate::remote_compaction::ValidatedCompactionStream::Decode { error, .. } => {
+                return ProbeVerdict::Inconclusive(format!("decode:{error:?}"));
+            }
+        }
         let verdict = validator.finish();
+        // 两种“不支持”判定：上游明确回 404/405/501，或 2xx 流里没有 compaction
+        // 块（NotCompaction）。合并成一个分支，避免同一结果写两遍。
+        let unsupported = matches!(status, 404 | 405 | 501)
+            || (response.status.is_success()
+                && matches!(
+                    &verdict,
+                    Err(remote_compaction::CompactionV2Error::NotCompaction)
+                ));
         if response.status.is_success() && verdict.is_ok() {
             ProbeVerdict::Supported
-        } else if matches!(status, 404 | 405 | 501) {
-            ProbeVerdict::Unsupported
-        } else if response.status.is_success()
-            && matches!(
-                verdict,
-                Err(remote_compaction::CompactionV2Error::NotCompaction)
-            )
-        {
+        } else if unsupported {
             ProbeVerdict::Unsupported
         } else {
             ProbeVerdict::Inconclusive(format!(
@@ -747,11 +764,9 @@ impl DiscoveryService {
         }
     }
 
-    /// Applies a discovery snapshot to the catalog in ONE transaction (P2-5):
-    /// model upserts, protocol bindings, stale-binding pruning, `available`
-    /// recomputation, and the run terminal self. Either all of it lands, or
-    /// none of it — a failed write rolls back to the previous catalog instead
-    /// of leaving new models without bindings or a run stuck in `pending`.
+    /// 在**单个事务**内把发现快照应用到目录：模型 upsert、协议绑定、过期绑定
+    /// 清理、`available` 重算以及运行终态。要么全部生效，要么全部不生效——写入
+    /// 失败会回滚到原有目录，而不会留下缺绑定的新模型或卡在 `pending` 的运行。
     async fn apply_discovery(
         &self,
         channel_id: &str,
@@ -760,6 +775,17 @@ impl DiscoveryService {
         finished_at: &str,
     ) -> Result<()> {
         let mut tx = self.db.pool().begin().await?;
+        // Command Code 渠道服务于转换层能用 `command_code` 驱动的每一个入口协议：
+        // 目录行镜像这些绑定（及其元数据），好让模型路由在 Claude / OpenAI 路由下
+        // 也能选出该渠道，而不只限于 `command_code` 路由。
+        let provider_kind = self.channels.provider_kind(channel_id).await?;
+        let mut succeeded: Vec<String> = snapshot.succeeded.iter().cloned().collect();
+        succeeded.sort();
+        let extra_protocols: Vec<String> =
+            protocol::model_binding_protocols(provider_kind.as_deref(), &succeeded)
+                .into_iter()
+                .filter(|protocol| !snapshot.succeeded.contains(protocol))
+                .collect();
         let existing_rows = sqlx::query(
         "SELECT id, model_id, display_name, source, metadata_json FROM channel_models WHERE channel_id=?",
     )
@@ -809,6 +835,13 @@ impl DiscoveryService {
                 let mut protocol_meta = item.clone();
                 if let Some(object) = protocol_meta.as_object_mut() {
                     object.remove("id");
+                }
+                // 自身没有目录的入口协议（如 Command Code 渠道）继承本协议的
+                // 元数据——能力与价格读取器按 `metadata_json[路由协议]` 查找。
+                for extra_protocol in &extra_protocols {
+                    metadata
+                        .entry(extra_protocol.clone())
+                        .or_insert(protocol_meta.clone());
                 }
                 metadata.insert(protocol_name.clone(), protocol_meta);
                 let display_name = item
@@ -883,11 +916,22 @@ impl DiscoveryService {
                     .entry(model_id.clone())
                     .or_default()
                     .insert(protocol_name.clone());
+                for extra_protocol in &extra_protocols {
+                    sqlx::query("INSERT OR IGNORE INTO channel_model_protocols(channel_model_id,protocol) VALUES(?,?)")
+                    .bind(&row_id)
+                    .bind(extra_protocol)
+                    .execute(&mut *tx)
+                    .await?;
+                    protocol_sets
+                        .entry(model_id.clone())
+                        .or_default()
+                        .insert(extra_protocol.clone());
+                }
             }
         }
 
-        // Prune bindings for protocols that no longer list the model, and
-        // recompute `available` — a model with no remaining protocols is hidden.
+        // 清理不再列出该模型的协议绑定，并重算 `available`——没有任何剩余协议的
+        // 模型会被隐藏。
         for (model_id, (row_id, _, manual, _)) in &existing {
             if *manual {
                 continue;
@@ -929,8 +973,8 @@ impl DiscoveryService {
             }
         }
 
-        // Persist remote-compaction probe results in the same transaction.
-        // Inconclusive verdicts leave existing capability values untouched.
+        // 在同一事务内持久化远程压缩探测结果。Inconclusive 判定不改动已有的
+        // 能力值。
         if let Some(probe) = &snapshot.remote_compaction {
             let v1 = match &probe.v1 {
                 ProbeVerdict::Supported => Some(1i64),
@@ -959,14 +1003,11 @@ impl DiscoveryService {
             }
         }
 
-        // The run terminal state commits in the same transaction (P2-5): a
-        // catalog change can never be persisted without its run outcome, and a
-        // failed write rolls the whole discovery back.
-        // A run is a success when at least one protocol catalog was fetched:
-        // providers with messy/partial protocol support (e.g. only the
-        // openai family answering /v1/models) still discover their models
-        // and must not surface as a failed run. `error_kind` records which
-        // protocols failed.
+        // 运行终态在同一事务内提交：目录变更绝不会脱离其运行结果被持久化，写入
+        // 失败会把整次发现回滚。
+        // 只要至少一个协议目录拉取成功，运行就算成功：协议支持参差不齐的提供商
+        // （例如只有 openai 家族应答 /v1/models）仍能发现其模型，不应呈现为失败
+        // 运行。`error_kind` 记录哪些协议失败。
         sqlx::query(
         "UPDATE discovery_runs SET finished_at=?,success=?,model_count=?,status_code=?,error_kind=? WHERE id=?",
     )
@@ -982,9 +1023,8 @@ impl DiscoveryService {
         Ok(())
     }
 
-    /// Writes the failure terminal for a discovery run in a short standalone
-    /// transaction (P2-5): the previous catalog is left untouched. Never
-    /// silently swallowed — the caller logs the result (P2-8).
+    /// 在一个简短的独立事务里写入发现运行的失败终态：原目录保持不变。结果绝不
+    /// 静默吞掉——由调用方负责记录日志。
     async fn record_run_failure(
         &self,
         run_id: &str,
@@ -1005,109 +1045,97 @@ impl DiscoveryService {
 
 #[cfg(test)]
 mod tests {
-    use crate::{application::Context, config::AppConfig, db::Database};
+    use super::ProbeVerdict;
+    use crate::state::AppState;
+    use crate::test_support::TempDir;
     use serde_json::Value;
-    use std::sync::Arc;
 
-    async fn test_state(upstream_port: u16) -> (Context, std::path::PathBuf) {
-        let dir =
-            std::env::temp_dir().join(format!("lagw-discovery-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let db = Database::open(&dir.join("test.db")).await.unwrap();
-        let secrets = crate::crypto::SecretStore::load(&dir.join("master.key"))
-            .await
-            .unwrap();
-        let (telemetry, _rx) = crate::telemetry::Telemetry::new(64);
-        let time = "2026-08-04T01:00:00+00:00";
-        sqlx::query("INSERT INTO providers(id,name,base_url,created_at,updated_at) VALUES('prov-1','mock',?,?,?)")
-            .bind(format!("http://127.0.0.1:{upstream_port}"))
-            .bind(time)
-            .bind(time)
-            .execute(db.pool())
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO channels(id,provider_id,name,protocol,api_key_encrypted,api_key_hint,manual_enabled,created_at,updated_at) VALUES('ch-1','prov-1','chan','openai_compatible',?,?,1,?,?)")
-            .bind(secrets.encrypt("test-key"))
-            .bind("...key")
-            .bind(time)
-            .bind(time)
-            .execute(db.pool())
-            .await
-            .unwrap();
-        sqlx::query(
-            "INSERT INTO channel_protocols(channel_id,protocol) VALUES('ch-1','openai_compatible')",
+    async fn test_state(upstream_port: u16) -> (AppState, TempDir) {
+        // 统一夹具：临时目录 + 整套 Context + 标准 provider/channel 播种。
+        let crate::test_support::TestEnv {
+            dir,
+            context: state,
+        } = crate::test_support::context("discovery").await;
+        crate::test_support::seed_provider(
+            &state.db,
+            "prov-1",
+            "mock",
+            &format!("http://127.0.0.1:{upstream_port}"),
         )
-        .execute(db.pool())
-        .await
-        .unwrap();
+        .await;
+        crate::test_support::seed_channel(
+            &state.db,
+            &state.secrets,
+            "ch-1",
+            "prov-1",
+            "openai_compatible",
+            "test-key",
+        )
+        .await;
         sqlx::query("INSERT INTO discovery_runs(id,channel_id,trigger,started_at) VALUES('run-1','ch-1','manual',?)")
-            .bind(time)
-            .execute(db.pool())
+            .bind(crate::test_support::SEED_TIME)
+            .execute(state.db.pool())
             .await
             .unwrap();
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let http: Arc<dyn crate::ports::UpstreamClient> =
-            Arc::new(crate::infrastructure::HttpClientPool::default());
-        let routes: Arc<dyn crate::ports::RouteRepository> =
-            crate::infrastructure::SqliteRouteRepository::new(db.clone());
-        let channels: Arc<dyn crate::ports::ChannelRepository> =
-            crate::infrastructure::SqliteChannelRepository::new(db.clone());
-        let clock: Arc<dyn crate::ports::Clock> = Arc::new(crate::infrastructure::SystemClock);
-        let background = crate::infrastructure::RuntimeSupervisor::new(cancel);
-        let limits = Arc::new(crate::runtime::RuntimeLimits::default());
-        let discovery = crate::discovery::DiscoveryService::new(
-            db.clone(),
-            secrets.clone(),
-            Arc::clone(&http),
-            Arc::clone(&channels),
-            Arc::clone(&clock),
-            Arc::clone(&background),
-            Arc::clone(&limits),
-        );
-        let notifier: std::sync::Arc<dyn crate::ports::Notifier> =
-            crate::notification::DesktopNotifier::new(std::time::Duration::from_millis(50));
-        let proxy = crate::proxy::ProxyService::new(
-            db.clone(),
-            secrets.clone(),
-            Arc::clone(&http),
-            routes.clone(),
-            telemetry.clone(),
-            Arc::clone(&clock),
-            Arc::clone(&limits),
-            crate::notification::DesktopNotifier::new(std::time::Duration::from_millis(50)),
-        );
-        let balance = crate::balance::BalanceService::new(
-            db.clone(),
-            secrets.clone(),
-            Arc::clone(&http),
-            channels.clone(),
-            Arc::clone(&clock),
-            Arc::clone(&limits),
-        );
-        let command_code_login = crate::commandcode_login::CommandCodeLogin::new(std::sync::Arc::clone(&http));
-        let state = Context {
-            config: Arc::new(AppConfig::default()),
-            db: db.clone(),
-            secrets: secrets.clone(),
-            http,
-            routes,
-            channels,
-            clock,
-            notifier,
-            discovery,
-            proxy,
-            telemetry,
-            background,
-            limits,
-            balance,
-            admin: crate::admin::AdminService::new(db.clone(), secrets.clone()),
-            command_code_login,
-            recovery: crate::auth::RecoverySession::new(),
-        };
         (state, dir)
     }
 
-    /// Raw upstream answering `GET /v1/models` with a two-model catalog.
+    /// 原始上游：对任何请求回固定状态行与响应体（用于探测体超限等场景）。
+    async fn spawn_raw_upstream(status: &'static str, body: Vec<u8>) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let mut total = 0usize;
+                loop {
+                    match stream.read(&mut buf[total..]).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            total += n;
+                            if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let head = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+            }
+        });
+        port
+    }
+
+    /// V1 探测体撞上读取上限时判定依据不完整 → `Inconclusive("truncated")`，
+    /// 绝不拿半个响应体去断言 Supported/Unsupported。
+    #[tokio::test]
+    async fn v1_compaction_probe_reports_truncation_instead_of_support() {
+        let port = spawn_raw_upstream("200 OK", vec![b'x'; 2 * 1024 * 1024]).await;
+        let (state, _dir) = test_state(port).await;
+        let verdict = state
+            .discovery
+            .probe_remote_compaction_v1(
+                &state,
+                &format!("http://127.0.0.1:{port}"),
+                "test-key",
+                "test-model",
+                "ch-1",
+            )
+            .await;
+        match verdict {
+            ProbeVerdict::Inconclusive(reason) => {
+                assert_eq!(reason, "truncated", "truncation must be the reason");
+            }
+            other => panic!("a truncated probe body must be inconclusive, got {other:?}"),
+        }
+    }
+
+    /// 原始上游：对 `GET /v1/models` 回一个双模型目录。
     async fn spawn_models_upstream() -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1139,8 +1167,8 @@ mod tests {
     }
 
 
-    /// Command Code catalog mock: serves `GET /provider/v1/models` and
-    /// records every request head for header assertions.
+    /// Command Code 目录 mock：应答 `GET /provider/v1/models`，并记录每个请求头
+    /// 供头部断言使用。
     async fn spawn_command_code_catalog_upstream() -> (
         u16,
         tokio::sync::mpsc::UnboundedReceiver<String>,
@@ -1181,9 +1209,8 @@ mod tests {
         (port, rx)
     }
 
-    /// Command Code discovery hits the Provider API catalog path with the CLI
-    /// identity headers (only because the provider carries
-    /// `kind='command_code'`), and parses OpenAI-shaped catalog items.
+    /// Command Code 发现走 Provider API 目录路径并带上 CLI 身份头（仅当 provider
+    /// 的 `kind='command_code'` 时），同时解析 OpenAI 形状的目录条目。
     #[tokio::test]
     async fn command_code_discovery_uses_provider_catalog_with_identity() {
         let (port, mut heads) = spawn_command_code_catalog_upstream().await;
@@ -1230,10 +1257,61 @@ mod tests {
         ] {
             assert!(lower.contains(needle), "{needle} missing in {head}");
         }
+
+        // Command Code 渠道的目录行为转换层能用 `command_code` 驱动的每个入口协议
+        // 建立绑定，并在这些协议键下镜像目录元数据，好让能力/价格读取器在
+        // claude/openai 路由上也能找到它们。
+        state
+            .discovery
+            .apply_discovery("ch-1", &snapshot, "run-1", "2026-08-04T02:00:00+00:00")
+            .await
+            .unwrap();
+        let mut bindings: Vec<String> = sqlx::query_scalar(
+            "SELECT cmp.protocol FROM channel_model_protocols cmp \
+             JOIN channel_models cm ON cm.id = cmp.channel_model_id \
+             WHERE cm.model_id = 'cc-model'",
+        )
+        .fetch_all(state.db.pool())
+        .await
+        .unwrap();
+        bindings.sort();
+        assert_eq!(
+            bindings,
+            [
+                "claude",
+                "command_code",
+                "openai_compatible",
+                "openai_responses"
+            ]
+        );
+        let raw_metadata: String =
+            sqlx::query_scalar("SELECT metadata_json FROM channel_models WHERE model_id='cc-model'")
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap();
+        let metadata: Value = serde_json::from_str(&raw_metadata).unwrap();
+        for protocol in [
+            "command_code",
+            "claude",
+            "openai_compatible",
+            "openai_responses",
+        ] {
+            assert!(
+                metadata.get(protocol).is_some(),
+                "{protocol} metadata missing: {metadata}"
+            );
+        }
+        // 渠道级（探测用）协议保持与配置完全一致。
+        let channel_protocols: Vec<String> =
+            sqlx::query_scalar("SELECT protocol FROM channel_protocols WHERE channel_id='ch-1'")
+                .fetch_all(state.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(channel_protocols, ["command_code"]);
     }
 
 
-    /// Catalog mock answering every request with one HTTP status.
+    /// 目录 mock：对每个请求都回同一个 HTTP 状态码。
     async fn spawn_status_catalog_upstream(status: u16) -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1328,8 +1406,8 @@ mod tests {
         );
     }
 
-    /// Switch the seeded channel/provider to the Command Code protocol.
-    async fn switch_to_command_code(state: &Context) {
+    /// 把已播种的渠道/provider 切换到 Command Code 协议。
+    async fn switch_to_command_code(state: &AppState) {
         let time = "2026-08-04T01:00:00+00:00";
         sqlx::query("UPDATE providers SET kind='command_code' WHERE id='prov-1'")
             .execute(state.db.pool())
@@ -1387,7 +1465,7 @@ mod tests {
             error_kind.contains("command_code_bundled_catalog"),
             "diagnostic missing: {error_kind}"
         );
-        // Not a Pro/Max-only model.
+        // 不是 Pro/Max 专属模型。
         assert!(!models.contains_key("claude-opus-5"));
     }
 
@@ -1407,8 +1485,7 @@ mod tests {
         );
     }
 
-    /// P2-5: a successful discovery applies models, bindings and the run
-    /// terminal state atomically.
+    /// 一次成功的发现会原子地应用模型、绑定与运行终态。
     #[tokio::test]
     async fn discovery_applies_catalog_and_run_atomically() {
         let port = spawn_models_upstream().await;
@@ -1450,8 +1527,8 @@ mod tests {
         );
     }
 
-    /// P2-5: a mid-write failure (fault-injected via a SQL trigger) rolls the
-    /// WHOLE discovery back — no new models, no bindings, run still pending.
+    /// 写入中途失败（通过 SQL 触发器注入故障）会把**整次**发现回滚——没有新模型、
+    /// 没有绑定，运行仍停在 pending。
     #[tokio::test]
     async fn discovery_mid_write_failure_rolls_back() {
         let port = spawn_models_upstream().await;
@@ -1486,11 +1563,10 @@ mod tests {
         );
     }
 
-    /// P2-5: a network-failed discovery leaves the old catalog untouched and
-    /// marks the run failed with the aggregated reason.
+    /// 网络失败的发现不会改动原目录，并以聚合出的原因把运行标记为失败。
     #[tokio::test]
     async fn failed_network_discovery_marks_run_failed() {
-        // Nothing listens on this port: the fetch fails immediately.
+        // 该端口没有任何监听者：抓取会立刻失败。
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead_port = listener.local_addr().unwrap().port();
         drop(listener);
@@ -1525,8 +1601,8 @@ mod tests {
         assert_eq!(models, 0, "the old catalog stays untouched");
     }
 
-    /// Upstream that answers `GET /v1/models` only for Bearer auth (the
-    /// openai family) and rejects the Claude auth header with 401.
+    /// 只对 Bearer 认证（openai 家族）应答 `GET /v1/models`、并以 401 拒绝 Claude
+    /// 认证头的上游。
     async fn spawn_partial_upstream() -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1576,10 +1652,8 @@ mod tests {
         port
     }
 
-    /// A provider whose protocols are only partially supported (the openai
-    /// family answers /v1/models, Claude auth does not) still discovers its
-    /// models: the run is a success, the failure is recorded per protocol,
-    /// and bindings land only for the succeeded protocol.
+    /// 协议仅被部分支持的提供商（openai 家族应答 /v1/models，Claude 认证不应答）
+    /// 仍能发现其模型：运行算成功，失败按协议记录，且只为成功的协议落绑定。
     #[tokio::test]
     async fn partial_discovery_marks_run_success_and_applies_models() {
         let port = spawn_partial_upstream().await;

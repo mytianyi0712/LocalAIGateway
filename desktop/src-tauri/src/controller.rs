@@ -1,3 +1,9 @@
+//! 桌面启动器 / 网关生命周期控制器：负责 start/stop/set_port 与托盘状态，
+//! 维护运行时 generation 轮次，并监控 serve 退出。
+//!
+//! 边界：只管生命周期，不碰任何业务逻辑。
+//! 不变量：slot 锁串行化 start/stop（并发调用不会产生两个存活的 generation）；
+//! serve 异常退出由控制器自有的 monitor 回收槽位并排空运行时；stop 为有界排空。
 use std::{
     path::PathBuf,
     sync::{
@@ -24,25 +30,24 @@ struct RuntimeStatus {
 }
 
 struct RunningServer {
-    /// Owns serve + every background task (P1-3): stopping the server is one
-    /// bounded [`RuntimeSupervisor::shutdown`] — no detached handles.
+    /// 拥有 serve 与全部后台任务：停止服务器就是一次有界
+    /// [`RuntimeSupervisor::shutdown`]——不留下任何 detach 的句柄。
     supervisor: Arc<RuntimeSupervisor>,
-    /// Absolute shutdown deadline for this runtime (P2-10).
+    /// 该运行时的绝对关停期限。
     limits: crate::runtime::RuntimeLimits,
-    /// Generation of this runtime (P1-2): a serve-exit monitor from an
-    /// earlier generation never reaps a newer slot.
+    /// 该运行时的 generation 轮次：更早轮次的 serve 退出 monitor
+    /// 永远不会回收更新的槽位。
     generation: u64,
-    /// Set once the serve task has returned (normal or abnormal). Lets
-    /// `start()` recognise a dead runtime before its monitor reaped it.
+    /// serve 任务返回（正常或异常）后置位；让 `start()` 能在其 monitor
+    /// 回收之前就识别出已死的运行时。
     serve_ended: Arc<AtomicBool>,
-    /// Serve completion channel, cloned into the serve task. Kept on the
-    /// slot so tests can inject an abnormal serve exit.
-    #[allow(dead_code)] // read by tests to inject serve failures
+    /// serve 完成通道，被 clone 进 serve 任务。保留在槽位上，
+    /// 以便测试注入一次异常 serve 退出。
+    #[allow(dead_code)] // 测试读取它来注入 serve 失败
     serve_done: mpsc::Sender<anyhow::Result<()>>,
-    /// Controller-owned monitor: watches the serve completion channel and
-    /// reaps the slot + drains the runtime on an abnormal serve exit.
-    /// Explicitly held here (NOT inside the supervisor's JoinSet) so it can
-    /// call [`RuntimeSupervisor::shutdown`] without waiting on itself.
+    /// 控制器自有的 monitor：监听 serve 完成通道，在 serve 异常退出时
+    /// 回收槽位并排空运行时。它被显式持有在此处（不在 supervisor 的
+    /// JoinSet 内），因此能调用 [`RuntimeSupervisor::shutdown`] 而无需等待自己。
     monitor: tokio::task::JoinHandle<()>,
 }
 
@@ -51,7 +56,7 @@ pub struct ServerController {
     config: RwLock<AppConfig>,
     runtime: RwLock<RuntimeStatus>,
     server: Mutex<Option<RunningServer>>,
-    /// Monotonic runtime generation counter; bumped on every `start()`.
+    /// 单调递增的运行时 generation 计数器；每次 `start()` 都会自增。
     generation: AtomicU64,
 }
 
@@ -93,28 +98,26 @@ impl ServerController {
         runtime.error = Some(error.into());
     }
 
-    /// Starts the gateway. The slot lock is held across the whole start so
-    /// concurrent `start`/`stop`/`set_port` can never produce two live
-    /// generations (P1-2). A slot whose serve task already returned is
-    /// reaped first: its background tasks are drained, then a fresh runtime
-    /// takes the slot.
+    /// 启动网关。整个 start 期间都持有 slot 锁，因此并发的
+    /// `start`/`stop`/`set_port` 绝不会产生两个存活的 generation。
+    /// serve 任务已返回的槽位会先被回收：排空其后台任务后，
+    /// 再由新运行时接管该槽位。
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         let mut slot = self.server.lock().await;
         if let Some(running) = slot.as_ref()
             && !running.serve_ended.load(Ordering::SeqCst)
         {
-            // A live runtime (serve still accepting) is already running.
+            // 已有存活的运行时（serve 仍在接受连接），无需再启动。
             return Ok(());
         }
-        // Stale slot: the serve task already returned (abnormal exit the
-        // monitor has not reaped yet, or a post-request_stop slot). Drain
-        // its background tasks before starting fresh.
+        // 陈旧槽位：serve 任务已经返回（monitor 尚未回收的异常退出，
+        // 或 request_stop 之后的槽位）。先排空它的后台任务再重新启动。
         let stale = slot.take();
         if let Some(stale) = stale {
             stale.supervisor.shutdown(stale.limits.shutdown_deadline).await;
-            // The stale monitor (controller-owned, outside the JoinSet)
-            // wakes, sees the new generation or an empty slot, and exits on
-            // its own — nothing here joins it, so no self-wait is possible.
+            // 陈旧的 monitor（控制器自有、位于 JoinSet 之外）会醒来，
+            // 看到新 generation 或空槽位后自行退出——这里不 join 它，
+            // 因此不可能出现自等待。
         }
         let config = self.config.read().await.clone();
         let server::GatewayRuntime {
@@ -133,19 +136,17 @@ impl ServerController {
         let controller = Arc::clone(self);
         let task_serve_ended = Arc::clone(&serve_ended);
         let task_serve_done = serve_done_tx.clone();
-        // The listener is bound: the runtime is running from this point.
-        // Set the flag synchronously so `start()` returning means a live
-        // runtime, and the serve task only records the exit side.
+        // 监听端口已绑定：运行时从此刻起算作运行中。
+        // 同步置位该标志，使 `start()` 返回即代表运行时存活，
+        // serve 任务只负责记录退出侧的状态。
         {
             let mut runtime = self.runtime.write().await;
             runtime.running = true;
             runtime.error = None;
         }
-        // The serve task joins the supervisor's JoinSet too (P1-3): shutdown
-        // covers the HTTP server just like every background task. It only
-        // does state bookkeeping and signals completion; the slot reap and
-        // unified shutdown on abnormal exit belong to the controller-owned
-        // monitor below.
+        // serve 任务同样加入 supervisor 的 JoinSet：关停与所有后台任务一样
+        // 覆盖 HTTP 服务器。它只做状态记账并发出完成信号；槽位回收与异常退出时的
+        // 统一关停由下方控制器自有的 monitor 负责。
         supervisor
             .spawn(async move {
                 let result = server::serve(listener, router, serve_cancel).await;
@@ -160,25 +161,24 @@ impl ServerController {
                 let _ = task_serve_done.send(result).await;
             })
             .await
+            // 启动期专用任务：此处 `expect` 保留——控制器在同一协程内顺序调用，
+            // 不可能与关停竞争；真失败时快速退出是预期行为。
             .expect("start must not race shutdown");
-        // Controller-owned monitor (P1-2): watches the serve completion
-        // channel and, on an abnormal exit, reaps the slot and drains the
-        // runtime so health/maintenance/telemetry do not keep running under
-        // a dead HTTP server. It lives OUTSIDE the supervisor's JoinSet and
-        // is explicitly held by `RunningServer`, so it can call
-        // `shutdown()` without waiting on itself.
+        // 控制器自有的 monitor：监听 serve 完成通道，在异常退出时回收槽位并
+        // 排空运行时，避免健康/维护/遥测在已死的 HTTP 服务器下继续运行。
+        // 它位于 supervisor 的 JoinSet 之外，并由 `RunningServer` 显式持有，
+        // 因此可以调用 `shutdown()` 而无需等待自己。
         let monitor_controller = Arc::clone(self);
         let monitor_generation = generation;
         let monitor = tokio::spawn(async move {
             match serve_done_rx.recv().await {
                 Some(Ok(())) => {
-                    // Graceful stop: the owner (stop()/request_stop) reaped
-                    // the slot and drained the supervisor; nothing to do.
+                    // 优雅停止：所有者（stop()/request_stop）已回收槽位并
+                    // 排空了 supervisor，此处无事可做。
                 }
                 Some(Err(error)) => {
-                    // Abnormal serve exit. Reap only if this monitor's
-                    // generation is still in the slot — a newer runtime must
-                    // not be torn down by a stale monitor.
+                    // serve 异常退出。仅当槽位中仍是本 monitor 的 generation 时才回收——
+                    // 更新的运行时绝不能被陈旧 monitor 拆掉。
                     let stale = {
                         let mut slot = monitor_controller.server.lock().await;
                         match slot.as_ref() {
@@ -189,9 +189,8 @@ impl ServerController {
                         }
                     };
                     if let Some(stale) = stale {
-                        // The serve task already returned abnormally; mark
-                        // the runtime stopped BEFORE the (bounded) drain so
-                        // observers never see a dead runtime as running.
+                        // serve 任务已异常返回；在（有界的）排空之前先把运行时
+                        // 标记为已停止，避免观察者把已死的运行时当成运行中。
                         {
                             let mut runtime = monitor_controller.runtime.write().await;
                             runtime.running = false;
@@ -220,18 +219,15 @@ impl ServerController {
     pub async fn stop(&self) {
         let running = self.server.lock().await.take();
         if let Some(running) = running {
-            // One bounded drain covers serve + telemetry tail + every
-            // background task; the deadline is the runtime's absolute
-            // shutdown bound, after which remaining tasks are aborted and
-            // joined (P1-3) — nothing is ever detached.
+            // 一次有界排空覆盖 serve + 遥测尾部 + 全部后台任务；期限即该运行时
+            // 的绝对关停上界，超过后剩余任务被 abort 并 join——绝不 detach。
             running
                 .supervisor
                 .shutdown(running.limits.shutdown_deadline)
                 .await;
-            // The serve task has returned (graceful shutdown), so the
-            // monitor received its completion signal; the slot is gone, so
-            // it exits without touching anything. Join it briefly so no
-            // controller-owned task outlives stop().
+            // serve 任务已返回（优雅关停），因此 monitor 已收到完成信号；
+            // 槽位已清空，它会自行退出而不触碰任何东西。这里短暂 join 它，
+            // 确保没有控制器自有的任务比 stop() 活得更久。
             let _ = tokio::time::timeout(Duration::from_secs(5), running.monitor).await;
         }
         self.runtime.write().await.running = false;
@@ -287,11 +283,11 @@ impl ServerController {
 mod tests {
     use super::*;
     use crate::db::Database;
+    use crate::test_support::TempDir;
     use std::time::Duration;
 
-    /// Accept-loop upstream: a real `/v1/models` catalog (so the maintenance
-    /// supervisor's startup discovery keeps the seeded model available) plus
-    /// a healthy chat-completions response.
+    /// 接受循环式上游：提供真实的 `/v1/models` 目录（让维护 supervisor 的
+    /// 启动期 discovery 保持已播种模型可用）以及一个健康的 chat-completions 响应。
     async fn spawn_upstream() -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -358,22 +354,19 @@ mod tests {
         }
     }
 
-    /// Report §8 scenario 3: restarting on a new port must not leak the old
-    /// health supervisor — each 5s cycle produces exactly one probe row.
+    /// 换端口重启不得泄漏旧的健康 supervisor——每 5s 周期恰好产生一行探测。
     #[tokio::test(flavor = "multi_thread")]
     async fn port_restart_keeps_single_supervisor() {
         let upstream_port = spawn_upstream().await;
-        let dir = std::env::temp_dir().join(format!("lagw-ctrl-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("ctrl");
 
-        // Seed the channel DB exactly as the runtime would see it, then close
-        // the seeding pool so only the controller's own pool is active — the
-        // production shape. The key file must exist before encryption:
-        // SecretStore::load creates it.
-        let secrets = crate::crypto::SecretStore::load(&dir.join("master.key"))
+        // 按运行时将要看到的样子播种渠道数据库，然后关闭播种用的连接池，
+        // 只留控制器自己的连接池活跃——与生产形态一致。加密前密钥文件必须已存在：
+        // SecretStore::load 会创建它。
+        let secrets = crate::crypto::SecretStore::load(&dir.path().join("master.key"))
             .await
             .unwrap();
-        let seed_db = Database::open(&dir.join("gateway.db")).await.unwrap();
+        let seed_db = Database::open(&dir.path().join("gateway.db")).await.unwrap();
         let time = chrono::Utc::now().to_rfc3339();
         let past = (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
         sqlx::query("INSERT INTO providers(id,name,base_url,created_at,updated_at) VALUES('prov-1','mock',?,?,?)")
@@ -406,14 +399,14 @@ mod tests {
             .unwrap();
         seed_db.pool().close().await;
 
-        let controller = ServerController::load(dir.clone()).await.unwrap();
+        let controller = ServerController::load(dir.path().to_path_buf()).await.unwrap();
         let first_port = free_port();
         controller.set_port(first_port).await.unwrap();
-        // The first supervisor tick fires immediately, then every 5s.
-        let db = Database::open(&dir.join("gateway.db")).await.unwrap();
+        // supervisor 的第一次 tick 立即触发，之后每 5s 一次。
+        let db = Database::open(&dir.path().join("gateway.db")).await.unwrap();
         wait_for_probe_count(&db, 1, Duration::from_secs(8)).await;
 
-        // Re-arm the circuit and restart on a new port.
+        // 重新武装熔断，然后换端口重启。
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query(
             "UPDATE channel_health SET state='open', disabled_until=? WHERE channel_id='ch-1'",
@@ -427,26 +420,23 @@ mod tests {
         wait_for_probe_count(&db, 2, Duration::from_secs(8)).await;
 
         controller.stop().await;
-        // Stop must join every background handle; no leaked supervisor can
-        // produce a third probe row afterwards.
+        // stop 必须 join 掉全部后台句柄；之后不应再有泄漏的 supervisor
+        // 产生第三行探测记录。
         tokio::time::sleep(Duration::from_millis(500)).await;
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM health_probe_logs")
             .fetch_one(db.pool())
             .await
             .unwrap();
         assert_eq!(count, 2, "no probe may fire after stop");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// P1-5: graceful shutdown drains the telemetry tail. A streaming request
-    /// that is in flight when `stop()` is called must still land its success
-    /// finish in request_logs — the writer keeps draining while shutdown
-    /// completes, instead of exiting at the first cancel tick.
+    /// 优雅关停会排空遥测尾部。`stop()` 被调用时仍在途的流式请求，其成功
+    /// 结束记录仍必须落进 request_logs——写入器在关停完成期间持续排空，
+    /// 而不是在第一次取消 tick 时就退出。
     ///
-    /// The response and `stop()` are driven concurrently: `serve`'s graceful
-    /// shutdown waits for the in-flight connection, and the connection only
-    /// completes once the client consumes the stream, so awaiting `stop()`
-    /// before reading the response would deadlock.
+    /// 响应与 `stop()` 是并发驱动的：`serve` 的优雅关停会等待在途连接，
+    /// 而该连接只有在客户端消费完流后才结束，因此若先 await `stop()`
+    /// 再读取响应就会死锁。
     #[tokio::test(flavor = "multi_thread")]
     async fn shutdown_drains_tail_telemetry() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -473,7 +463,7 @@ mod tests {
                     }
                     let request = String::from_utf8_lossy(&buf[..total]);
                     if request.contains("/v1/models") {
-                        // Keep the discovery-scheduled catalog healthy.
+                        // 让 discovery 定时拉取的目录保持健康。
                         let body = r#"{"object":"list","data":[{"id":"probe-model","object":"model","owned_by":"test"}]}"#;
                         let response = format!(
                             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
@@ -482,7 +472,7 @@ mod tests {
                         let _ = stream.write_all(response.as_bytes()).await;
                         return;
                     }
-                    // Chat completions: 1s delay, then a complete SSE body.
+                    // chat completions：延迟 1s，然后返回完整的 SSE 响应体。
                     tokio::time::sleep(Duration::from_millis(1000)).await;
                     let body = "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
                     let response = format!(
@@ -549,8 +539,7 @@ mod tests {
         let controller = Arc::new(ServerController::load(dir.clone()).await.unwrap());
         let port = free_port();
         controller.set_port(port).await.unwrap();
-        // The accept loop starts a moment after `bind` returns; wait for the
-        // listener before firing the request.
+        // accept 循环在 `bind` 返回后片刻才启动；发请求前先等待监听就绪。
         let mut accepted = false;
         for _ in 0..50 {
             if tokio::net::TcpStream::connect(("127.0.0.1", port))
@@ -563,9 +552,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(accepted, "gateway must accept connections");
-        // Fire a streaming request; do not await it yet. `send()` is lazy, so
-        // the future runs in a spawned task: the connect happens immediately
-        // and the request is truly in flight when `stop()` is called.
+        // 发起流式请求，但先不 await 它。`send()` 是惰性的，因此把 future 放进
+        // spawn 的任务里：连接会立即建立，调用 `stop()` 时请求确实在途。
         let client = reqwest::Client::new();
         let response_future = tokio::spawn(
             client
@@ -576,7 +564,7 @@ mod tests {
                 )
                 .send(),
         );
-        // Ensure the request is in flight before stopping.
+        // 确保请求在停止之前已经发出。
         tokio::time::sleep(Duration::from_millis(200)).await;
         let controller_for_stop = Arc::clone(&controller);
         let stop_task = tokio::spawn(async move { controller_for_stop.stop().await });
@@ -596,8 +584,7 @@ mod tests {
             .expect("stop must finish within its bounded joins")
             .expect("stop task must not panic");
 
-        // The tail of the request log must be persisted even though the
-        // writer was cancelled while the request was in flight.
+        // 即便写入器在请求在途时被取消，请求日志的尾部也必须持久化。
         let db = Database::open(&dir.join("gateway.db")).await.unwrap();
         let (outcome, attempts): (String, i64) = sqlx::query_as(
             "SELECT outcome, attempt_count FROM request_logs ORDER BY started_at DESC LIMIT 1",
@@ -610,10 +597,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// P1-2: an abnormal serve exit must reap the slot, drain every
-    /// background task, make the error visible, and allow a fresh `start()`
-    /// on the same port — the old runtime must not keep the slot or the
-    /// listener.
+    /// serve 异常退出必须回收槽位、排空全部后台任务、暴露错误，并允许在同一端口
+    /// 上重新 `start()`——旧运行时不得继续占用槽位或监听端口。
     #[tokio::test(flavor = "multi_thread")]
     async fn abnormal_serve_exit_reaps_slot_and_allows_restart() {
         let dir = std::env::temp_dir().join(format!("lagw-ctrl-fail-{}", uuid::Uuid::new_v4()));
@@ -634,8 +619,8 @@ mod tests {
         }
         assert!(accepted, "gateway must accept connections");
 
-        // Inject the abnormal exit exactly as the serve task reports one:
-        // through the serve completion channel held on the slot.
+        // 完全按 serve 任务上报异常退出的方式注入：经由槽位上持有的
+        // serve 完成通道。
         let serve_done = {
             let slot = controller.server.lock().await;
             let running = slot.as_ref().expect("runtime must be live");
@@ -650,7 +635,7 @@ mod tests {
             .await
             .expect("completion channel must be open");
 
-        // The monitor reaps the slot and drains the runtime.
+        // monitor 回收槽位并排空运行时。
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if controller.server.lock().await.is_none() {
@@ -672,7 +657,7 @@ mod tests {
             state.error
         );
 
-        // A fresh start() on the same port must actually listen again.
+        // 同一端口上的新 start() 必须真正重新监听。
         controller.start().await.unwrap();
         let mut reaccepted = false;
         for _ in 0..50 {
@@ -692,9 +677,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// P1-2: concurrent `start()` calls must yield exactly one runtime
-    /// generation — the slot lock serialises them, and the losers observe a
-    /// live slot instead of building a second, unowned runtime.
+    /// 并发的 `start()` 调用必须只产生一个运行时 generation——slot 锁串行化它们，
+    /// 失败者观察到的是存活槽位，而不是再建一个无人持有的运行时。
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_starts_yield_one_generation() {
         let dir = std::env::temp_dir().join(format!("lagw-ctrl-race-{}", uuid::Uuid::new_v4()));

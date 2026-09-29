@@ -1,3 +1,9 @@
+# systemd 单元示例：用 gateway-headless 常驻运行本地网关（无桌面环境的部署）。
+#
+# 用法：复制为 /etc/systemd/system/local-ai-gateway.service，按需修改 User/Group、
+#       WorkingDirectory 与 Environment，然后 systemctl daemon-reload 并 enable --now。
+# 前提：二进制与数据目录需自行准备，AI_GATEWAY_DATA_DIR 必须存在且属主为运行用户。
+# 注意：示例监听 0.0.0.0:3000，请自行确认对外暴露范围。
 [Unit]
 Description=Local AI Gateway
 After=network-online.target

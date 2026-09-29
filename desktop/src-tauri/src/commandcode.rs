@@ -1,10 +1,10 @@
-//! Command Code Go 集成（路线 B）：身份、会话、transport router 与额度辅助。
+//! Command Code Go 集成：身份、会话、transport 路由与额度辅助。
 //!
 //! 协议转换在 [`crate::convert::commandcode`]，本模块只负责「以 CLI 身份与
 //! 上游对话」的周边：每 API Key（=每渠道）的指纹、初始化节流、会话粘滞、
 //! 官方 Provider API → `/alpha/generate` 的 transport 记忆，以及额度重置解析。
 //!
-//! 事实基准见 `docs/command-code-protocol.md`（阶段 0）。
+//! 事实基准见 `docs/command-code-protocol.md`。
 
 use std::time::Duration;
 
@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::db::Database;
+use crate::health::{HealthEvent, apply_health_event};
 use crate::ports::{UpstreamClient, UpstreamRequest};
 use crate::protocol;
 
@@ -107,7 +108,7 @@ pub fn bundled_catalog_items() -> Vec<Value> {
         .collect()
 }
 
-/// transport router 状态（按渠道记忆，先官方 Provider API、403 后降级反代）。
+/// transport 路由状态（按渠道记忆，先官方 Provider API、403 后降级反代）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
     Unknown,
@@ -134,13 +135,11 @@ impl Transport {
 }
 
 // ---------------------------------------------------------------------------
-// settings KV helpers (settings 是 KV 表，新增键无需迁移)
+// settings KV 助手（settings 是 KV 表，新增键无需迁移）
 // ---------------------------------------------------------------------------
 
 async fn read_json(db: &Database, key: &str) -> Option<Value> {
-    sqlx::query_scalar::<_, String>("SELECT CAST(value_json AS TEXT) FROM settings WHERE key=?")
-        .bind(key)
-        .fetch_optional(db.pool())
+    crate::settings::read_setting(db, key)
         .await
         .ok()
         .flatten()
@@ -148,16 +147,7 @@ async fn read_json(db: &Database, key: &str) -> Option<Value> {
 }
 
 async fn write_json(db: &Database, key: &str, value: &Value) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO settings(key, value_json, updated_at) VALUES(?, ?, ?) \
-         ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
-    )
-    .bind(key)
-    .bind(serde_json::to_string(value)?)
-    .bind(Utc::now().to_rfc3339())
-    .execute(db.pool())
-    .await?;
-    Ok(())
+    crate::settings::write_setting(db, key, &serde_json::to_string(value)?).await
 }
 
 pub fn channel_key(name: &str, channel_id: &str) -> String {
@@ -165,7 +155,7 @@ pub fn channel_key(name: &str, channel_id: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// session / version / identity
+// 会话 / 版本 / 身份
 // ---------------------------------------------------------------------------
 
 fn now_epoch() -> i64 {
@@ -215,7 +205,7 @@ pub async fn cli_version(db: &Database) -> String {
         .unwrap_or_else(|| DEFAULT_CLI_VERSION.to_owned())
 }
 
-/// ZDR 开关（全局设置，默认关闭；计划 §7.4 未决项的保守实现）。
+/// ZDR 开关（全局设置，默认关闭）。
 pub async fn zdr_enabled(db: &Database) -> bool {
     read_json(db, "command_code_zdr")
         .await
@@ -252,7 +242,7 @@ pub async fn identity_for_probe(db: &Database, channel_id: &str) -> protocol::Co
 }
 
 // ---------------------------------------------------------------------------
-// fingerprint
+// 设备指纹
 // ---------------------------------------------------------------------------
 
 fn sha256_hex(value: &str) -> String {
@@ -398,7 +388,7 @@ pub async fn ensure_initialized(
     );
     headers.insert(
         axum::http::header::AUTHORIZATION,
-        axum::http::HeaderValue::from_str(&format!("Bearer {api_key}"))?,
+        crate::protocol::bearer_header(api_key)?,
     );
     headers.insert(
         axum::http::HeaderName::from_static("x-cli-environment"),
@@ -484,7 +474,7 @@ pub async fn ensure_initialized(
 }
 
 // ---------------------------------------------------------------------------
-// transport router
+// transport 路由状态机
 // ---------------------------------------------------------------------------
 
 pub async fn transport(db: &Database, channel_id: &str) -> Transport {
@@ -566,8 +556,9 @@ pub fn quota_reset_at(body: &[u8]) -> Option<chrono::DateTime<Utc>> {
     None
 }
 
-/// 额度耗尽的账号轮换（计划决策 3）：直接写 `channel_health`，
-/// 窗口重置后由既有健康探测自动放回；无需账号池调度器、无需新表。
+/// 额度耗尽的账号轮换：经 [`crate::health::apply_health_event`] 写入
+/// [`HealthEvent::QuotaExhausted`] 开断渠道，窗口重置后由既有健康探测自动
+/// 放回；无需账号池调度器、无需新表。
 pub async fn mark_quota_exhausted(
     db: &Database,
     channel_id: &str,
@@ -579,16 +570,15 @@ pub async fn mark_quota_exhausted(
     let until = reset_at
         .filter(|value| *value > now)
         .unwrap_or_else(|| now + chrono::Duration::seconds(fallback_seconds.max(1)));
-    sqlx::query(
-        "UPDATE channel_health SET state='open', last_failure_at=?, last_error_kind='quota_exhausted', \
-         last_status_code=?, disabled_until=?, updated_at=? WHERE channel_id=?",
+    apply_health_event(
+        db.pool(),
+        HealthEvent::QuotaExhausted {
+            channel_id,
+            at: &now.to_rfc3339(),
+            status: Some(status as i64),
+            disabled_until: &until.to_rfc3339(),
+        },
     )
-    .bind(now.to_rfc3339())
-    .bind(status as i64)
-    .bind(until.to_rfc3339())
-    .bind(now.to_rfc3339())
-    .bind(channel_id)
-    .execute(db.pool())
     .await?;
     Ok(())
 }
@@ -647,6 +637,7 @@ pub fn version_drift(version: &str) -> bool {
 mod tests {
     use super::*;
     use crate::ports::{UpstreamBody, UpstreamClient, UpstreamError, UpstreamResponse};
+    use crate::test_support::TempDir;
     use futures_util::future::BoxFuture;
 
     #[derive(Default)]
@@ -692,10 +683,11 @@ mod tests {
         }
     }
 
-    async fn test_db() -> (Database, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("lagw-cc-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let db = Database::open(&dir.join("test.db")).await.unwrap();
+    /// 测试数据库与其临时目录：目录随返回值一起交给调用方，测试结束时由
+    /// `TempDir` 的 `Drop` 清理。
+    async fn test_db() -> (Database, TempDir) {
+        let dir = TempDir::new("cc");
+        let db = Database::open(&dir.path().join("test.db")).await.unwrap();
         (db, dir)
     }
 
@@ -815,7 +807,7 @@ mod tests {
         assert_eq!(ids.len(), items.len(), "model ids must be unique");
         assert!(ids.contains("deepseek/deepseek-v4-flash"));
         assert!(ids.contains("z-ai/glm-5.3-flash"));
-        // Pro/Max/GOAT-only models must never leak into the Go fallback.
+        // 仅 Pro/Max/GOAT 可用的模型绝不外泄进 Go 兜底目录。
         assert!(!ids.contains("claude-opus-5"));
         assert!(!ids.contains("gpt-6-astra"));
         assert!(!ids.contains("gpt-5.6-sol"));
@@ -902,12 +894,12 @@ mod tests {
         assert!(lifecycle_body.contains("cli_session_exists"));
         assert!(lifecycle_body.contains(DEFAULT_CLI_VERSION));
 
-        // Throttled per channel: the next call performs zero requests.
+        // 按渠道节流：下一次调用不再发起任何请求。
         ensure_initialized(&db, &http, "ch-a", "user_test", DEFAULT_API_BASE, 8)
             .await
             .unwrap();
         assert_eq!(http.calls().len(), 2, "init is throttled per channel");
-        // A different channel initializes independently.
+        // 另一个渠道独立初始化。
         ensure_initialized(&db, &http, "ch-b", "user_other", DEFAULT_API_BASE, 8)
             .await
             .unwrap();
@@ -929,7 +921,7 @@ mod tests {
                 .await
                 .is_some()
         );
-        // A non-JSON registry answer fails soft: the stored version stays.
+        // registry 返回非 JSON 时软失败：已存版本保持不变。
         *http.npm_body.lock() = Some("not json".into());
         assert!(refresh_cli_version(&db, &http).await.is_err());
         assert_eq!(cli_version(&db).await, "1.99.0");
@@ -958,7 +950,7 @@ mod tests {
         assert_eq!(kind.as_deref(), Some("quota_exhausted"));
         assert_eq!(status, Some(429));
 
-        // Without a parsable reset the circuit window is the fallback.
+        // 无可用重置时间时，回退为熔断窗口。
         mark_quota_exhausted(&db, "ch-1", None, 60, 402)
             .await
             .unwrap();

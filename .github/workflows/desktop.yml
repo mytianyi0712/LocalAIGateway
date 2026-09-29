@@ -1,3 +1,9 @@
+# 桌面端发布流水线：手动触发或推送 v* 标签时，在 Linux/Windows 上分别产出
+# AppImage、NSIS 安装包（原生与 Wine 交叉编译）以及 Arch 包，并上传为 artifact。
+#
+# 前提：推送标签前先同步版本（标签名须等于 VERSION 去掉前缀 v）；
+#       各矩阵任务只使用所在平台能提供的工具链（Ubuntu 侧装 webkit2gtk/patchelf 等）。
+# 关键不变量：打包前必须先通过 version.sh check 与 check-layers.sh 两道门禁。
 name: Desktop bundles
 
 on:

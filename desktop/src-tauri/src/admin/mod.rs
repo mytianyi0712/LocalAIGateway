@@ -1,10 +1,14 @@
+//! 管理端 HTTP 层：装配 `/api/admin/v1/*` 路由，并定义 `AdminService`、
+//! 共享响应助手（`ok`/`no_content`/`validate_text`/`integrity`）与 `ApiResult` 别名。
+//! 边界：13 个 admin 子模块的 SQL 都收口到 `AdminService`（多数在各自同名
+//! 子模块内，provider 域的在 `admin/mod.rs`），handler 只做参数提取与透传。
+//! 关键不变量：多步写路径包在单个事务内，校验失败即回滚，不留半更新状态。
 use crate::{
     api_error::{ApiError, correlation_middleware, json_response},
-    application::Context,
-    auth::AdminAuth,
     crypto::SecretStore,
     db::Database,
-    protocol::{PROTOCOL_ORDER, normalize_base_url, valid_protocol},
+    protocol::normalize_base_url,
+    state::AppState,
 };
 use axum::{
     Json, Router,
@@ -16,9 +20,7 @@ use chrono::Utc;
 use providers::{
     ProviderInput, ProviderPatch, ProviderRow, load_provider, provider_json, validate_provider_kind,
 };
-use serde_json::{Map, Value, json};
-use sqlx::{FromRow, QueryBuilder, Row};
-use std::collections::{HashMap, HashSet};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use uuid::Uuid;
 mod balances;
@@ -67,7 +69,7 @@ use settings::{
 use stats::{stats_cache, stats_channels, stats_models, stats_summary, stats_timeseries};
 
 type ApiResult = Result<Response, ApiError>;
-pub fn router() -> Router<Context> {
+pub fn router() -> Router<AppState> {
     Router::new()
         .route(
             "/api/admin/v1/providers",
@@ -246,17 +248,20 @@ fn integrity(error: sqlx::Error, message: &str) -> ApiError {
         ApiError::internal(error)
     }
 }
-#[derive(FromRow)]
-/// Admin service (P2-1): provider/channel domain operations. Handlers are
-/// thin shells delegating here; the service owns the SQL and the response
-/// assembly, depending only on storage and the secret store. Other admin
-/// subdomains (routes, capabilities, mappings, logs, stats, settings) are
-/// migrated progressively.
+/// 管理端服务：所有 admin 子域的 SQL 与响应组装的归属地。
+/// handler 只做参数提取与透传；本服务持有数据库、密钥库与渠道端口
+/// （不持有 HTTP 客户端）。
+/// 需要能力检测 / discovery 等其它域服务的方法，按仓库既有约定临时接收
+/// `&Context`（仅作参数，不保存）。
 pub struct AdminService {
     db: Database,
     secrets: SecretStore,
+    /// 渠道端口：存在性、`providers.kind` 与协议清单查询的唯一来源
+    /// （渠道行的 SQL 归 `infrastructure`，admin 侧不再重复）。
+    channels: Arc<dyn crate::ports::ChannelRepository>,
 }
 impl AdminService {
+
     pub async fn list_providers(&self) -> ApiResult {
         let rows = sqlx::query_as::<_, ProviderRow>("SELECT p.id,p.name,p.base_url,p.kind,p.created_at,p.updated_at,COUNT(c.id) channel_count FROM providers p LEFT JOIN channels c ON c.provider_id=p.id GROUP BY p.id ORDER BY p.name")
             .fetch_all(self.db.pool()).await?;
@@ -291,9 +296,9 @@ impl AdminService {
         Ok(ok(provider_json(load_provider(&self.db, row_id).await?)))
     }
     pub async fn patch_provider(&self, row_id: &str, input: ProviderPatch) -> ApiResult {
-        // P1-4: validate EVERYTHING before touching the row, then commit
-        // name and base_url in ONE atomic UPDATE — a bad URL or a failed
-        // statement can no longer leave the name half-updated.
+        // 先校验全部输入再触碰数据行，随后用单条原子 UPDATE 提交
+        // name、base_url（以及有值时的 kind）—— 非法 URL 或语句失败
+        // 都不会再留下半更新的名称。
         let name = match input.name {
             Some(name) => {
                 validate_text(&name, "name", 120)?;
@@ -312,8 +317,8 @@ impl AdminService {
             Some(value) => validate_provider_kind(Some(value))?,
             None => None,
         };
-        // P1-4 continuation: `kind` uses the same all-or-nothing update as
-        // name/base_url.
+        // 续上：`kind` 与 name/base_url 共用同一套全有或全无的更新，
+        // 有值即写、无值即跳过。
         let kind_present = input.kind.is_some();
         if name.is_none() && base_url.is_none() && !kind_present {
             return self.get_provider(row_id).await;
@@ -359,11 +364,11 @@ impl AdminService {
         self.get_provider(row_id).await
     }
 
-    /// P1-4: delete is already one transaction; keep the cascades explicit
-    /// (route_candidates → channels → provider).
+    /// 删除本就包在单个事务内；级联顺序保持显式：
+    /// 即 route_candidates → channels → provider。
     pub async fn delete_provider(&self, row_id: &str) -> ApiResult {
         let mut tx = self.db.pool().begin().await?;
-        sqlx::query("DELETE FROM route_candidates WHERE channel_model_id IN (SELECT cm.id FROM channel_models cm JOIN channels c ON c.id=cm.channel_id WHERE c.provider_id=?)").bind(row_id).execute(&mut *tx).await?;
+        self.delete_candidates_for_provider(&mut tx, row_id).await?;
         sqlx::query("DELETE FROM channels WHERE provider_id=?")
             .bind(row_id)
             .execute(&mut *tx)
@@ -379,8 +384,16 @@ impl AdminService {
         Ok(no_content())
     }
 
-    pub fn new(db: Database, secrets: SecretStore) -> Arc<Self> {
-        Arc::new(Self { db, secrets })
+    pub fn new(
+        db: Database,
+        secrets: SecretStore,
+        channels: Arc<dyn crate::ports::ChannelRepository>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            db,
+            secrets,
+            channels,
+        })
     }
 }
 #[cfg(test)]
@@ -388,20 +401,22 @@ mod tests {
     use super::*;
     use super::{
         channels::{ChannelFilter, ChannelInput, ChannelPatch},
+        models::{ManualModelInput, ModelPatch},
         profiles::ProfileInput,
         routes::{CandidateInput, CandidateList, RouteInput},
         stats::{SummaryQuery, format_utc_millis, parse_utc_rfc3339, resolve_token_window},
     };
     use crate::{
         api_error::ErrorCode,
-        auth::{RecoveryAuth, RecoveryGenerateAuth},
-        config::AppConfig,
-        db::Database,
+        application::Context,
+        auth::{AdminAuth, RecoveryAuth, RecoveryGenerateAuth},
         settings as core_settings,
     };
     use axum::extract::{FromRequestParts, Path, Query, State};
+    use sqlx::Row;
 
-    use std::sync::Arc;
+    use crate::test_support::TempDir;
+    use std::collections::HashMap;
 
     fn window(from: &str, to: &str) -> SummaryQuery {
         SummaryQuery {
@@ -446,8 +461,7 @@ mod tests {
             sorted, values,
             "fixed-millis Z format must sort chronologically"
         );
-        // The half-open window start must compare equal to a stored value at
-        // the same instant.
+        // 半开区间的起点与同一时刻的已存值比较必须相等。
         let window = resolve_token_window(&window(
             "2026-08-04T00:00:00+08:00",
             "2026-08-05T00:00:00+08:00",
@@ -503,8 +517,8 @@ mod tests {
 
     #[test]
     fn boundary_values_keep_half_open_semantics() {
-        // A stored occurred_at exactly at `from` must compare >= the bound,
-        // and one exactly at `to` must compare < the bound.
+        // occurred_at 恰好等于 `from` 的已存值必须 >= 该边界，
+        // 恰好等于 `to` 的必须 < 该边界。
         let window = resolve_token_window(&window(
             "2026-08-03T16:00:00.000Z",
             "2026-08-04T16:00:00.000Z",
@@ -525,79 +539,17 @@ mod tests {
         );
     }
 
-    async fn test_state() -> (Context, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("lagw-admin-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let db = Database::open(&dir.join("test.db")).await.unwrap();
-        let secrets = crate::crypto::SecretStore::load(&dir.join("master.key"))
-            .await
-            .unwrap();
-        let (telemetry, _rx) = crate::telemetry::Telemetry::new(1000);
-        let http: Arc<dyn crate::ports::UpstreamClient> =
-            Arc::new(crate::infrastructure::HttpClientPool::default());
-        let routes: Arc<dyn crate::ports::RouteRepository> =
-            crate::infrastructure::SqliteRouteRepository::new(db.clone());
-        let channels: Arc<dyn crate::ports::ChannelRepository> =
-            crate::infrastructure::SqliteChannelRepository::new(db.clone());
-        let clock: Arc<dyn crate::ports::Clock> = Arc::new(crate::infrastructure::SystemClock);
-        let background = crate::infrastructure::RuntimeSupervisor::new(
-            tokio_util::sync::CancellationToken::new(),
-        );
-        let limits = Arc::new(crate::runtime::RuntimeLimits::default());
-        let discovery = crate::discovery::DiscoveryService::new(
-            db.clone(),
-            secrets.clone(),
-            Arc::clone(&http),
-            Arc::clone(&channels),
-            Arc::clone(&clock),
-            Arc::clone(&background),
-            Arc::clone(&limits),
-        );
-        let notifier: std::sync::Arc<dyn crate::ports::Notifier> =
-            crate::notification::DesktopNotifier::new(std::time::Duration::from_millis(50));
-        let proxy = crate::proxy::ProxyService::new(
-            db.clone(),
-            secrets.clone(),
-            Arc::clone(&http),
-            routes.clone(),
-            telemetry.clone(),
-            Arc::clone(&clock),
-            Arc::clone(&limits),
-            crate::notification::DesktopNotifier::new(std::time::Duration::from_millis(50)),
-        );
-        let balance = crate::balance::BalanceService::new(
-            db.clone(),
-            secrets.clone(),
-            Arc::clone(&http),
-            channels.clone(),
-            Arc::clone(&clock),
-            Arc::clone(&limits),
-        );
-        let command_code_login = crate::commandcode_login::CommandCodeLogin::new(std::sync::Arc::clone(&http));
-        let state = crate::application::Context {
-            config: Arc::new(AppConfig::default()),
-            db: db.clone(),
-            secrets: secrets.clone(),
-            http,
-            routes,
-            channels,
-            clock,
-            notifier,
-            discovery,
-            proxy,
-            telemetry,
-            background,
-            limits,
-            balance,
-            admin: crate::admin::AdminService::new(db.clone(), secrets.clone()),
-            command_code_login,
-            recovery: crate::auth::RecoverySession::new(),
-        };
+    async fn test_state() -> (AppState, TempDir) {
+        // 统一夹具：临时目录 + 整套 Context（见 `crate::test_support`）。
+        let crate::test_support::TestEnv {
+            dir,
+            context: state,
+        } = crate::test_support::context("admin").await;
         (state, dir)
     }
 
-    /// P1-7: a settings patch writes the keys and the runtime settings in one
-    /// transaction; both must be readable afterwards.
+    /// 设置补丁在同一个事务里写入密钥与运行时设置；
+    /// 两者事后都必须可读。
     #[tokio::test]
     async fn patch_settings_writes_keys_and_settings_atomically() {
         let (state, _dir) = test_state().await;
@@ -642,8 +594,8 @@ mod tests {
         );
     }
 
-    /// P1-7: updating a capability profile propagates to model_caps in one
-    /// transaction; both sides are consistent afterwards.
+    /// 更新能力档案会在同一个事务里把改动传播到 model_caps；
+    /// 事后两侧保持一致。
     #[tokio::test]
     async fn update_profile_propagates_to_model_caps_in_one_transaction() {
         let (state, _dir) = test_state().await;
@@ -693,9 +645,8 @@ mod tests {
         assert_eq!(profile_name, "Updated");
     }
 
-    /// P1-4: a failed provider PATCH must leave BOTH fields unchanged — the
-    /// name and base_url commit in a single atomic UPDATE, so a trigger
-    /// failure cannot produce a half-updated row.
+    /// provider PATCH 失败时两个字段都必须保持不变 —— name 与 base_url
+    /// 在单条原子 UPDATE 中提交，因此触发器失败不会产生半更新的数据行。
     #[tokio::test]
     async fn provider_patch_failure_rolls_back_both_fields() {
         let (state, _dir) = test_state().await;
@@ -706,9 +657,8 @@ mod tests {
             .execute(state.db.pool())
             .await
             .unwrap();
-        // Inject a failure on ANY providers UPDATE — the second statement of
-        // the old two-statement implementation would have left the name
-        // changed; the single UPDATE must fail as one unit.
+        // 对任何 providers UPDATE 注入失败：历史上实现为非原子的两条语句时，
+        // name 会先被写入；单条 UPDATE 必须整体失败。
         sqlx::query("CREATE TRIGGER fail_provider_update BEFORE UPDATE ON providers BEGIN SELECT RAISE(ABORT, 'injected provider failure'); END")
             .execute(state.db.pool())
             .await
@@ -742,9 +692,8 @@ mod tests {
         );
     }
 
-    /// `providers.kind` (migration 0005) is explicit and validated: only
-    /// `command_code` is accepted, unknown values are rejected before any
-    /// write, and an empty string clears the marker.
+    /// `providers.kind`（migration 0005）显式且经过校验：只接受
+    /// `command_code`，未知值在写入前就被拒绝，空字符串则清除标记。
     #[tokio::test]
     async fn provider_kind_round_trips_and_rejects_unknown_values() {
         let (state, _dir) = test_state().await;
@@ -806,8 +755,8 @@ mod tests {
         assert!(kind.is_none());
     }
 
-    /// P1-4: a successful provider PATCH writes name + base_url in one
-    /// statement, so the row carries a single consistent updated_at.
+    /// provider PATCH 成功时用单条语句写入 name + base_url，
+    /// 因此数据行只带一个一致的 updated_at。
     #[tokio::test]
     async fn provider_patch_success_writes_single_consistent_snapshot() {
         let (state, _dir) = test_state().await;
@@ -840,7 +789,7 @@ mod tests {
         assert_eq!(name, "renamed");
         assert_eq!(base_url, "http://127.0.0.1:2");
         assert_ne!(updated_at, time, "updated_at must move on");
-        // A bad base_url is rejected BEFORE any write (validation order).
+        // 非法 base_url 在任何写入之前就被拒绝（校验顺序）。
         let error = patch_provider(
             AdminAuth,
             State(state.clone()),
@@ -862,9 +811,9 @@ mod tests {
         assert_eq!(name, "renamed", "pre-validation must not write the name");
     }
 
-    /// Balance admin flow: PUT config -> POST query -> GET -> POST refresh
-    /// -> DELETE. The upstream is unreachable on purpose: the query must
-    /// still return 200 plus an error snapshot, never break the admin API.
+    /// 余额管理流程：PUT config -> POST query -> GET -> POST refresh
+    /// -> DELETE。上游被刻意设为不可达：查询仍须返回 200 加错误快照，
+    /// 绝不破坏管理端 API。
     #[tokio::test]
     async fn balance_admin_flow_round_trips_and_survives_upstream_failure() {
         let (state, _dir) = test_state().await;
@@ -943,7 +892,7 @@ mod tests {
                 .expect("delete must succeed");
         assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
 
-        // Default-off is restored; a manual query now gets the stable 422.
+        // 恢复默认关闭；此时手动查询得到稳定的 422。
         let error = query_balance(AdminAuth, State(state.clone()), Path("ch-1".to_owned()))
             .await
             .expect_err("unconfigured manual query must fail");
@@ -951,8 +900,8 @@ mod tests {
         assert_eq!(error.code, ErrorCode::BalanceNotConfigured);
     }
 
-    /// Route wiring smoke test: the balance endpoints must be reachable
-    /// through the real admin router (extractors + correlation middleware).
+    /// 路由接线冒烟测试：余额端点必须能经由真正的 admin 路由访问
+    /// （extractor + correlation 中间件）。
     #[tokio::test]
     async fn balance_routes_are_wired_through_the_admin_router() {
         use tower::ServiceExt;
@@ -1031,9 +980,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    /// P1-4: a failure while propagating a profile update to model_caps
-    /// rolls the WHOLE update back — the profile row must not change when
-    /// the caps propagation fails.
+    /// 把档案更新传播到 model_caps 的过程中失败时，整个更新都会回滚 ——
+    /// 传播失败时档案行不得改变。
     #[tokio::test]
     async fn profile_update_rolls_back_with_caps_propagation_failure() {
         let (state, _dir) = test_state().await;
@@ -1050,9 +998,8 @@ mod tests {
             .execute(state.db.pool())
             .await
             .unwrap();
-        // Fail the SECOND statement (the model_caps propagation) — with the
-        // old non-transactional code the profile row would already be
-        // committed and stay changed.
+        // 让第二条语句（model_caps 传播）失败：历史上传播不在同一事务内时，
+        // 档案行会先被提交并残留改动。
         sqlx::query("CREATE TRIGGER fail_model_caps_update BEFORE UPDATE ON model_caps BEGIN SELECT RAISE(ABORT, 'injected caps failure'); END")
             .execute(state.db.pool())
             .await
@@ -1094,8 +1041,7 @@ mod tests {
         assert_eq!(caps, Some(1000), "model_caps must be untouched");
     }
 
-    /// P2-6: saving candidates whose channel model supports none of the
-    /// route's protocols is rejected with 422 and changes nothing.
+    /// 保存的候选中渠道模型不支持该路由的任一协议时，返回 422 且不做任何改动。
     #[tokio::test]
     async fn replace_candidates_rejects_protocol_unsupported_items() {
         let (state, _dir) = test_state().await;
@@ -1119,7 +1065,7 @@ mod tests {
             .execute(state.db.pool())
             .await
             .unwrap();
-        // The channel model only supports claude; the route is openai.
+        // 该渠道模型只支持 claude；而路由是 openai。
         sqlx::query("INSERT INTO channel_model_protocols(channel_model_id,protocol) VALUES('cm-1','claude')")
             .execute(state.db.pool())
             .await
@@ -1130,9 +1076,8 @@ mod tests {
             .execute(state.db.pool())
             .await
             .unwrap();
-        // A pre-existing valid candidate (openai support) so the rejection
-        // must leave existing rows untouched (P2-1). It lives on a second
-        // channel: channel_models is unique per (channel_id, model_id).
+        // 预先放一个有效候选（支持 openai），以确保拒绝时既有行不被触碰。
+        // 它位于第二个渠道：channel_models 按 (channel_id, model_id) 唯一。
         sqlx::query("INSERT INTO channels(id,provider_id,name,protocol,api_key_encrypted,api_key_hint,manual_enabled,created_at,updated_at) VALUES('ch-2','prov-1','chan2','openai_compatible',x'00','',1,?,?)")
             .bind(time)
             .bind(time)
@@ -1186,9 +1131,8 @@ mod tests {
         assert_eq!(surviving, "cm-2", "nothing may be saved on rejection");
     }
 
-    /// P2-1: candidates are inserted per (route, protocol) pair — a claude
-    /// candidate lands only under the claude sibling route, an openai
-    /// candidate only under the openai sibling.
+    /// 候选按 (route, protocol) 对插入 —— claude 候选只落在 claude 兄弟路由下，
+    /// openai 候选只落在 openai 兄弟路由下。
     #[tokio::test]
     async fn replace_candidates_mixed_protocols_inserts_matching_pairs() {
         let (state, _dir) = test_state().await;
@@ -1267,9 +1211,8 @@ mod tests {
         assert!(rows.contains(&("route-claude".into(), "cm-claude".into(), "claude".into())));
     }
 
-    /// Custom models: an arbitrary route name can be created with explicit
-    /// protocols, and its candidates may carry a *different* upstream model id
-    /// (the gateway rewrites the outbound `model` per candidate).
+    /// 自定义模型：任意路由名都可用显式协议创建，其候选可以携带不同于路由的
+    /// 上游模型 id（网关按候选重写出站的 `model`）。
     #[tokio::test]
     async fn create_custom_route_accepts_differing_model_candidates() {
         let (state, _dir) = test_state().await;
@@ -1341,8 +1284,8 @@ mod tests {
         assert_eq!(bound, "gpt-4o");
     }
 
-    /// A custom route may be created with no candidates at all; a route with no
-    /// matching channel model is rejected only when protocols are omitted.
+    /// 自定义路由可以不带任何候选创建；只有在省略协议时，
+    /// 没有匹配渠道模型的路由才会被拒绝。
     #[tokio::test]
     async fn create_route_without_protocols_still_requires_a_channel_model() {
         let (state, _dir) = test_state().await;
@@ -1361,10 +1304,9 @@ mod tests {
         assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
-    /// P1-7: with a corrupt admin key, the recovery path (healthy keys ->
-    /// AdminAuth, corrupt keys -> loopback only) must still regenerate both
-    /// access keys atomically, and a `RecoveryAuth` extraction without the
-    /// `ConnectInfo` extension must be rejected.
+    /// admin 密钥损坏时，恢复路径（密钥健康 -> AdminAuth，损坏 -> 仅回环）
+    /// 仍须原子地重新生成两把访问密钥；且缺少 `ConnectInfo` 扩展的
+    /// `RecoveryAuth` 提取必须被拒绝。
     #[tokio::test]
     async fn corrupt_key_recovery_generates_fresh_keys() {
         let (state, _dir) = test_state().await;
@@ -1377,8 +1319,8 @@ mod tests {
         .execute(state.db.pool())
         .await
         .unwrap();
-        // While the key is corrupt, an extraction without the ConnectInfo
-        // extension (no real HTTP peer) must be rejected.
+        // 密钥损坏期间，缺少 ConnectInfo 扩展（没有真实 HTTP 对端）的提取
+        // 必须被拒绝。
         let parts = axum::extract::Request::builder()
             .uri("/")
             .body(())
@@ -1391,7 +1333,7 @@ mod tests {
             matches!(rejected, Err(error) if error.status == StatusCode::UNAUTHORIZED),
             "missing ConnectInfo must be rejected while keys are corrupt"
         );
-        // P1-4: without the one-time nonce the generate endpoint is closed.
+        // 没有一次性 nonce 时，generate 端点对外关闭。
         let rejected = generate_access_keys(
             RecoveryGenerateAuth,
             State(state.clone()),
@@ -1400,8 +1342,7 @@ mod tests {
         .await
         .expect_err("missing nonce must be rejected");
         assert_eq!(rejected.status, StatusCode::UNAUTHORIZED);
-        // A valid nonce (as issued by the recovery status endpoint) allows
-        // one regeneration.
+        // 有效 nonce（由 recovery status 端点签发）允许重新生成一次。
         let nonce = state.recovery.issue().await;
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
@@ -1425,13 +1366,13 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap();
         assert!(!admin.is_empty() && !gateway.is_empty());
-        // The freshly written keys must be decryptable again.
+        // 刚写入的密钥必须能再次解密。
         let policy = core_settings::access_policy(&state)
             .await
             .expect("keys must be valid again");
         assert_eq!(policy.admin_key, admin);
         assert_eq!(policy.gateway_key, gateway);
-        // The nonce is single-use: replaying it must be rejected.
+        // nonce 单次有效：重放必须被拒绝。
         let mut replay = axum::http::HeaderMap::new();
         replay.insert(
             "x-recovery-nonce",
@@ -1445,10 +1386,9 @@ mod tests {
         );
     }
 
-    /// P1-3: corrupt runtime settings fail closed (admin surface locked with
-    /// `config_corrupted`) but stay repairable through the loopback + nonce
-    /// recovery-repair endpoint; the corrupt rows are overwritten and reads
-    /// recover.
+    /// 运行时设置损坏时故障关闭（管理界面以 `config_corrupted` 锁定），
+    /// 但仍可通过回环 + nonce 的 recovery-repair 端点修复；
+    /// 损坏的行被覆盖写，读取随之恢复。
     #[tokio::test]
     async fn corrupt_settings_are_repairable_via_recovery_endpoint() {
         let (state, _dir) = test_state().await;
@@ -1465,7 +1405,7 @@ mod tests {
             .execute(state.db.pool())
             .await
             .unwrap();
-        // 1. Admin auth fails closed with the config_corrupted signal.
+        // 1. admin 鉴权以 config_corrupted 信号故障关闭。
         let parts = axum::extract::Request::builder()
             .uri("/")
             .body(())
@@ -1478,7 +1418,7 @@ mod tests {
             matches!(rejected, Err(error) if error.code == ErrorCode::ConfigCorrupted),
             "corrupt settings must fail closed with config_corrupted"
         );
-        // 2. The recovery status endpoint reports the corrupt keys.
+        // 2. recovery status 端点报告损坏的键。
         let response = recovery_key_status(RecoveryAuth, State(state.clone()))
             .await
             .expect("recovery status must load");
@@ -1499,7 +1439,7 @@ mod tests {
         );
         assert!(corrupt_keys.contains(&"failure_threshold"));
         let nonce = status["recovery_nonce"].as_str().unwrap().to_owned();
-        // 3. Repair with the nonce: valid rows overwrite the corrupt ones.
+        // 3. 带 nonce 修复：有效的行覆盖损坏的行。
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
             "x-recovery-nonce",
@@ -1522,7 +1462,7 @@ mod tests {
             .expect("settings must be readable again after repair");
         assert!(settings.trust_local_network, "repaired value must be read");
         assert_eq!(settings.failure_threshold, 5);
-        // 4. Admin auth works again.
+        // 4. admin 鉴权恢复可用。
         let parts = axum::extract::Request::builder()
             .uri("/")
             .body(())
@@ -1533,7 +1473,7 @@ mod tests {
         AdminAuth::from_request_parts(&mut parts, &state)
             .await
             .expect("admin auth must recover after the repair");
-        // 5. The nonce is single-use.
+        // 5. nonce 单次有效。
         let mut replay = axum::http::HeaderMap::new();
         replay.insert(
             "x-recovery-nonce",
@@ -1548,7 +1488,7 @@ mod tests {
         .await
         .expect_err("the consumed nonce must not be replayable");
         assert_eq!(rejected.status, StatusCode::UNAUTHORIZED);
-        // 6. Access keys are never accepted through the repair endpoint.
+        // 6. 修复端点绝不接受访问密钥。
         let nonce = state.recovery.issue().await;
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
@@ -1572,8 +1512,8 @@ mod tests {
         assert_eq!(key_rows, 0, "repair must never write access keys");
     }
 
-    /// P1-4: the generate endpoint's extractor rejects cross-site origins,
-    /// missing origins, DNS-rebinding hosts, and non-loopback peers.
+    /// generate 端点的 extractor 拒绝跨站来源、缺失来源、
+    /// DNS 重绑定主机以及非回环对端。
     #[tokio::test]
     async fn recovery_generate_auth_rejects_cross_site_requests() {
         use axum::extract::{ConnectInfo, FromRequestParts};
@@ -1601,7 +1541,7 @@ mod tests {
             parts
         };
         let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-        // The legitimate same-origin call passes.
+        // 合法的同源调用通过。
         let mut parts = build_parts("127.0.0.1:3000", Some("http://127.0.0.1:3000"), loopback);
         assert!(
             RecoveryGenerateAuth::from_request_parts(&mut parts, &state)
@@ -1609,25 +1549,25 @@ mod tests {
                 .is_ok(),
             "same-origin loopback must pass"
         );
-        // Cross-site form: loopback peer but the attacker's origin.
+        // 跨站形式：回环对端，但来源是攻击者的。
         let mut parts = build_parts("127.0.0.1:3000", Some("http://evil.example"), loopback);
         assert!(matches!(
             RecoveryGenerateAuth::from_request_parts(&mut parts, &state).await,
             Err(error) if error.status == StatusCode::UNAUTHORIZED
         ));
-        // No Origin header at all (e.g. a raw socket form).
+        // 完全没有 Origin 头（例如原始 socket 形式）。
         let mut parts = build_parts("127.0.0.1:3000", None, loopback);
         assert!(matches!(
             RecoveryGenerateAuth::from_request_parts(&mut parts, &state).await,
             Err(error) if error.status == StatusCode::UNAUTHORIZED
         ));
-        // DNS rebinding: loopback peer, attacker-controlled Host.
+        // DNS 重绑定：回环对端，Host 由攻击者控制。
         let mut parts = build_parts("evil.example:3000", Some("http://evil.example"), loopback);
         assert!(matches!(
             RecoveryGenerateAuth::from_request_parts(&mut parts, &state).await,
             Err(error) if error.status == StatusCode::UNAUTHORIZED
         ));
-        // Non-loopback peer.
+        // 非回环对端。
         let mut parts = build_parts(
             "127.0.0.1:3000",
             Some("http://127.0.0.1:3000"),
@@ -1639,8 +1579,8 @@ mod tests {
         ));
     }
 
-    /// P1-4: an expired recovery nonce is rejected — the challenge is
-    /// short-lived even if it was never used.
+    /// 过期的恢复 nonce 会被拒绝 —— 即使从未使用过，
+    /// 该挑战也是短时效的。
     #[tokio::test]
     async fn recovery_nonce_expires() {
         let session = crate::auth::RecoverySession::with_ttl(chrono::Duration::milliseconds(50));
@@ -1652,10 +1592,9 @@ mod tests {
         );
     }
 
-    /// P2-3: an Axum rejection (malformed JSON body) must come back as the
-    /// stable JSON envelope — `code` / `message` / `request_id`, with the
-    /// `x-request-id` header matching the body — instead of raw extractor
-    /// text.
+    /// Axum 的拒绝（JSON 体格式错误）必须以稳定的 JSON 信封返回 ——
+    /// `code` / `message` / `request_id`，且 `x-request-id` 头与响应体一致 ——
+    /// 而不是原始的 extractor 文本。
     #[tokio::test]
     async fn malformed_json_rejection_has_stable_shape() {
         use tower::ServiceExt;
@@ -1699,7 +1638,7 @@ mod tests {
         );
     }
 
-    /// P2-3: the same stable envelope applies to query-string rejections.
+    /// 同样的稳定信封适用于查询串拒绝。
     #[tokio::test]
     async fn query_rejection_normalized() {
         use tower::ServiceExt;
@@ -1731,9 +1670,8 @@ mod tests {
         assert!(value.get("request_id").and_then(Value::as_str).is_some());
     }
 
-    /// P2-4: profile capability values are validated on write — a zero
-    /// context window and a non-object thinking map are rejected with 422
-    /// (pre-fix: `update_profile` accepted anything).
+    /// 档案能力值在写入时校验 —— 零 context window 和非对象 thinking map
+    /// 都返回 422（历史上 `update_profile` 不做校验，现已拒绝）。
     #[tokio::test]
     async fn profile_validation_rejects_invalid_values() {
         let (state, _dir) = test_state().await;
@@ -1778,7 +1716,7 @@ mod tests {
         .await
         .expect_err("a non-object thinking map must be rejected");
         assert_eq!(bad_map.status, StatusCode::UNPROCESSABLE_ENTITY);
-        // Neither rejection may have mutated the stored profile.
+        // 两次拒绝都不得改动已存档案。
         let window: Option<i64> = sqlx::query_scalar(
             "SELECT context_window FROM capability_profiles WHERE id='profile-1'",
         )
@@ -1788,8 +1726,8 @@ mod tests {
         assert_eq!(window, Some(1000));
     }
 
-    /// P2-4: a failing profile delete rolls the whole transaction back — the
-    /// model_caps profile_id reference must survive the injected failure.
+    /// 档案删除失败时整个事务回滚 —— model_caps 的 profile_id 引用
+    /// 必须在注入的失败后仍然存在。
     #[tokio::test]
     async fn delete_profile_rolls_back_on_failure() {
         let (state, _dir) = test_state().await;
@@ -1835,11 +1773,75 @@ mod tests {
             .unwrap();
     }
 
-    /// The health-check model is advisory: a provider whose protocols are
-    /// messy (e.g. one catalog serves some protocols and not others) must
-    /// still be able to pin a health model that covers only a subset. The
-    /// runtime probe falls back per protocol (health.rs), so saving with
-    /// partial or no coverage is accepted.
+    /// 建渠道必须落下一行 `active` 初始健康行（否则该渠道永远无法被路由选中，
+    /// 熔断/恢复状态机也无行可改）；重复初始化必须幂等且不改状态。
+    #[tokio::test]
+    async fn channel_creation_seeds_active_health_row() {
+        let (state, _dir) = test_state().await;
+        let time = "2026-08-04T01:00:00+00:00";
+        sqlx::query("INSERT INTO providers(id,name,base_url,created_at,updated_at) VALUES('prov-1','mock','http://127.0.0.1:1',?,?)")
+            .bind(time)
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        let response = create_channel(
+            AdminAuth,
+            State(state.clone()),
+            Json(ChannelInput {
+                provider_id: "prov-1".into(),
+                name: "chan".into(),
+                protocol: None,
+                protocols: vec!["openai_compatible".into()],
+                api_key: "k".into(),
+                login_id: None,
+                manual_enabled: true,
+                health_check_model_id: None,
+            }),
+        )
+        .await
+        .expect("channel creation must succeed");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let channel_id: String = sqlx::query_scalar("SELECT id FROM channels LIMIT 1")
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap();
+        let (health_state, failures): (String, i64) = sqlx::query_as(
+            "SELECT state, consecutive_failures FROM channel_health WHERE channel_id=?",
+        )
+        .bind(&channel_id)
+        .fetch_one(state.db.pool())
+        .await
+        .expect("creation must seed a channel_health row");
+        assert_eq!(health_state, "active");
+        assert_eq!(failures, 0);
+
+        // 幂等：已开断的行不会被再次初始化覆盖。
+        sqlx::query("UPDATE channel_health SET state='open' WHERE channel_id=?")
+            .bind(&channel_id)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        crate::health::apply_health_event(
+            state.db.pool(),
+            crate::health::HealthEvent::Initialize {
+                channel_id: &channel_id,
+                at: time,
+            },
+        )
+        .await
+        .expect("re-initialization must not fail");
+        let after: String = sqlx::query_scalar("SELECT state FROM channel_health WHERE channel_id=?")
+            .bind(&channel_id)
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(after, "open", "initialize must not clobber an existing row");
+    }
+
+    /// 健康检查模型是建议性的：协议混杂的 provider（例如同一目录只覆盖
+    /// 部分协议）仍应能指定一个只覆盖子集的健康模型。运行时探针按协议
+    /// 回退（health.rs），因此部分覆盖甚至不覆盖都允许保存。
     #[tokio::test]
     async fn channel_save_accepts_partial_health_model_coverage() {
         let (state, _dir) = test_state().await;
@@ -1850,8 +1852,7 @@ mod tests {
             .execute(state.db.pool())
             .await
             .unwrap();
-        // Two protocols, no channel model covers either of them — the save
-        // must not be rejected.
+        // 两个协议，没有任何渠道模型覆盖其中之一 —— 保存不得被拒绝。
         let response = create_channel(
             AdminAuth,
             State(state.clone()),
@@ -1881,11 +1882,9 @@ mod tests {
         assert_eq!(stored.as_deref(), Some("A"));
     }
 
-    /// The providers page renders accounts grouped by provider; the channel
-    /// list must therefore be ordered by provider name (then channel name),
-    /// never by channel name alone. The channel names here order one way
-    /// while their providers order the other, so the assertion fails on a
-    /// name-based sort.
+    /// providers 页面按 provider 分组渲染账号；因此渠道列表必须按
+    /// provider 名（再按渠道名）排序，绝不只按渠道名。此处渠道名的排序
+    /// 与所属 provider 的排序相反，所以按渠道名排序的断言会失败。
     #[tokio::test]
     async fn channels_list_is_ordered_by_provider_name() {
         let (state, _dir) = test_state().await;
@@ -1931,9 +1930,8 @@ mod tests {
         );
     }
 
-    /// P1-6: `health_check_model_id: null` clears the stored model back to
-    /// automatic — a PATCH that omits the field leaves it untouched, and a
-    /// value not owned by the channel is rejected.
+    /// `health_check_model_id: null` 把已存模型清回自动 —— 省略该字段的
+    /// PATCH 保持原值不动，不属于该渠道的值则被拒绝。
     #[tokio::test]
     async fn health_check_model_can_be_cleared_with_null() {
         let (state, _dir) = test_state().await;
@@ -1957,7 +1955,7 @@ mod tests {
             .execute(state.db.pool())
             .await
             .unwrap();
-        // 1. PATCH with an explicit null clears the value.
+        // 1. 显式 null 的 PATCH 清除该值。
         let cleared = patch_channel(
             AdminAuth,
             State(state.clone()),
@@ -1978,7 +1976,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(stored, None, "explicit null must clear the model");
-        // 2. A PATCH omitting the field leaves the (cleared) value alone.
+        // 2. 省略该字段的 PATCH 不动（已清空的）值。
         let _ = patch_channel(
             AdminAuth,
             State(state.clone()),
@@ -1996,7 +1994,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(stored, None, "omitted field must not change the value");
-        // 3. A model that does not belong to the channel is rejected.
+        // 3. 不属于该渠道的模型会被拒绝。
         let error = patch_channel(
             AdminAuth,
             State(state.clone()),
@@ -2011,7 +2009,7 @@ mod tests {
         .await
         .expect_err("a foreign model must be rejected");
         assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
-        // 4. Setting an owned model works.
+        // 4. 设置一个归属该渠道的模型可行。
         let _ = patch_channel(
             AdminAuth,
             State(state.clone()),
@@ -2033,8 +2031,162 @@ mod tests {
         assert_eq!(stored.as_deref(), Some("A"));
     }
 
-    /// P2-3: the channel form's API key commits in the SAME transaction as
-    /// the other fields — a rejected key rolls the whole patch back.
+    /// Command Code 渠道在渠道/模型编辑后保留每个可转换条目的绑定，
+    /// 手动创建的模型也继承它们 —— 守卫不得拒绝候选为 CC 目录行的
+    /// claude/openai 路由。
+    #[tokio::test]
+    async fn command_code_bindings_survive_channel_and_model_edits() {
+        let (state, _dir) = test_state().await;
+        let time = "2026-08-04T01:00:00+00:00";
+        sqlx::query("INSERT INTO providers(id,name,base_url,kind,created_at,updated_at) VALUES('prov-cc','cc','https://api.commandcode.ai','command_code',?,?)")
+            .bind(time)
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channels(id,provider_id,name,protocol,api_key_encrypted,api_key_hint,manual_enabled,created_at,updated_at) VALUES('ch-1','prov-cc','cc','command_code',X'00','hint',1,?,?)")
+            .bind(time)
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channel_protocols(channel_id,protocol) VALUES('ch-1','command_code')")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channel_models(id,channel_id,model_id,display_name,source,available,first_seen_at,created_at,updated_at) VALUES('cm-1','ch-1','deepseek-v4','DeepSeek','discovered',1,?,?,?)")
+            .bind(time)
+            .bind(time)
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO channel_model_protocols(channel_model_id,protocol) VALUES('cm-1','command_code')")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        // 在 `claude` 上有一个活跃候选 —— 该协议是 CC 渠道通过转换提供的，
+        // 而非其自身目录所含。
+        sqlx::query("INSERT INTO model_routes(id,protocol,requested_model_id,enabled,created_at,updated_at) VALUES('route-1','claude','deepseek-v4',1,?,?)")
+            .bind(time)
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO route_candidates(id,route_id,channel_model_id,priority,enabled,created_at,updated_at) VALUES('rc-1','route-1','cm-1',1,1,?,?)")
+            .bind(time)
+            .bind(time)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+
+        async fn bindings(state: &Context) -> Vec<String> {
+            let mut rows: Vec<String> = sqlx::query_scalar(
+                "SELECT protocol FROM channel_model_protocols WHERE channel_model_id='cm-1'",
+            )
+            .fetch_all(state.db.pool())
+            .await
+            .unwrap();
+            rows.sort();
+            rows
+        }
+
+        // 1. 编辑渠道协议时保留可转换条目的绑定
+        //    （守卫与 DELETE 都使用展开后的集合）。
+        patch_channel(
+            AdminAuth,
+            State(state.clone()),
+            Path("ch-1".to_owned()),
+            Json(
+                serde_json::from_value::<ChannelPatch>(
+                    serde_json::json!({"protocols": ["command_code"]}),
+                )
+                .unwrap(),
+            ),
+        )
+        .await
+        .expect("the claude route must not block the channel edit");
+        assert_eq!(
+            bindings(&state).await,
+            [
+                "claude",
+                "command_code",
+                "openai_compatible",
+                "openai_responses"
+            ]
+        );
+        let channel_protocols: Vec<String> =
+            sqlx::query_scalar("SELECT protocol FROM channel_protocols WHERE channel_id='ch-1'")
+                .fetch_all(state.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            channel_protocols,
+            ["command_code"],
+            "probe-level protocols stay as configured"
+        );
+
+        // 2. 未指定协议的手动模型会继承它们。
+        let response = create_manual_model(
+            AdminAuth,
+            State(state.clone()),
+            Path("ch-1".to_owned()),
+            Json(
+                serde_json::from_value::<ManualModelInput>(
+                    serde_json::json!({"model_id": "manual-1"}),
+                )
+                .unwrap(),
+            ),
+        )
+        .await
+        .expect("manual model creation must succeed");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let mut manual: Vec<String> = sqlx::query_scalar(
+            "SELECT cmp.protocol FROM channel_model_protocols cmp \
+             JOIN channel_models cm ON cm.id = cmp.channel_model_id WHERE cm.model_id='manual-1'",
+        )
+        .fetch_all(state.db.pool())
+        .await
+        .unwrap();
+        manual.sort();
+        assert_eq!(
+            manual,
+            [
+                "claude",
+                "command_code",
+                "openai_compatible",
+                "openai_responses"
+            ]
+        );
+
+        // 3. 把模型协议收窄为 `command_code` 时，保留活跃 claude 路由
+        //    所需的条目绑定。
+        patch_channel_model(
+            AdminAuth,
+            State(state.clone()),
+            Path("cm-1".to_owned()),
+            Json(
+                serde_json::from_value::<ModelPatch>(
+                    serde_json::json!({"protocols": ["command_code"]}),
+                )
+                .unwrap(),
+            ),
+        )
+        .await
+        .expect("the claude route must not block the model edit");
+        assert_eq!(
+            bindings(&state).await,
+            [
+                "claude",
+                "command_code",
+                "openai_compatible",
+                "openai_responses"
+            ]
+        );
+    }
+
+    /// 渠道表单的 API key 与其他字段在同一事务中提交 ——
+    /// key 被拒绝时整个补丁回滚。
     #[tokio::test]
     async fn channel_patch_with_api_key_is_atomic() {
         let (state, _dir) = test_state().await;
@@ -2051,7 +2203,7 @@ mod tests {
             .execute(state.db.pool())
             .await
             .unwrap();
-        // 1. name + api_key in one PATCH: both commit together.
+        // 1. 一次 PATCH 同时带 name + api_key：两者一起提交。
         let response = patch_channel(
             AdminAuth,
             State(state.clone()),
@@ -2085,7 +2237,7 @@ mod tests {
             "new-key-123",
             "the stored key must decrypt to the submitted one"
         );
-        // 2. A rejected key (empty) rolls the WHOLE patch back.
+        // 2. key 被拒绝（空）时整个补丁回滚。
         let error = patch_channel(
             AdminAuth,
             State(state.clone()),
@@ -2111,13 +2263,12 @@ mod tests {
         );
     }
 
-    /// P1-5: preset refresh queues REAL discovery runs for eligible enabled
-    /// channels and returns their IDs; with no eligible channel it fails
-    /// clearly instead of faking "queued".
+    /// 预设刷新为符合条件的启用渠道排队真实的 discovery 运行并返回其 ID；
+    /// 没有符合条件渠道时明确失败，而不是伪报“已排队”。
     #[tokio::test]
     async fn preset_refresh_queues_real_discovery_runs() {
         let (state, _dir) = test_state().await;
-        // No channels yet: a clear conflict, never a fake 202.
+        // 尚无渠道：明确的冲突，绝不是伪造的 202。
         let error = refresh_claude_presets(AdminAuth, State(state.clone()))
             .await
             .expect_err("no eligible channel must fail clearly");
@@ -2156,13 +2307,13 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(runs, 1, "a real discovery run row must exist");
-        // Codex refresh must NOT queue the claude-only channel.
+        // Codex 刷新不得为仅支持 claude 的渠道排队。
         let error = refresh_codex_presets(AdminAuth, State(state.clone()))
             .await
             .expect_err("a claude-only channel cannot feed Codex presets");
         assert_eq!(error.status, StatusCode::CONFLICT);
-        // The queued discovery task eventually fails against port 1; wait
-        // for it to finish so it cannot outlive the test supervisor.
+        // 排队的 discovery 任务最终会因端口 1 失败；等它结束，
+        // 以免其存活时间超过测试监管进程。
         let run_id = run_ids[0].as_str().unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -2184,8 +2335,8 @@ mod tests {
         }
     }
 
-    /// P1-5: GET presets aggregates live channel models with the built-in
-    /// defaults, deduplicates, and keeps protocol families apart.
+    /// GET presets 把实时渠道模型与内置默认值聚合，去重，
+    /// 并把不同协议族分开。
     #[tokio::test]
     async fn presets_aggregate_live_channel_models_with_defaults() {
         let (state, _dir) = test_state().await;
@@ -2216,7 +2367,7 @@ mod tests {
             .execute(state.db.pool())
             .await
             .unwrap();
-        // The same model twice through two rows: dedup must yield one entry.
+        // 同一模型经两行出现两次：去重后只能产生一个条目。
         sqlx::query("INSERT INTO channel_model_protocols(channel_model_id,protocol) VALUES('cm-1','claude')")
             .execute(state.db.pool())
             .await
@@ -2229,7 +2380,7 @@ mod tests {
             .execute(state.db.pool())
             .await
             .unwrap();
-        // An unavailable model is not a preset.
+        // 不可用的模型不是预设。
         sqlx::query("INSERT INTO channel_models(id,channel_id,model_id,display_name,source,available,first_seen_at,created_at,updated_at) VALUES('cm-3','ch-1','unavailable-model',NULL,1,0,?,?,?)")
             .bind(time)
             .bind(time)
@@ -2291,8 +2442,8 @@ mod tests {
         assert!(ids.contains(&"channel-model-x".into()), "responses-capable models feed codex presets");
         assert!(!ids.contains(&"claude-opus-5".into()), "claude defaults do not leak into codex presets");
     }
-    /// `GET /command-code/status` surfaces the switch, the verified protocol
-    /// baseline and version drift; it must not leak any credential material.
+    /// `GET /command-code/status` 透出开关、已验证的协议基线和版本漂移；
+    /// 它不得泄露任何凭据材料。
     #[tokio::test]
     async fn command_code_status_reports_switch_baseline_and_drift() {
         let (state, _dir) = test_state().await;
@@ -2322,8 +2473,7 @@ mod tests {
         );
         assert!(!body.to_string().contains("api_key"));
 
-        // A probed CLI version that differs from the fixture baseline is
-        // reported as drift.
+        // 探测到的 CLI 版本与夹具基线不同时报告为漂移。
         sqlx::query(
             "INSERT INTO settings(key,value_json,updated_at) VALUES('command_code_cli_version','\"1.99.0\"',?)",
         )
@@ -2345,8 +2495,8 @@ mod tests {
         assert_eq!(body.get("drift").and_then(Value::as_bool), Some(true));
     }
 
-    /// The static preset catalog leads with the Command Code Go preset and
-    /// carries the mandatory risk warning the UI must confirm.
+    /// 静态预设目录以 Command Code Go 预设打头，
+    /// 并携带 UI 必须确认的强制风险警告。
     #[tokio::test]
     async fn provider_presets_lead_with_command_code_go() {
         let response = list_provider_presets(AdminAuth).await.unwrap();
@@ -2381,7 +2531,7 @@ mod tests {
             .expect("preset warning");
         assert!(warning.contains("403 upgrade_required"));
         assert!(warning.contains("账号封禁"));
-        // Generic presets must not carry a warning or a kind.
+        // 通用预设不得带警告或 kind。
         assert!(items[1..].iter().all(|item| item.get("warning").is_none_or(Value::is_null)));
     }
 
@@ -2450,7 +2600,7 @@ mod tests {
             "the Studio key lands encrypted in the channel row"
         );
 
-        // Single use: replaying the same login_id is rejected and creates nothing.
+        // 单次有效：重放同一 login_id 会被拒绝且不创建任何东西。
         let error = create_channel(
             AdminAuth,
             State(state.clone()),
@@ -2465,7 +2615,7 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1, "no second channel may be created");
 
-        // Unknown handle is rejected too.
+        // 未知句柄同样被拒绝。
         let error = create_channel(
             AdminAuth,
             State(state.clone()),

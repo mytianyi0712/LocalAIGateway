@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# 在 Linux/WSL 上经 Wine 交叉构建 Windows NSIS 安装包：安装 x86_64-pc-windows-gnu 目标、
+# 下载 NSIS、生成 makensis 包装脚本，最后调用 cargo tauri build。
+#
+# 用法：packaging/build-windows-wine.sh（可用 NSIS_VERSION / NSIS_EXE / WINEPREFIX 覆盖默认值）
+# 前提：需 wine、MinGW-w64、rustup、cargo、Tauri CLI、curl、unzip；
+#       产物收集到 target/packages/windows-wine/。
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -86,10 +92,9 @@ PYTHON
   fi
   args+=("$arg")
 done
-# wine cannot open a CWD containing non-ASCII bytes (e.g. a repo path with
-# CJK characters), and refuses to run when the CWD is not writable by the
-# current user (e.g. /tmp owned by root); start it from the user home so the
-# prefix loads and the tools dir is reachable.
+# wine 无法在以非 ASCII 字节构成的路径（例如含中文字符的仓库目录）作为 CWD 时启动，
+# 当前用户不可写的 CWD（例如 root 拥有的 /tmp）同样会被拒绝；因此从用户主目录启动，
+# 保证 prefix 能加载且 tools 目录可达。
 cd "${HOME}"
 exec wine "${NSIS_EXE:?NSIS_EXE is not set}" "${args[@]}"
 WRAPPER
@@ -107,8 +112,8 @@ export CI=true
 
 cd "${TAURI_DIR}"
 cargo clean --release --target "${TARGET}" --package local-ai-gateway
-# Tauri does not remove previously built installers; stale-version NSIS
-# bundles would otherwise be copied into releases/ alongside the new one.
+# Tauri 不会删除上一次构建的安装包；否则旧版本的 NSIS 产物会和新产物
+# 一起被复制进 releases/。
 rm -rf "${TARGET_DIR}/${TARGET}/release/bundle/nsis"
 cargo tauri build --target "${TARGET}" --bundles nsis
 

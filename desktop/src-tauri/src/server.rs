@@ -1,3 +1,9 @@
+//! 组合根：装配 Database/SecretStore/Telemetry/supervisor 与各业务服务，
+//! 并把 axum router 组装好、绑定监听地址并 serve。
+//!
+//! 边界：只负责装配与启动，不实现任何业务逻辑。
+//! 不变量：一个 supervisor 同时拥有 serve 与全部后台任务；关停只经一次有界排空，
+//! 绝不把任务 detach 出去（重启换端口时旧 supervisor 必须被回收）。
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
@@ -10,22 +16,24 @@ use tower_http::trace::TraceLayer;
 
 use crate::{
     application::Context,
+    state::AppState,
     assets,
     config::AppConfig,
     crypto::SecretStore,
     db::Database,
+    domain::Event,
     infrastructure::{HttpClientPool, RuntimeSupervisor},
-    telemetry::{Event, Telemetry},
+    telemetry::Telemetry,
 };
 
-/// Assembled gateway: state + router + supervisor, plus the telemetry event
-/// channel so the caller can spawn (and later join) all background tasks.
+/// 装配完成的网关：state + router + supervisor，外加遥测事件通道，
+/// 供调用方 spawn（并在之后 join）全部后台任务。
 pub struct GatewayRuntime {
-    pub state: Context,
+    pub state: AppState,
     pub router: Router,
     pub telemetry_rx: mpsc::Receiver<Event>,
-    /// Owns serve + every background task; call [`RuntimeSupervisor::shutdown`]
-    /// to stop the runtime with one bounded, joinable drain.
+    /// 拥有 serve 与全部后台任务；调用 [`RuntimeSupervisor::shutdown`]
+    /// 即可用一次有界、可 join 的排空停止整个运行时。
     pub supervisor: Arc<RuntimeSupervisor>,
 }
 
@@ -50,22 +58,30 @@ pub async fn build(config: AppConfig) -> Result<GatewayRuntime> {
         supervisor.clone(),
         Arc::clone(&limits),
     );
-    let proxy = crate::proxy::ProxyService::new(
-        db.clone(),
-        secrets.clone(),
-        Arc::clone(&http),
-        routes.clone(),
-        telemetry.clone(),
-        Arc::clone(&clock),
-        Arc::clone(&limits),
-        crate::notification::DesktopNotifier::new(
-            crate::notification::DEFAULT_FLUSH_WINDOW,
-        ),
-    );
-    let admin = crate::admin::AdminService::new(db.clone(), secrets.clone());
-    let notifier = crate::notification::DesktopNotifier::new(
+    // 只构造一个 notifier：worker 注册进 supervisor，proxy 与 Context
+    // 看到的是同一实例，不再多出一个没人等待的后台任务。
+    let notifier = crate::notification::DesktopNotifier::registered(
         crate::notification::DEFAULT_FLUSH_WINDOW,
-    );
+        &supervisor,
+    )
+    .await?;
+    let notifier_dyn: Arc<dyn crate::ports::Notifier> = notifier.clone();
+    let settings_reader: Arc<dyn crate::ports::SettingsReader> =
+        crate::infrastructure::SettingsStore::new(db.clone(), secrets.clone());
+    let command_code_state: Arc<dyn crate::ports::CommandCodeState> =
+        crate::infrastructure::CommandCodeStore::new(db.clone(), Arc::clone(&http));
+    let proxy = crate::proxy::ProxyService::new(crate::proxy::ProxyServiceDeps {
+        settings: Arc::clone(&settings_reader),
+        command_code: Arc::clone(&command_code_state),
+        secrets: secrets.clone(),
+        http: Arc::clone(&http),
+        routes: routes.clone(),
+        telemetry: telemetry.clone(),
+        clock: Arc::clone(&clock),
+        limits: Arc::clone(&limits),
+        notifier: notifier_dyn,
+    });
+    let admin = crate::admin::AdminService::new(db.clone(), secrets.clone(), Arc::clone(&channels_dyn));
     let balance = crate::balance::BalanceService::new(
         db.clone(),
         secrets.clone(),
@@ -75,7 +91,8 @@ pub async fn build(config: AppConfig) -> Result<GatewayRuntime> {
         Arc::clone(&limits),
     );
     let command_code_login = crate::commandcode_login::CommandCodeLogin::new(std::sync::Arc::clone(&http));
-    let state = Context {
+    // 先构造只含端口与值的 `Context`，再组装 `AppState`（服务在其上）。
+    let ctx = Context {
         config: Arc::new(config),
         db,
         secrets,
@@ -84,13 +101,16 @@ pub async fn build(config: AppConfig) -> Result<GatewayRuntime> {
         channels,
         clock,
         notifier,
-        discovery,
-        proxy,
-        admin,
-        balance,
         telemetry,
         background: supervisor.clone(),
         limits,
+    };
+    let state = crate::state::AppState {
+        ctx,
+        proxy,
+        admin,
+        balance,
+        discovery,
         command_code_login,
         recovery: crate::auth::RecoverySession::new(),
     };
@@ -158,20 +178,19 @@ pub async fn build(config: AppConfig) -> Result<GatewayRuntime> {
     })
 }
 
-/// Registers every long-lived background task (one-shot task reaper, health
-/// supervisor, maintenance supervisor, telemetry writer) on the supervisor.
-/// Each entry is the task body itself — no inner `tokio::spawn` layer, so
-/// the supervisor's `JoinSet` owns the real tasks and a deadline abort can
-/// never detach them (P1-1). The caller owns the supervisor and stops
-/// everything with one [`RuntimeSupervisor::shutdown`] call.
+/// 把所有长驻后台任务（一次性任务回收器、健康 supervisor、维护 supervisor、
+/// 遥测写入器）注册到 supervisor。每个条目本身就是任务体——不再套一层
+/// `tokio::spawn`，因此 supervisor 的 `JoinSet` 直接持有真实任务，到期 abort
+/// 绝不会把它们 detach 掉。调用方持有 supervisor，用一次
+/// [`RuntimeSupervisor::shutdown`] 即可停止全部任务。
 pub async fn spawn_background(
     supervisor: &Arc<RuntimeSupervisor>,
-    state: Context,
+    state: AppState,
     telemetry_rx: mpsc::Receiver<Event>,
     limits: &crate::runtime::RuntimeLimits,
 ) {
-    // Composition time: the supervisor cannot be shutting down, so a
-    // rejection here is a programming error, not a runtime condition.
+    // 组装期（启动）：supervisor 不可能已进入关停流程，因此注册被拒属于编程
+    // 错误；启动期失败就快速退出是预期行为，故此处保留 `expect`。
     let supervisor = Arc::clone(supervisor);
     supervisor
         .spawn(supervisor.clone().reap_loop(limits.reaper_interval))
@@ -189,9 +208,8 @@ pub async fn spawn_background(
         .spawn(crate::maintenance::run_supervisor(maintenance_state, maintenance_cancel))
         .await
         .expect("background registration at startup must be accepted");
-    // Only db + the dropped counter are cloned in: the writer task must
-    // NEVER hold a telemetry sender — it would keep its own receive channel
-    // open and the shutdown drain would wait on itself (P1-3).
+    // 这里只 clone 进 db 与被丢弃计数器：写入任务绝不能持有遥测 sender——
+    // 否则它会把自己的接收端一直保持打开，关停排空就会等待自己。
     let writer_db = state.db.clone();
     let writer_dropped = state.telemetry.dropped_handle();
     let writer_cancel = supervisor.cancel.clone();
@@ -213,8 +231,8 @@ pub async fn bind(config: &AppConfig) -> Result<TcpListener> {
 }
 
 pub async fn serve(listener: TcpListener, router: Router, cancel: CancellationToken) -> Result<()> {
-    // ConnectInfo is required by the RecoveryAuth extractor (P1-7): the
-    // loopback check for the key-recovery endpoints needs the peer address.
+    // RecoveryAuth 提取器要求 `ConnectInfo`：密钥恢复端点的回环地址检查
+    // 需要拿到对端地址。
     axum::serve(
         listener,
         router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -233,8 +251,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
 
-    /// P1-3: once shutdown starts no new task may register, and a task that
-    /// only exits on cancellation is still joined within the deadline.
+    /// 关停一开始就不得再注册新任务，且只靠取消退出的任务仍须在期限内被 join。
     #[tokio::test]
     async fn shutdown_rejects_registrations_and_joins_everything() {
         let supervisor = RuntimeSupervisor::new(CancellationToken::new());
@@ -246,8 +263,8 @@ mod tests {
             .await
             .unwrap();
         supervisor.spawn(async {}).await.unwrap();
-        // Registration racing shutdown: every outcome is safe — registered
-        // (then joined/aborted) or rejected — never an orphaned task.
+        // 注册与关停竞争：任何结果都安全——要么注册成功（随后被 join/abort），
+        // 要么被拒——绝不会残留孤立任务。
         let racer = supervisor.clone();
         let spawner = tokio::spawn(async move {
             for _ in 0..50 {
@@ -267,14 +284,11 @@ mod tests {
         );
     }
 
-    /// P1-1: a task that ignores cancellation and never ends is aborted
-    /// when the deadline expires, and its drop guards still run — the drain
-    /// returns with zero live tasks and released resources, not detached
-    /// survivors.
+    /// 忽略取消、永不结束的任务会在期限到达时被 abort，且其 Drop 守卫仍会执行——
+    /// 排空返回时存活任务为零、资源已释放，而不是留下 detach 的幸存者。
     #[tokio::test]
     async fn deadline_abort_runs_drop_guards_and_leaves_zero_tasks() {
-        /// Drop guard for a never-ending task; proving it runs proves the
-        /// task future was dropped (not detached).
+        /// 永不结束任务的 Drop 守卫；它能执行即证明该任务 future 被 drop（而非 detach）。
         struct Guard(Arc<std::sync::atomic::AtomicU64>);
         impl Drop for Guard {
             fn drop(&mut self) {
@@ -287,15 +301,14 @@ mod tests {
         supervisor
             .spawn(async move {
                 let _guard = Guard(dropped_probe);
-                // Never observes cancellation; only an abort can stop it.
+                // 永不观察取消信号；只有 abort 能停止它。
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
                 }
             })
             .await
             .unwrap();
-        // A second never-ending task, so the abort path must drain more
-        // than one entry.
+        // 第二个永不结束的任务，好让 abort 路径必须排空不止一个条目。
         supervisor
             .spawn(async {
                 loop {
@@ -317,8 +330,8 @@ mod tests {
         );
     }
 
-    /// P1-3: repeated start/stop cycles leave nothing running — each
-    /// shutdown returns only after every registered task has finished.
+    /// 反复 start/stop 不留任何运行中的东西——每次 shutdown 只有在
+    /// 所有已注册任务都结束后才返回。
     #[tokio::test]
     async fn ten_restart_cycles_drain_completely() {
         for cycle in 0..10 {
@@ -327,8 +340,8 @@ mod tests {
             let task_cancel = cancel.clone();
             supervisor
                 .spawn(async move {
-                    // Simulates a health/telemetry-style task that runs
-                    // until cancelled, with some async churn in between.
+                    // 模拟健康/遥测类任务：一直运行到被取消，
+                    // 中间夹杂一些异步切换。
                     while !task_cancel.is_cancelled() {
                         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                         tokio::task::yield_now().await;

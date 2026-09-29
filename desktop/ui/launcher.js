@@ -1,3 +1,12 @@
+/**
+ * 桌面启动器窗口脚本：端口设置、开关项与一键打开管理端。
+ *
+ * 职责：渲染端口与「开机自启 / 启动到托盘」等开关，提交时经 Tauri
+ * `invoke` 调用后端命令。
+ * 边界：只做界面与命令调用；运行状态以后端返回为准，不在前端持久化。
+ * 关键不变量：刷新与初始化失败只记录到 console，绝不向外抛出；定时刷新
+ * 句柄在 `beforeunload` 时清理。
+ */
 const invoke = window.__TAURI_INTERNALS__.invoke;
 
 const elements = {
@@ -32,7 +41,12 @@ function render(state) {
 }
 
 async function refresh() {
-  render(await invoke('launcher_state'));
+  // 刷新失败只记录到 console，不得向外抛出，避免定时刷新把整个模块带崩。
+  try {
+    render(await invoke('launcher_state'));
+  } catch (error) {
+    console.error('launcher refresh failed:', error);
+  }
 }
 
 async function withBusy(button, task) {
@@ -77,7 +91,7 @@ async function toggleSetting(invokeName, checkbox) {
   checkbox.disabled = true;
   try {
     await invoke(invokeName, { enabled: checkbox.checked });
-    // The backend is the source of truth (OS autostart state, persisted config).
+    // 以后端为准（操作系统的自启动状态与持久化配置）。
     await refreshSettings();
     elements.settingsHint.hidden = true;
   } catch (error) {
@@ -96,6 +110,17 @@ elements.startToTray.addEventListener('change', () =>
   toggleSetting('set_start_to_tray', elements.startToTray),
 );
 
-await refreshSettings();
-await refresh();
-setInterval(refresh, 1500);
+// 顶层初始化：任何失败只记录到 console，绝不让整个模块因异常而白屏。
+try {
+  await refreshSettings();
+  await refresh();
+} catch (error) {
+  console.error('launcher init failed:', error);
+}
+
+// 定时刷新：窗口不可见时跳过；句柄在 beforeunload 时清理。
+const refreshTimer = setInterval(() => {
+  if (document.hidden) return;
+  refresh();
+}, 1500);
+window.addEventListener('beforeunload', () => clearInterval(refreshTimer));

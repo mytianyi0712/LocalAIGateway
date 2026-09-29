@@ -1,9 +1,8 @@
-//! Model capability detection — port of backend/app/services/capabilities.py.
+//! 模型能力（capability）检测。
 //!
-//! Capabilities are inferred from the metadata captured during model
-//! discovery (per-protocol dicts inside `channel_models.metadata_json`) and
-//! aggregated across every live candidate of a route. `source = "auto"` rows
-//! are re-detected on read; `source = "manual"` rows store explicit values.
+//! 能力从模型发现阶段捕获的元数据推断（`channel_models.metadata_json` 内
+//! 按协议分组的字典），并跨某条路由的全部存活候选项聚合；`source = "auto"`
+//! 的行在读取时重新检测，`source = "manual"` 的行保存显式取值。
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -185,8 +184,8 @@ fn cost_value(value: &Value, paths: &[&[&str]]) -> Option<f64> {
     None
 }
 
-/// Extract capability fields from a discovery metadata dict (or a per-protocol
-/// metadata sub-dict). Only keys with a detected value are present.
+/// 从发现元数据字典（或按协议分组的子字典）中提取能力字段。
+/// 只有检测到取值的键才会出现在返回值中。
 pub fn extract_capabilities(metadata: &Value) -> Value {
     if !metadata.is_object() {
         return json!({});
@@ -336,7 +335,7 @@ fn merge_values(values: &[Value]) -> Option<Value> {
         .iter()
         .all(|value| value.is_number() && !value.is_boolean())
     {
-        // Preserve integers (Python `min(known)` keeps the numeric type).
+        // 保留整数：全为整数时取最小值并保持整数类型（不转成浮点）。
         if known.iter().all(|value| value.as_i64().is_some()) {
             let minimum = known
                 .iter()
@@ -381,8 +380,8 @@ fn merge_thinking_level_maps(values: &[Value]) -> Option<Value> {
     }
 }
 
-/// Aggregate a list of extracted capability dicts: numerics take the minimum,
-/// booleans are AND-ed, thinking maps are merged level-by-level.
+/// 聚合一组已提取的能力字典：数值取最小值，布尔取逻辑与，
+/// thinking 映射按层级逐级合并。
 pub fn aggregate_capabilities(items: &[Value]) -> Value {
     let mut result = serde_json::Map::new();
     for key in CAPABILITY_FIELDS {
@@ -411,9 +410,8 @@ pub fn aggregate_capabilities(items: &[Value]) -> Value {
     Value::Object(result)
 }
 
-/// Recompute the capabilities of a route's model from its live candidates'
-/// discovery metadata — mirror of services/capabilities.py
-/// `detect_model_capabilities`. Never touches the network.
+/// 依据路由各存活候选项的发现元数据重新计算该路由模型的能力。
+/// 纯本地计算，绝不访问网络。
 pub async fn detect_model_capabilities(state: &Context, requested_model_id: &str) -> Result<Value> {
     let rows = sqlx::query(
         "SELECT cm.metadata_json, cmp.protocol FROM channel_models cm \
@@ -437,8 +435,8 @@ pub async fn detect_model_capabilities(state: &Context, requested_model_id: &str
         if !metadata.is_object() {
             continue;
         }
-        // INNER JOIN guarantees a protocol binding (P2-2); candidates without
-        // one are excluded instead of leaking whole-metadata fallbacks.
+        // INNER JOIN 保证候选项有协议绑定；无绑定的候选项被直接排除，
+        // 不会退化成用整份元数据兜底。
         let protocol: String = row.try_get("protocol")?;
         let mut extracted: Vec<Value> = Vec::new();
         if let Some(per_protocol) = metadata.get(&protocol)
@@ -479,9 +477,8 @@ pub fn has_capability_data(capabilities: &Value) -> bool {
     false
 }
 
-/// The full capability object served by the admin API and embedded in the
-/// model catalog — mirror of services/capabilities.py `get_model_caps` +
-/// `caps_json`. `source = "auto"` (or a missing row) re-detects on read.
+/// 管理端 API 返回、并嵌入模型目录的完整能力对象。
+/// `source = "auto"`（或缺少记录）时在读取时重新检测。
 pub async fn get_model_caps(state: &Context, model_id: &str) -> Result<Value> {
     let row = sqlx::query(
         "SELECT source, profile_id, context_window, max_tokens, supports_image_input, \
@@ -627,7 +624,7 @@ fn caps_json(
     })
 }
 
-/// Capability summary embedded in `x_local_gateway.pi_model_config`.
+/// 嵌入 `x_local_gateway.pi_model_config` 的能力摘要。
 pub fn pi_model_config(capabilities: &Value) -> Value {
     let mut input = vec!["text"];
     if capabilities
@@ -659,8 +656,7 @@ pub fn pi_model_config(capabilities: &Value) -> Value {
     config
 }
 
-/// The `x_local_gateway` metadata for a catalog item — mirror of
-/// `gateway_metadata` in api/proxy.py (capabilities/pi_model_config part).
+/// 目录条目的 `x_local_gateway` 元数据（仅 capabilities/pi_model_config 部分）。
 pub fn gateway_metadata(item: &Value) -> Value {
     let mut metadata = json!({});
     let capabilities = item
@@ -677,83 +673,20 @@ pub fn gateway_metadata(item: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{application::Context, config::AppConfig, db::Database};
-    use std::sync::Arc;
+    use crate::state::AppState;
+    use crate::test_support::TempDir;
 
-    async fn test_state() -> (Context, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("lagw-caps-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let db = Database::open(&dir.join("test.db")).await.unwrap();
-        let secrets = crate::crypto::SecretStore::load(&dir.join("master.key"))
-            .await
-            .unwrap();
-        let (telemetry, _rx) = crate::telemetry::Telemetry::new(1000);
-        let http: Arc<dyn crate::ports::UpstreamClient> =
-            Arc::new(crate::infrastructure::HttpClientPool::default());
-        let routes: Arc<dyn crate::ports::RouteRepository> =
-            crate::infrastructure::SqliteRouteRepository::new(db.clone());
-        let channels: Arc<dyn crate::ports::ChannelRepository> =
-            crate::infrastructure::SqliteChannelRepository::new(db.clone());
-        let clock: Arc<dyn crate::ports::Clock> = Arc::new(crate::infrastructure::SystemClock);
-        let background = crate::infrastructure::RuntimeSupervisor::new(
-            tokio_util::sync::CancellationToken::new(),
-        );
-        let limits = Arc::new(crate::runtime::RuntimeLimits::default());
-        let discovery = crate::discovery::DiscoveryService::new(
-            db.clone(),
-            secrets.clone(),
-            Arc::clone(&http),
-            Arc::clone(&channels),
-            Arc::clone(&clock),
-            Arc::clone(&background),
-            Arc::clone(&limits),
-        );
-        let notifier: std::sync::Arc<dyn crate::ports::Notifier> =
-            crate::notification::DesktopNotifier::new(std::time::Duration::from_millis(50));
-        let proxy = crate::proxy::ProxyService::new(
-            db.clone(),
-            secrets.clone(),
-            Arc::clone(&http),
-            routes.clone(),
-            telemetry.clone(),
-            Arc::clone(&clock),
-            Arc::clone(&limits),
-            crate::notification::DesktopNotifier::new(std::time::Duration::from_millis(50)),
-        );
-        let balance = crate::balance::BalanceService::new(
-            db.clone(),
-            secrets.clone(),
-            Arc::clone(&http),
-            channels.clone(),
-            Arc::clone(&clock),
-            Arc::clone(&limits),
-        );
-        let command_code_login = crate::commandcode_login::CommandCodeLogin::new(std::sync::Arc::clone(&http));
-        let state = crate::application::Context {
-            config: Arc::new(AppConfig::default()),
-            db: db.clone(),
-            secrets: secrets.clone(),
-            http,
-            routes,
-            channels,
-            clock,
-            notifier,
-            discovery,
-            proxy,
-            telemetry,
-            background,
-            limits,
-            balance,
-            admin: crate::admin::AdminService::new(db.clone(), secrets.clone()),
-            command_code_login,
-            recovery: crate::auth::RecoverySession::new(),
-        };
+    async fn test_state() -> (AppState, TempDir) {
+        // 统一夹具：临时目录 + 整套 Context（见 `crate::test_support`）。
+        let crate::test_support::TestEnv {
+            dir,
+            context: state,
+        } = crate::test_support::context("caps").await;
         (state, dir)
     }
 
-    /// P2-5: capability detection must only aggregate metadata of the route's
-    /// own protocol. The claude metadata carries a *smaller* context window so
-    /// the pre-fix min-aggregation across protocols would pick it up.
+    /// 能力检测只能聚合路由自身协议的元数据：claude 元数据携带*更小*的
+    /// 上下文窗口，若跨协议取最小值就会错误地把它采纳。
     #[tokio::test]
     async fn detection_uses_route_protocol_metadata_only() {
         let (state, _dir) = test_state().await;
@@ -804,9 +737,8 @@ mod tests {
         );
     }
 
-    /// P2-2: a candidate without a `channel_model_protocols` binding is
-    /// excluded from capability detection entirely — pre-fix the LEFT JOIN
-    /// produced a NULL protocol that fell back to the whole metadata dict.
+    /// 没有 `channel_model_protocols` 绑定的候选项被完全排除在能力检测之外：
+    /// 早先的 LEFT JOIN 会产生 NULL 协议，从而退化成用整份元数据兜底。
     #[tokio::test]
     async fn candidate_without_protocol_binding_is_excluded() {
         let (state, _dir) = test_state().await;
@@ -823,7 +755,7 @@ mod tests {
             .execute(state.db.pool())
             .await
             .unwrap();
-        // No channel_model_protocols row at all.
+        // 完全没有 channel_model_protocols 记录。
         sqlx::query("INSERT INTO channel_models(id,channel_id,model_id,display_name,source,available,metadata_json,first_seen_at,created_at,updated_at) VALUES('cm-1','ch-1','test-model','Test','discovered',1,?,?,?,?)")
             .bind(r#"{"openai_compatible":{"context_window":128000}}"#)
             .bind(time)

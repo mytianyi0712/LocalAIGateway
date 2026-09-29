@@ -1,20 +1,12 @@
-//! Channel balance / usage query sidecar.
+//! 渠道余额 / 用量查询旁路。
 //!
-//! Balance is an opt-in, per-channel sidecar: a channel without a row in
-//! `channel_balance_configs` never produces an upstream balance request.
-//! Users pick one of five adapters and enable the switch; after that the
-//! maintenance supervisor refreshes enabled channels hourly and the admin
-//! API can query one channel manually.
-//!
-//! Hard boundaries (mirrors health probing):
-//! 1. A balance query is a sidecar — any failure must never touch the proxy
-//!    path;
-//! 2. failures only write a snapshot (`status=error` + stable `error_kind`)
-//!    and never escape the admin API as a 5xx for upstream problems;
-//! 3. snapshots never store the raw response body or any token; tokens only
-//!    live encrypted;
-//! 4. no network call happens inside a transaction: prepare, exchange, then
-//!    one write.
+//! 余额是可选启用的逐渠道旁路：`channel_balance_configs` 无记录的渠道不发任何
+//! 上游余额请求；用户从内置适配器（当前 14 种，另有 `custom` 模板）中选一种并
+//! 开启后，maintenance supervisor 默认每小时刷新已启用渠道；Command Code 集成
+//! 启用时按 `command_code_quota_interval_minutes`（默认 15 分钟）缩短。
+//! 管理 API 也可手动查询单个渠道。
+//! 边界与不变量：查询是旁路、失败绝不触碰代理主路径，只写 `status=error` +
+//! 稳定 `error_kind` 的快照；快照不存原始响应体与 token；事务内不发网络请求。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -38,25 +30,42 @@ use crate::{
     runtime::RuntimeLimits,
 };
 
-/// New API stores quota at 500,000 units per USD.
+/// New API 的额度以每 USD 500,000 单位计。
 pub const NEW_API_QUOTA_PER_USD: f64 = 500_000.0;
 
-/// New API account-balance endpoint, reachable with a dashboard Personal
-/// Access Token (the channel's sk- key only exposes token-scoped usage).
+/// New API 账户余额端点，需仪表盘 Personal Access Token 才能访问
+/// （渠道的 sk- key 只能访问 token 作用域的用量）。
 const NEW_API_ACCOUNT_PATH: &str = "/api/user/self";
 
-/// Balance payloads are tiny; cap the body like the other sidecars do.
+/// 小米 MiMo 控制台（Token Plan 没有 API Key 查询路径，只有账号 Cookie 可用）。
+const MIMO_CONSOLE_URL: &str = "https://platform.xiaomimimo.com";
+/// 控制台接口前的浏览器 UA；缺省 UA 会被网关拒绝。
+const MIMO_USER_AGENT: &str = "Mozilla/5.0";
+/// OpenRouter 控制面主机（账户余额与 key 额度都在它下面）。
+const OPENROUTER_API_URL: &str = "https://openrouter.ai";
+/// Novita AI 用量/余额主机的固定域名（余额单位是 0.0001 USD）。
+const NOVITA_BALANCE_URL: &str = "https://api.novita.ai/v3/user/balance";
+/// Novita 的 `availableBalance`/`cashBalance` 等字段以 0.0001 USD 计。
+const NOVITA_UNITS_PER_USD: f64 = 10_000.0;
+/// MiniMax Coding Plan 额度接口（官方域名是唯一公开出处）。
+const MINIMAX_REMAINS_URL: &str =
+    "https://api.minimaxi.com/v1/api/openplatform/coding_plan/remains";
+/// Kimi For Coding 额度接口（官方域名是唯一公开出处）。
+const KIMI_USAGES_URL: &str = "https://api.kimi.com/coding/v1/usages";
+
+/// 余额响应很小；像其它旁路一样给响应体设上限。
 const BALANCE_BODY_MAX: usize = 256 * 1024;
-/// Custom request template bounds (validated on save).
+/// 自定义请求模板的上限（保存时校验）。
 const MAX_CUSTOM_HEADERS: usize = 8;
 const MAX_CUSTOM_BODY_BYTES: usize = 16 * 1024;
 const MAX_CUSTOM_PATH_CHARS: usize = 1024;
 const MAX_MAPPING_CHARS: usize = 256;
-/// Background and batch refresh concurrency cap.
+/// 后台刷新与批量刷新的并发上限。
 const REFRESH_CONCURRENCY: usize = 4;
 
-/// Stable upstream failure classifications (stored in
-/// `channel_balance_snapshots.error_kind`).
+/// 稳定的失败分类（存入 `channel_balance_snapshots.error_kind`）。
+/// 除 [`DISABLED`] 外均为上游/传输失败分类；`DISABLED` 是本地闸门，
+/// 表示 Command Code 集成被全局关闭、根本没有发起上游请求。
 pub mod error_kind {
     pub const HTTP_401: &str = "http_401";
     pub const HTTP_403: &str = "http_403";
@@ -66,17 +75,17 @@ pub mod error_kind {
     pub const TIMEOUT: &str = "timeout";
     pub const INVALID_PAYLOAD: &str = "invalid_payload";
     pub const CUSTOM_PATH_MISSING: &str = "custom_path_missing";
-    /// Command Code integration is globally disabled (`command_code_enabled`).
+    /// Command Code 集成被全局关闭（`command_code_enabled`），未发起任何上游请求。
     pub const DISABLED: &str = "disabled";
 }
 
-/// Stable service-level failures for admin handlers.
+/// 管理 handler 用的稳定服务级失败。
 #[derive(Debug)]
 pub enum BalanceError {
-    /// Manual query on a channel without a saved adapter (default-off).
+    /// 对未保存适配器的渠道手动查询（默认关闭）。
     NotConfigured,
     ChannelNotFound,
-    /// Invalid user input (422).
+    /// 用户输入非法（422）。
     Invalid(String),
     Internal(anyhow::Error),
 }
@@ -130,7 +139,7 @@ impl From<BalanceError> for ApiError {
     }
 }
 
-/// The five supported adapters. Serialized names are the persisted values.
+/// 支持的适配器。序列化名即持久化值。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BalanceAdapter {
     #[serde(rename = "newapi")]
@@ -141,10 +150,39 @@ pub enum BalanceAdapter {
     OpencodeGo,
     #[serde(rename = "deepseek")]
     DeepSeek,
-    /// Command Code Go: `whoami` → `billing/credits` → `usage/summary`
-    /// (three read-only GETs, no generation).
+    /// Command Code Go 四步只读查询：`whoami` → `billing/credits` → `usage/summary`
+    /// → `billing/subscriptions`（四个只读 GET，不产生生成请求）。
     #[serde(rename = "command_code")]
     CommandCode,
+    /// 小米 MiMo Token Plan：控制台 Cookie，`tokenPlan/usage` +
+    /// `balance`（可选 `tokenPlan/detail`）。
+    #[serde(rename = "mimo")]
+    Mimo,
+    /// OpenRouter：Management Key 走 `/credits`，普通 key 走 `/key`。
+    #[serde(rename = "openrouter")]
+    OpenRouter,
+    /// SiliconFlow `/v1/user/info`（币种随站点域名而定）。
+    #[serde(rename = "siliconflow")]
+    SiliconFlow,
+    /// StepFun 账户余额（`/v1/accounts`）；Step Plan 的月度额度池没有公开端点。
+    #[serde(rename = "stepfun")]
+    StepFun,
+    /// Novita AI `/v3/user/balance`（单位 0.0001 USD）。
+    #[serde(rename = "novita")]
+    Novita,
+    /// Moonshot Kimi 开放平台 `/v1/users/me/balance`。
+    #[serde(rename = "moonshot")]
+    Moonshot,
+    /// 智谱 GLM Coding Plan 额度窗口（`/api/monitor/usage/quota/limit`，
+    /// 裸 token——智谱不加 `Bearer` 前缀）。
+    #[serde(rename = "zhipu")]
+    ZhipuGlm,
+    /// MiniMax Coding Plan 剩余额度（5h / 每周百分比窗口）。
+    #[serde(rename = "minimax")]
+    MiniMax,
+    /// Kimi For Coding `/coding/v1/usages`（5h / 每周窗口）。
+    #[serde(rename = "kimi_code")]
+    KimiCode,
     #[serde(rename = "custom")]
     Custom,
 }
@@ -157,6 +195,15 @@ impl BalanceAdapter {
             "opencode_go" => Ok(BalanceAdapter::OpencodeGo),
             "deepseek" => Ok(BalanceAdapter::DeepSeek),
             "command_code" => Ok(BalanceAdapter::CommandCode),
+            "mimo" => Ok(BalanceAdapter::Mimo),
+            "openrouter" => Ok(BalanceAdapter::OpenRouter),
+            "siliconflow" => Ok(BalanceAdapter::SiliconFlow),
+            "stepfun" => Ok(BalanceAdapter::StepFun),
+            "novita" => Ok(BalanceAdapter::Novita),
+            "moonshot" => Ok(BalanceAdapter::Moonshot),
+            "zhipu" => Ok(BalanceAdapter::ZhipuGlm),
+            "minimax" => Ok(BalanceAdapter::MiniMax),
+            "kimi_code" => Ok(BalanceAdapter::KimiCode),
             "custom" => Ok(BalanceAdapter::Custom),
             other => Err(BalanceError::Invalid(format!(
                 "不支持的余额适配器：{other}"
@@ -171,31 +218,52 @@ impl BalanceAdapter {
             BalanceAdapter::OpencodeGo => "opencode_go",
             BalanceAdapter::DeepSeek => "deepseek",
             BalanceAdapter::CommandCode => "command_code",
+            BalanceAdapter::Mimo => "mimo",
+            BalanceAdapter::OpenRouter => "openrouter",
+            BalanceAdapter::SiliconFlow => "siliconflow",
+            BalanceAdapter::StepFun => "stepfun",
+            BalanceAdapter::Novita => "novita",
+            BalanceAdapter::Moonshot => "moonshot",
+            BalanceAdapter::ZhipuGlm => "zhipu",
+            BalanceAdapter::MiniMax => "minimax",
+            BalanceAdapter::KimiCode => "kimi_code",
             BalanceAdapter::Custom => "custom",
         }
     }
 
-    /// Preset endpoint stored for every built-in adapter (`custom` has none).
+    /// 每个内置适配器保存的预设端点（`custom` 没有）。
     pub fn default_path(self) -> Option<&'static str> {
         match self {
             BalanceAdapter::NewApi => Some("/api/usage/token/"),
             BalanceAdapter::Sub2Api => Some("/v1/usage"),
             BalanceAdapter::OpencodeGo => Some("v1/usage"),
             BalanceAdapter::DeepSeek => Some("/user/balance"),
-            // Multi-step (whoami → credits → summary); the stored path is
-            // unused for this adapter.
+            // 多步流程（whoami → credits → summary）；对适配器而言存储的 path
+            // 未被使用。
             BalanceAdapter::CommandCode => None,
+            // 多步控制台流程（Cookie + 三个 GET）。
+            BalanceAdapter::Mimo => None,
+            // 多步（`/credits`，回退到 `/key`）。
+            BalanceAdapter::OpenRouter => None,
+            BalanceAdapter::SiliconFlow => Some("/v1/user/info"),
+            BalanceAdapter::StepFun => Some("/v1/accounts"),
+            BalanceAdapter::Novita => Some(NOVITA_BALANCE_URL),
+            BalanceAdapter::Moonshot => Some("/v1/users/me/balance"),
+            BalanceAdapter::ZhipuGlm => Some("/api/monitor/usage/quota/limit"),
+            BalanceAdapter::MiniMax => Some(MINIMAX_REMAINS_URL),
+            BalanceAdapter::KimiCode => Some(KIMI_USAGES_URL),
             BalanceAdapter::Custom => None,
         }
     }
 }
 
-/// Authentication mode for the balance request. Built-in adapters always
-/// use `bearer`; `none` exists for custom endpoints that authenticate by
-/// header template only.
+/// 余额请求的鉴权模式。内置适配器用 `bearer`（智谱控制台用裸 token，不加
+/// 前缀）；`none` 供只用头模板鉴权的自定义端点使用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BalanceAuth {
     Bearer,
+    /// token 原样写入 `Authorization`（不加 `Bearer ` 前缀）。
+    Raw,
     None,
 }
 
@@ -203,6 +271,7 @@ impl BalanceAuth {
     pub fn parse(value: &str) -> Result<Self, BalanceError> {
         match value.trim().to_ascii_lowercase().as_str() {
             "bearer" => Ok(BalanceAuth::Bearer),
+            "raw" => Ok(BalanceAuth::Raw),
             "none" => Ok(BalanceAuth::None),
             other => Err(BalanceError::Invalid(format!("不支持的鉴权方式：{other}"))),
         }
@@ -211,12 +280,13 @@ impl BalanceAuth {
     pub fn as_str(self) -> &'static str {
         match self {
             BalanceAuth::Bearer => "bearer",
+            BalanceAuth::Raw => "raw",
             BalanceAuth::None => "none",
         }
     }
 }
 
-/// One usage window (OpenCode Go rolling / weekly / monthly).
+/// 一个用量窗口（OpenCode Go 的滚动 / 每周 / 每月）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuotaWindow {
     pub label: String,
@@ -225,7 +295,7 @@ pub struct QuotaWindow {
     pub resets_at: Option<String>,
 }
 
-/// Normalized result of one adapter parser.
+/// 单个适配器解析器的归一化结果。
 #[derive(Debug, Clone, Default)]
 pub struct BalanceReading {
     pub remaining: Option<f64>,
@@ -238,7 +308,7 @@ pub struct BalanceReading {
     pub detail: Value,
 }
 
-/// User's balance mapping for the custom adapter.
+/// 用户为 `custom` 适配器配置的余额字段映射。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BalanceMapping {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -253,8 +323,7 @@ pub struct BalanceMapping {
     pub label: Option<String>,
 }
 
-/// Stored configuration. `adapter=None` means the channel has no config row
-/// and must not produce any balance request.
+/// 存储的配置。`adapter=None` 表示渠道没有配置行，不得发出任何余额请求。
 #[derive(Debug, Clone)]
 pub struct BalanceConfig {
     pub adapter: Option<BalanceAdapter>,
@@ -267,7 +336,7 @@ pub struct BalanceConfig {
     pub mapping: BalanceMapping,
     pub has_token: bool,
     pub token_hint: Option<String>,
-    /// Ciphertext is only used by `prepare` and never serialized.
+    /// 密文只被 `prepare` 使用，绝不序列化。
     token_encrypted: Option<Vec<u8>>,
 }
 
@@ -290,7 +359,7 @@ impl Default for BalanceConfig {
 }
 
 impl BalanceConfig {
-    /// Admin JSON view: everything except the token ciphertext.
+    /// 管理端 JSON 视图：除 token 密文外的全部字段。
     pub fn to_json(&self) -> Value {
         let headers: BTreeMap<&str, &str> = self
             .headers
@@ -313,7 +382,7 @@ impl BalanceConfig {
     }
 }
 
-/// JSON path mapping inside [`BalanceConfigInput`].
+/// [`BalanceConfigInput`] 内的 JSON 路径映射。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct BalanceMappingInput {
     #[serde(default)]
@@ -328,7 +397,7 @@ pub struct BalanceMappingInput {
     pub label: Option<String>,
 }
 
-/// Request body for `PUT /channels/{id}/balance-config`.
+/// `PUT /channels/{id}/balance-config` 的请求体。
 #[derive(Debug, Clone, Deserialize)]
 pub struct BalanceConfigInput {
     pub adapter: String,
@@ -346,15 +415,14 @@ pub struct BalanceConfigInput {
     pub body: Option<String>,
     #[serde(default)]
     pub mapping: BalanceMappingInput,
-    /// New dedicated token. An empty/absent string keeps the stored token;
-    /// deletion requires `clear_token: true`.
+    /// 新的专用 token。空/缺省字符串保留原 token；删除需 `clear_token: true`。
     #[serde(default)]
     pub token: Option<String>,
     #[serde(default)]
     pub clear_token: bool,
 }
 
-/// Latest snapshot of one channel.
+/// 某渠道的最新快照。
 #[derive(Debug, Clone, Serialize)]
 pub struct BalanceSnapshot {
     pub channel_id: String,
@@ -374,7 +442,7 @@ pub struct BalanceSnapshot {
     pub checked_at: String,
 }
 
-/// Normalized config handed to persistence after validation.
+/// 校验后交给持久化的归一化配置。
 struct NormalizedConfig {
     adapter: BalanceAdapter,
     enabled: bool,
@@ -386,14 +454,14 @@ struct NormalizedConfig {
     mapping: BalanceMapping,
 }
 
-/// Token mutation requested by one config save.
+/// 一次配置保存请求的 token 变更。
 enum TokenUpdate {
     Keep,
     Set(String),
     Clear,
 }
 
-/// Service dependencies injected from the composition root.
+/// 由组装根注入的服务依赖。
 pub struct BalanceService {
     db: Database,
     secrets: SecretStore,
@@ -422,20 +490,15 @@ impl BalanceService {
         })
     }
 
-    /// Channel existence guard for every public entry point.
+    /// 每个公开入口的渠道存在性守卫。
     async fn ensure_channel(&self, channel_id: &str) -> Result<(), BalanceError> {
-        let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM channels WHERE id=?")
-            .bind(channel_id)
-            .fetch_one(self.db.pool())
-            .await?;
-        if exists == 0 {
+        if !self.channels.exists(channel_id).await? {
             return Err(BalanceError::ChannelNotFound);
         }
         Ok(())
     }
 
-    /// Load the stored config; a missing row yields `adapter=None`
-    /// (default-off, no requests).
+    /// 读取存储的配置；无记录时 `adapter=None`（默认关闭，不发请求）。
     pub async fn config(&self, channel_id: &str) -> Result<BalanceConfig, BalanceError> {
         self.ensure_channel(channel_id).await?;
         Ok(self.load_config(channel_id).await?.unwrap_or_default())
@@ -453,7 +516,7 @@ impl BalanceService {
         row.map(ConfigRow::into_config).transpose()
     }
 
-    /// Read the latest snapshot (if any) for the admin view.
+    /// 读取（若有）最新快照供管理端查看。
     pub async fn snapshot(
         &self,
         channel_id: &str,
@@ -462,7 +525,7 @@ impl BalanceService {
         Ok(load_snapshot(&self.db, channel_id).await?)
     }
 
-    /// Save (upsert) the channel's balance configuration.
+    /// 保存（upsert）渠道的余额配置。
     pub async fn save_config(
         &self,
         channel_id: &str,
@@ -531,7 +594,7 @@ impl BalanceService {
         self.config(channel_id).await
     }
 
-    /// Delete config plus snapshot — the channel returns to default-off.
+    /// 删除配置与快照——渠道回到默认关闭状态。
     pub async fn delete_config(&self, channel_id: &str) -> Result<(), BalanceError> {
         self.ensure_channel(channel_id).await?;
         let mut tx = self.db.pool().begin().await?;
@@ -547,12 +610,11 @@ impl BalanceService {
         Ok(())
     }
 
-    /// Query one channel now.
+    /// 立即查询单个渠道。
     ///
-    /// A saved-but-disabled config is still queried here: the user clicking
-    /// "query now" is explicit intent. Only background/batch refresh filters
-    /// on `enabled=1`. A channel without any config returns
-    /// [`BalanceError::NotConfigured`].
+    /// 已保存但处于禁用状态的配置在这里仍会查询：用户点“立即查询”即为显式
+    /// 意图。只有后台/批量刷新才按 `enabled=1` 过滤。没有任何配置的渠道会得到
+    /// [`BalanceError::NotConfigured`] 错误。
     pub async fn query(
         &self,
         state: &Context,
@@ -569,13 +631,16 @@ impl BalanceService {
         };
         let checked_at = self.clock.now_utc().to_rfc3339();
         let started = Instant::now();
-        let outcome = if adapter == BalanceAdapter::CommandCode {
-            self.command_code_reading(state, &channel, &config).await
-        } else {
-            match self.prepare(state, &channel, &config, adapter).await {
+        let outcome = match adapter {
+            BalanceAdapter::CommandCode => {
+                self.command_code_reading(state, &channel, &config).await
+            }
+            BalanceAdapter::Mimo => self.mimo_reading(state, &channel, &config).await,
+            BalanceAdapter::OpenRouter => self.openrouter_reading(state, &channel, &config).await,
+            _ => match self.prepare(&channel, &config, adapter).await {
                 Ok(prepared) => self.exchange(prepared).await,
                 Err(failure) => Err(failure),
-            }
+            },
         };
         let duration_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
         let snapshot = match outcome {
@@ -601,9 +666,8 @@ impl BalanceService {
         Ok(snapshot)
     }
 
-    /// Manual batch refresh and the hourly maintenance task share this:
-    /// only channels with `enabled=1` are queried, with a concurrency cap.
-    /// Individual failures are silent (their snapshots are still written).
+    /// 手动批量刷新与每小时维护任务共用此方法：只查询 `enabled=1` 的渠道，
+    /// 并受并发上限约束。单个失败静默处理（其快照仍会写入）。
     pub async fn refresh_enabled(
         &self,
         state: &Context,
@@ -629,9 +693,8 @@ impl BalanceService {
             match result {
                 Ok(snapshot) => snapshots.push(snapshot),
                 Err(error) => {
-                    // Deleted/not-configured between listing and query, or a
-                    // local storage failure: never disturb the maintenance
-                    // loop or the batch response with a single bad channel.
+                    // 在列出与查询之间被删除/未配置，或本地存储失败：绝不因
+                    // 单个坏渠道打扰维护循环或批量响应。
                     tracing::debug!(%error, "channel balance refresh skipped");
                 }
             }
@@ -639,7 +702,7 @@ impl BalanceService {
         Ok(snapshots)
     }
 
-    /// Admin view: config (if any) plus the latest snapshot.
+    /// 管理端视图：配置（若有）加最新快照。
     pub async fn balance_json(&self, channel_id: &str) -> Result<Value, BalanceError> {
         self.ensure_channel(channel_id).await?;
         let config = self.load_config(channel_id).await?.unwrap_or_default();
@@ -654,7 +717,7 @@ impl BalanceService {
         Ok(value)
     }
 
-    /// `POST /channels/{id}/balance` response body.
+    /// `POST /channels/{id}/balance` 的响应体。
     pub async fn query_json(
         &self,
         state: &Context,
@@ -664,7 +727,7 @@ impl BalanceService {
         Ok(serde_json::to_value(&snapshot)?)
     }
 
-    /// `POST /balances/refresh` response body.
+    /// `POST /balances/refresh` 的响应体。
     pub async fn refresh_json(&self, state: &Context) -> Result<Value, BalanceError> {
         let snapshots = self.refresh_enabled(state).await?;
         let ok = snapshots.iter().filter(|item| item.status == "ok").count();
@@ -677,29 +740,121 @@ impl BalanceService {
         }))
     }
 
-    /// Build the request. Failures here are already classified so they can
-    /// be written as an error snapshot.
+    /// 配置的专用 token，缺省回退到渠道 key。渠道 key 由调用方解密一次
+    /// （模板渲染也可能需要它）。
+    fn balance_token(
+        &self,
+        api_key: String,
+        config: &BalanceConfig,
+    ) -> Result<String, BalanceFailure> {
+        match config.token_encrypted.as_deref() {
+            Some(ciphertext) if !ciphertext.is_empty() => self
+                .secrets
+                .decrypt(ciphertext)
+                .map_err(BalanceFailure::Fatal),
+            _ => Ok(api_key),
+        }
+    }
+
+    /// 渠道自身的 API Key（解密后）。
+    ///
+    /// 解密失败是本地密钥/密文问题，属 [`BalanceFailure::Fatal`]（服务错误），
+    /// 不是上游失败；余额适配器的模板渲染与鉴权都用这一个来源。
+    fn channel_token(&self, channel: &ChannelRow) -> Result<String, BalanceFailure> {
+        self.secrets
+            .decrypt(&channel.api_key_encrypted)
+            .map_err(BalanceFailure::Fatal)
+    }
+
+    /// 运行时设置里的连接超时（与 `prepare` 同源，唯一读取点）。
+    ///
+    /// 读取失败或设置行损坏时回落到 10s：余额查询是旁路，设置问题不应把
+    /// 整次查询升级成服务错误。缺省值不改（`connect_timeout_seconds` 默认 10）。
+    async fn runtime_connect_timeout(&self) -> Duration {
+        match crate::settings::runtime_settings_from(&self.db).await {
+            Ok(runtime) => Duration::from_secs(runtime.connect_timeout_seconds.max(1) as u64),
+            Err(_) => Duration::from_secs(10),
+        }
+    }
+
+    /// 一次上游发送 + 统一失败分类（超时 / 传输 / 非 2xx）+ 响应体上限。
+    ///
+    /// `fetch`（多步适配器）与 `exchange`（通用单步路径）共用这一段；两侧
+    /// 各自保留请求构造与响应解析，分类字符串与错误码不得放宽。
+    async fn classified_send(
+        &self,
+        request: UpstreamRequest,
+        deadline: Duration,
+    ) -> Result<(i64, StatusCode, Vec<u8>), BalanceFailure> {
+        let exchange = async {
+            let response = self.http.send(request).await?;
+            let status_code = response.status.as_u16() as i64;
+            let (body, _truncated) = response.body.read_capped(BALANCE_BODY_MAX).await;
+            Ok::<(i64, StatusCode, Vec<u8>), UpstreamError>((status_code, response.status, body))
+        };
+        let (status_code, status, body) =
+            match tokio::time::timeout(deadline, exchange).await {
+                Err(_) => {
+                    return Err(BalanceFailure::Classified {
+                        kind: error_kind::TIMEOUT,
+                        status_code: None,
+                    });
+                }
+                Ok(Err(UpstreamError::Deadline)) | Ok(Err(UpstreamError::ConnectTimeout)) => {
+                    return Err(BalanceFailure::Classified {
+                        kind: error_kind::TIMEOUT,
+                        status_code: None,
+                    });
+                }
+                Ok(Err(UpstreamError::Transport(_))) => {
+                    return Err(BalanceFailure::Classified {
+                        kind: error_kind::TRANSPORT_ERROR,
+                        status_code: None,
+                    });
+                }
+                Ok(Ok(value)) => value,
+            };
+        if !status.is_success() {
+            return Err(BalanceFailure::Classified {
+                kind: status_error_kind(status.as_u16()),
+                status_code: Some(status_code),
+            });
+        }
+        Ok((status_code, status, body))
+    }
+
+    /// 多步适配器的一次只读 GET：连接超时取运行时设置，其余交给
+    /// [`Self::classified_send`]（成功时只回状态码与响应体）。
+    async fn fetch(
+        &self,
+        url: Url,
+        headers: HeaderMap,
+        deadline: Duration,
+    ) -> Result<(i64, Vec<u8>), BalanceFailure> {
+        let request = UpstreamRequest {
+            url,
+            headers,
+            method: Method::GET,
+            body: None,
+            // R11：跟随运行时 `connect_timeout_seconds`，不再写死 10s。
+            connect_timeout: self.runtime_connect_timeout().await,
+            deadline,
+        };
+        let (status_code, _status, body) = self.classified_send(request, deadline).await?;
+        Ok((status_code, body))
+    }
+
+    /// 构造请求。这里的失败已被分类，可直接写成错误快照。
     async fn prepare(
         &self,
-        state: &Context,
         channel: &ChannelRow,
         config: &BalanceConfig,
         adapter: BalanceAdapter,
     ) -> Result<PreparedRequest, BalanceFailure> {
-        let api_key = self
-            .secrets
-            .decrypt(&channel.api_key_encrypted)
-            .map_err(BalanceFailure::Fatal)?;
-        let token = match config.token_encrypted.as_deref() {
-            Some(ciphertext) if !ciphertext.is_empty() => self
-                .secrets
-                .decrypt(ciphertext)
-                .map_err(BalanceFailure::Fatal)?,
-            _ => api_key.clone(),
-        };
-        // New API: a dedicated dashboard token (PAT) unlocks the account
-        // balance endpoint; without it only the token-scoped usage endpoint
-        // is reachable with an sk- key.
+        let api_key = self.channel_token(channel)?;
+        let token = self.balance_token(api_key.clone(), config)?;
+        // New API：专用仪表盘 token（PAT）才能解锁账户余额端点；否则用
+        // sk- key 只能访问 token 作用域的用量端点。
         let account_mode = adapter == BalanceAdapter::NewApi && config.has_token;
         let raw_path = if account_mode {
             NEW_API_ACCOUNT_PATH
@@ -753,8 +908,15 @@ impl BalanceService {
                 headers.insert(name, value);
             }
         }
-        if config.auth == BalanceAuth::Bearer {
-            let value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
+        // 一般用 Bearer；智谱控制台用裸 token（不加 `Bearer ` 前缀，即 `raw`），
+        // `none` 仅用于只用头模板鉴权的自定义端点。
+        let authorization = match config.auth {
+            BalanceAuth::Bearer => Some(format!("Bearer {token}")),
+            BalanceAuth::Raw => Some(token),
+            BalanceAuth::None => None,
+        };
+        if let Some(value) = authorization {
+            let value = HeaderValue::from_str(&value).map_err(|_| {
                 BalanceFailure::Classified {
                     kind: error_kind::INVALID_PAYLOAD,
                     status_code: None,
@@ -772,10 +934,7 @@ impl BalanceService {
             let session_id = crate::settings::opencode_session_id(&self.db).await;
             let _ = protocol::apply_opencode_session(&mut headers, &channel.base_url, &session_id);
         }
-        let connect_timeout = match crate::settings::runtime_settings(state).await {
-            Ok(runtime) => Duration::from_secs(runtime.connect_timeout_seconds.max(1) as u64),
-            Err(_) => Duration::from_secs(10),
-        };
+        let connect_timeout = self.runtime_connect_timeout().await;
         Ok(PreparedRequest {
             adapter,
             account_mode,
@@ -788,8 +947,7 @@ impl BalanceService {
         })
     }
 
-    /// Perform the exchange under one overall deadline and classify the
-    /// result. No response body is ever returned to the caller or persisted.
+    /// 在单一总超时下执行发送并分类结果。响应体绝不返回给调用方，也不持久化。
     async fn exchange(
         &self,
         prepared: PreparedRequest,
@@ -804,6 +962,8 @@ impl BalanceService {
             body,
             connect_timeout,
         } = prepared;
+        // 解析前先拿到主机名（SiliconFlow 用域名区分币种）。
+        let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
         let request = UpstreamRequest {
             url,
             headers,
@@ -812,46 +972,14 @@ impl BalanceService {
             connect_timeout,
             deadline: self.limits.balance_timeout,
         };
-        let exchange = async {
-            let response = self.http.send(request).await?;
-            let status_code = response.status.as_u16() as i64;
-            let (body, _truncated) = response.body.read_capped(BALANCE_BODY_MAX).await;
-            Ok::<(i64, StatusCode, Vec<u8>), UpstreamError>((status_code, response.status, body))
-        };
-        let (status_code, status, body) =
-            match tokio::time::timeout(self.limits.balance_timeout, exchange).await {
-                Err(_) => {
-                    return Err(BalanceFailure::Classified {
-                        kind: error_kind::TIMEOUT,
-                        status_code: None,
-                    });
-                }
-                Ok(Err(UpstreamError::Deadline)) | Ok(Err(UpstreamError::ConnectTimeout)) => {
-                    return Err(BalanceFailure::Classified {
-                        kind: error_kind::TIMEOUT,
-                        status_code: None,
-                    });
-                }
-                Ok(Err(UpstreamError::Transport(_))) => {
-                    return Err(BalanceFailure::Classified {
-                        kind: error_kind::TRANSPORT_ERROR,
-                        status_code: None,
-                    });
-                }
-                Ok(Ok(value)) => value,
-            };
-        if !status.is_success() {
-            return Err(BalanceFailure::Classified {
-                kind: status_error_kind(status.as_u16()),
-                status_code: Some(status_code),
-            });
-        }
+        let deadline = self.limits.balance_timeout;
+        let (status_code, _status, body) = self.classified_send(request, deadline).await?;
         let reading = if account_mode {
             parse_newapi_user(&body)
         } else {
             match adapter {
                 BalanceAdapter::Custom => parse_custom(&body, &mapping),
-                _ => parse_reading(adapter, &body),
+                _ => parse_reading(adapter, &body, &host),
             }
         };
         reading
@@ -862,9 +990,9 @@ impl BalanceService {
             })
     }
 
-    /// Command Code quota: `whoami` → `billing/credits` → `usage/summary`.
-    /// All three are read-only GETs (no generation, no token spend) and
-    /// gated by the global `command_code_enabled` switch.
+    /// Command Code 额度：`whoami` → `billing/credits` → `usage/summary`
+    /// → `billing/subscriptions`。四个都是只读 GET（不产生生成、不消耗
+    /// token），并受全局 `command_code_enabled` 开关约束。
     async fn command_code_reading(
         &self,
         state: &Context,
@@ -880,10 +1008,7 @@ impl BalanceService {
                 status_code: None,
             });
         }
-        let api_key = self
-            .secrets
-            .decrypt(&channel.api_key_encrypted)
-            .map_err(BalanceFailure::Fatal)?;
+        let api_key = self.channel_token(channel)?;
         let deadline = self.limits.balance_timeout;
         let (_, whoami) = self
             .command_code_get(&channel.base_url, "/alpha/whoami", &api_key, deadline)
@@ -900,8 +1025,7 @@ impl BalanceService {
         let (credits_status, credits) = self
             .command_code_get(&channel.base_url, &credits_path, &api_key, deadline)
             .await?;
-        // Usage summary is optional: a failure there still yields the
-        // credits/window reading rather than no balance at all.
+        // 用量汇总可选：它失败时仍返回 credits/窗口读数，而不是完全没有余额。
         let summary_path = with_org("/alpha/usage/summary");
         let summary = match self
             .command_code_get(&channel.base_url, &summary_path, &api_key, deadline)
@@ -948,48 +1072,82 @@ impl BalanceService {
         deadline: Duration,
     ) -> Result<(i64, Vec<u8>), BalanceFailure> {
         let url = crate::protocol::upstream_url(base_url, path, None, "command_code")
-            .map_err(|_| BalanceFailure::Classified {
+            .map_err(|_| invalid_payload_failure())?;
+        let headers = bearer_headers(api_key)?;
+        self.fetch(url, headers, deadline).await
+    }
+
+    /// 小米 MiMo Token Plan：控制台 Cookie 的三步只读 GET。
+    ///
+    /// MiMo 没有 API Key 查询路径（`tokenPlan/usage` 无 Cookie 会 401 +
+    /// `loginUrl`），所以「独立令牌」按浏览器 Cookie 串处理，缺省回落到渠道
+    /// API Key（那时必然 401，属预期）。`tokenPlan/usage` 与 `balance` 必需，
+    /// `tokenPlan/detail` 只补套餐名与周期，失败不影响读数。
+    async fn mimo_reading(
+        &self,
+        _state: &Context,
+        channel: &ChannelRow,
+        config: &BalanceConfig,
+    ) -> Result<(i64, BalanceReading), BalanceFailure> {
+        let api_key = self.channel_token(channel)?;
+        let token = self.balance_token(api_key, config)?;
+        let mut headers = json_headers();
+        headers.insert(
+            axum::http::header::USER_AGENT,
+            HeaderValue::from_static(MIMO_USER_AGENT),
+        );
+        headers.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_str(&token).map_err(|_| invalid_payload_failure())?,
+        );
+        let deadline = self.limits.balance_timeout;
+        let usage_url = balance_url(MIMO_CONSOLE_URL, "/api/v1/tokenPlan/usage")?;
+        let (usage_status, usage) = self.fetch(usage_url, headers.clone(), deadline).await?;
+        let balance_endpoint = balance_url(MIMO_CONSOLE_URL, "/api/v1/balance")?;
+        let (_, balance) = self.fetch(balance_endpoint, headers.clone(), deadline).await?;
+        // 套餐明细可选：查询失败只是没有套餐名/周期。
+        let detail = match balance_url(MIMO_CONSOLE_URL, "/api/v1/tokenPlan/detail") {
+            Ok(url) => match self.fetch(url, headers, deadline).await {
+                Ok((_, body)) => Some(body),
+                Err(_error) => None,
+            },
+            Err(_error) => None,
+        };
+        let reading = parse_mimo(&usage, &balance, detail.as_deref()).map_err(|_| {
+            BalanceFailure::Classified {
                 kind: error_kind::INVALID_PAYLOAD,
-                status_code: None,
-            })?;
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|_| {
-                BalanceFailure::Classified {
-                    kind: error_kind::INVALID_PAYLOAD,
-                    status_code: None,
-                }
-            })?,
-        );
-        headers.insert(
-            axum::http::header::ACCEPT,
-            HeaderValue::from_static("application/json"),
-        );
-        let response = self
-            .http
-            .send(UpstreamRequest {
-                url,
-                headers,
-                method: Method::GET,
-                body: None,
-                connect_timeout: Duration::from_secs(10),
-                deadline,
-            })
-            .await
-            .map_err(|_| BalanceFailure::Classified {
-                kind: error_kind::TRANSPORT_ERROR,
-                status_code: None,
-            })?;
-        let status_code = response.status.as_u16() as i64;
-        let (body, _truncated) = response.body.read_capped(BALANCE_BODY_MAX).await;
-        if !response.status.is_success() {
-            return Err(BalanceFailure::Classified {
-                kind: status_error_kind(response.status.as_u16()),
-                status_code: Some(status_code),
-            });
-        }
-        Ok((status_code, body))
+                status_code: Some(usage_status),
+            }
+        })?;
+        Ok((usage_status, reading))
+    }
+
+    /// OpenRouter：`/credits`（需要 Management Key）给出账户余额，失败时
+    /// 回落到 `/key`（任何 Key 都能读自己的额度）。
+    async fn openrouter_reading(
+        &self,
+        _state: &Context,
+        channel: &ChannelRow,
+        config: &BalanceConfig,
+    ) -> Result<(i64, BalanceReading), BalanceFailure> {
+        let token = self.balance_token(self.channel_token(channel)?, config)?;
+        let headers = bearer_headers(&token)?;
+        let deadline = self.limits.balance_timeout;
+        let credits_url = balance_url(OPENROUTER_API_URL, "/api/v1/credits")?;
+        let (status, body) = match self.fetch(credits_url, headers.clone(), deadline).await {
+            Ok(success) => success,
+            // 普通 Key 读不了账户视图（403）：改用 key 额度视图；两步都失败
+            // 时返回后一次的分类。
+            Err(_first) => {
+                let key_url = balance_url(OPENROUTER_API_URL, "/api/v1/key")?;
+                self.fetch(key_url, headers, deadline).await?
+            }
+        };
+        let reading = parse_openrouter(&body).map_err(|_| BalanceFailure::Classified {
+            kind: error_kind::INVALID_PAYLOAD,
+            status_code: Some(status),
+        })?;
+        Ok((status, reading))
     }
 
     async fn store_snapshot(&self, snapshot: &BalanceSnapshot) -> Result<(), BalanceError> {
@@ -1029,10 +1187,10 @@ impl BalanceService {
     }
 }
 
-/// Request built from a config, ready for the network phase.
+/// 由配置构造、可直接进入网络阶段的请求。
 struct PreparedRequest {
     adapter: BalanceAdapter,
-    /// New API account-balance mode (`/api/user/self` + dedicated PAT).
+    /// New API 账户余额模式（`/api/user/self` + 专用 PAT）。
     account_mode: bool,
     mapping: BalanceMapping,
     url: Url,
@@ -1042,8 +1200,8 @@ struct PreparedRequest {
     connect_timeout: Duration,
 }
 
-/// Classified balance failure: `Classified` becomes a snapshot, `Fatal`
-/// stays a service error (local corruption, never an upstream answer).
+/// 已分类的余额失败：`Classified` 写成快照，`Fatal` 保持服务错误
+/// （本地损坏，绝不是上游应答导致的）。
 enum BalanceFailure {
     Classified {
         kind: &'static str,
@@ -1106,7 +1264,7 @@ fn snapshot_error(
     }
 }
 
-/// Persisted config row.
+/// 持久化的配置行。
 #[derive(sqlx::FromRow)]
 struct ConfigRow {
     adapter: String,
@@ -1158,7 +1316,7 @@ impl ConfigRow {
     }
 }
 
-/// Persisted snapshot row.
+/// 持久化的快照行。
 #[derive(sqlx::FromRow)]
 struct SnapshotRow {
     adapter: String,
@@ -1222,8 +1380,8 @@ async fn load_snapshot(
     Ok(row.map(|row| row.into_snapshot(channel_id)))
 }
 
-/// Read-only balance summary embedded into every channel JSON (admin list /
-/// get). Never reports `configured=true` for a channel without a config row.
+/// 嵌入每个渠道 JSON（管理端列表 / 详情）的只读余额摘要。没有配置行的渠道
+/// 绝不报告 `configured=true`。
 pub async fn channel_balance_json(db: &Database, channel_id: &str) -> Result<Value, sqlx::Error> {
     let config: Option<(String, bool)> =
         sqlx::query_as("SELECT adapter, enabled FROM channel_balance_configs WHERE channel_id=?")
@@ -1241,7 +1399,7 @@ pub async fn channel_balance_json(db: &Database, channel_id: &str) -> Result<Val
     }))
 }
 
-/// Validate and normalize one `PUT balance-config` body.
+/// 校验并归一化一个 `PUT balance-config` 请求体。
 fn normalize_config(
     input: &BalanceConfigInput,
 ) -> Result<(NormalizedConfig, TokenUpdate), BalanceError> {
@@ -1283,6 +1441,8 @@ fn normalize_config(
     };
     let auth = match adapter {
         BalanceAdapter::Custom => BalanceAuth::parse(input.auth.as_deref().unwrap_or("bearer"))?,
+        // 智谱监控接口用裸 token（不加 Bearer 前缀）；其余内置适配器走 Bearer。
+        BalanceAdapter::ZhipuGlm => BalanceAuth::Raw,
         _ => BalanceAuth::Bearer,
     };
     if input.headers.len() > MAX_CUSTOM_HEADERS {
@@ -1391,12 +1551,12 @@ fn status_error_kind(status: u16) -> &'static str {
     }
 }
 
-/// Resolve the configured path against the channel base URL.
+/// 把配置的 path 解析到渠道 base URL 上。
 ///
-/// * `https://…` absolute;
-/// * `/xxx` is site-root relative;
-/// * anything else is appended to the base URL path;
-/// * query strings survive all three forms.
+/// * `https://…` 为绝对地址；
+/// * `/xxx` 相对站点根；
+/// * 其它则追加到 base URL 的路径后；
+/// * 三种形式的 query string 都会保留。
 pub fn resolve_url(base_url: &str, path: &str) -> anyhow::Result<Url> {
     let path = path.trim();
     if path.is_empty() {
@@ -1435,16 +1595,16 @@ fn split_query(path: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// `${api_key}` / `${token}` substitution for custom headers and bodies.
-/// The rendered value is only ever used on the wire — never persisted.
+/// 用于自定义 header 与 body 的 `${api_key}` / `${token}` 替换。
+/// 渲染后的值只在网络请求中使用，绝不持久化。
 pub fn render_template(template: &str, api_key: &str, token: &str) -> String {
     template
         .replace("${api_key}", api_key)
         .replace("${token}", token)
 }
 
-/// Minimal JSON path subset: `$`, `.field` and `[index]`, e.g.
-/// `$.data.items[0].balance`.
+/// 最小 JSON 路径子集：`$`、`.field` 与 `[index]`，
+/// 例如 `$.data.items[0].balance`。
 pub fn json_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
     let mut rest = path.trim().strip_prefix('$')?;
     let mut current = value;
@@ -1468,7 +1628,7 @@ pub fn json_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
     Some(current)
 }
 
-/// Number or numeric string to `f64` (upstreams disagree on JSON types).
+/// 数字或数字字符串转 `f64`（上游对 JSON 类型不统一）。
 pub fn number(value: &Value) -> Option<f64> {
     match value {
         Value::Number(number) => number.as_f64().filter(|value| value.is_finite()),
@@ -1481,15 +1641,33 @@ pub fn number(value: &Value) -> Option<f64> {
     }
 }
 
-/// Dispatch to the adapter parser.
-fn parse_reading(adapter: BalanceAdapter, body: &[u8]) -> Result<BalanceReading, BalanceError> {
+/// 分发到适配器解析器。`host` 是解析后的请求主机
+/// （SiliconFlow 按域名报告币种）。
+fn parse_reading(
+    adapter: BalanceAdapter,
+    body: &[u8],
+    host: &str,
+) -> Result<BalanceReading, BalanceError> {
     match adapter {
         BalanceAdapter::NewApi => parse_newapi(body),
         BalanceAdapter::Sub2Api => parse_sub2api(body),
         BalanceAdapter::OpencodeGo => parse_opencode_go(body),
         BalanceAdapter::DeepSeek => parse_deepseek(body),
+        BalanceAdapter::SiliconFlow => parse_siliconflow(body, host),
+        BalanceAdapter::StepFun => parse_stepfun(body),
+        BalanceAdapter::Novita => parse_novita(body),
+        BalanceAdapter::Moonshot => parse_moonshot(body),
+        BalanceAdapter::ZhipuGlm => parse_zhipu(body),
+        BalanceAdapter::MiniMax => parse_minimax(body),
+        BalanceAdapter::KimiCode => parse_kimi_code(body),
         BalanceAdapter::CommandCode => Err(BalanceError::Invalid(
             "command_code uses a multi-step query".into(),
+        )),
+        BalanceAdapter::Mimo => Err(BalanceError::Invalid(
+            "mimo uses a multi-step query".into(),
+        )),
+        BalanceAdapter::OpenRouter => Err(BalanceError::Invalid(
+            "openrouter uses a multi-step query".into(),
         )),
         BalanceAdapter::Custom => Err(BalanceError::Invalid("custom needs a mapping".into())),
     }
@@ -1499,9 +1677,54 @@ fn invalid_payload() -> BalanceError {
     BalanceError::Invalid("invalid_payload".into())
 }
 
-/// New API / one-api forks: quota values at 500,000 per USD.
+/// 解析上游 JSON 响应体；解析失败统一归类为 [`invalid_payload`]。
+///
+/// 只服务 `parse_*` 解析器（返回值是 [`BalanceError`]）；网络阶段的失败分类
+/// 用 [`invalid_payload_failure`]。
+fn decode_body(body: &[u8]) -> Result<Value, BalanceError> {
+    serde_json::from_slice(body).map_err(|_| invalid_payload())
+}
+
+/// 只读适配器通用的 JSON 请求头（`Accept: application/json`）。
+fn json_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::ACCEPT,
+        HeaderValue::from_static("application/json"),
+    );
+    headers
+}
+
+/// [`json_headers`] 再加上 `Authorization: Bearer <token>`。
+///
+/// 令牌含非法头字符时按既有分类返回 `invalid_payload`
+/// （错误来自 [`crate::protocol::bearer_header`] 的头值构造）。
+fn bearer_headers(token: &str) -> Result<HeaderMap, BalanceFailure> {
+    let mut headers = json_headers();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        crate::protocol::bearer_header(token).map_err(|_| invalid_payload_failure())?,
+    );
+    Ok(headers)
+}
+
+/// 请求构造阶段 [`invalid_payload`] 的分类版本。
+fn invalid_payload_failure() -> BalanceFailure {
+    BalanceFailure::Classified {
+        kind: error_kind::INVALID_PAYLOAD,
+        status_code: None,
+    }
+}
+
+/// 把某个适配器端点解析到固定主机上，失败像其它请求构造失败一样
+/// 归类为 `invalid_payload`（写入快照）。
+fn balance_url(base: &str, path: &str) -> Result<Url, BalanceFailure> {
+    resolve_url(base, path).map_err(|_| invalid_payload_failure())
+}
+
+/// New API / one-api 系：额度以每 USD 500,000 单位计。
 pub fn parse_newapi(body: &[u8]) -> Result<BalanceReading, BalanceError> {
-    let value: Value = serde_json::from_slice(body).map_err(|_| invalid_payload())?;
+    let value: Value = decode_body(body)?;
     let data = value
         .get("data")
         .filter(|data| data.is_object())
@@ -1522,11 +1745,10 @@ pub fn parse_newapi(body: &[u8]) -> Result<BalanceReading, BalanceError> {
         .get("unlimited_quota")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    // A concrete quota always wins over the unlimited flag: several forks
-    // set `unlimited_quota` while still returning real granted/available
-    // values (CCTQ returns granted > 0 and a negative available when the
-    // plan is overdrawn). Only the explicit `total_granted < 0` sentinel
-    // without any usable number keeps the unlimited view.
+    // 具体额度总是优先于 unlimited 标志：若干分支会把 `unlimited_quota`
+    // 置真，却仍返回真实的 granted/available 值（CCTQ 在套餐透支时返回
+    // granted > 0 且 available 为负）。只有显式 `total_granted < 0` 哨兵值
+    // 且没有任何可用数字时，才保留 unlimited 视图。
     let numeric_quota = granted.is_some_and(|granted| granted >= 0.0)
         || available.is_some_and(|available| available >= 0.0);
     let unlimited =
@@ -1552,11 +1774,10 @@ pub fn parse_newapi(body: &[u8]) -> Result<BalanceReading, BalanceError> {
     })
 }
 
-/// New API account balance (`GET /api/user/self`) using a dashboard PAT.
-/// `quota` is the account's remaining quota, `used_quota` the consumed one,
-/// both in 500,000-per-USD quota units.
+/// New API 账户余额（`GET /api/user/self`），使用仪表盘 PAT。
+/// `quota` 是账户剩余额度，`used_quota` 是已消耗额度，均以每 USD 500,000 单位计。
 pub fn parse_newapi_user(body: &[u8]) -> Result<BalanceReading, BalanceError> {
-    let value: Value = serde_json::from_slice(body).map_err(|_| invalid_payload())?;
+    let value: Value = decode_body(body)?;
     let data = value
         .get("data")
         .filter(|data| data.is_object())
@@ -1595,9 +1816,9 @@ pub fn parse_newapi_user(body: &[u8]) -> Result<BalanceReading, BalanceError> {
     })
 }
 
-/// Sub2API `/v1/usage` (quota_limited / unrestricted modes).
+/// Sub2API `/v1/usage`（quota_limited / unrestricted 模式）。
 pub fn parse_sub2api(body: &[u8]) -> Result<BalanceReading, BalanceError> {
-    let value: Value = serde_json::from_slice(body).map_err(|_| invalid_payload())?;
+    let value: Value = decode_body(body)?;
     let mode = value
         .get("mode")
         .and_then(Value::as_str)
@@ -1616,9 +1837,8 @@ pub fn parse_sub2api(body: &[u8]) -> Result<BalanceReading, BalanceError> {
         .and_then(number)
         .or_else(|| value.get("used").and_then(number));
     if remaining.is_none() && total.is_none() && used.is_none() {
-        // Only a response without any concrete number can be "unrestricted";
-        // when the upstream returns quota values they are displayed even if
-        // the mode says unrestricted.
+        // 只有不含任何具体数字的响应才算 “unrestricted”；当上游返回了额度
+        // 数值时就照常展示，哪怕 mode 写着 unrestricted。
         if mode == "unrestricted" {
             return Ok(BalanceReading {
                 unlimited: true,
@@ -1666,9 +1886,10 @@ fn sub2api_detail(value: &Value) -> Value {
     Value::Object(detail)
 }
 
-/// OpenCode Zen / Go `/v1/usage`: three rolling windows, percent used only.
+/// OpenCode Zen / Go `/v1/usage`：三个用量窗口（rolling 5h / weekly / monthly），
+/// 只有已用百分比。
 pub fn parse_opencode_go(body: &[u8]) -> Result<BalanceReading, BalanceError> {
-    let value: Value = serde_json::from_slice(body).map_err(|_| invalid_payload())?;
+    let value: Value = decode_body(body)?;
     let usage = value
         .get("usage")
         .filter(|usage| usage.is_object())
@@ -1688,26 +1909,24 @@ pub fn parse_opencode_go(body: &[u8]) -> Result<BalanceReading, BalanceError> {
         if !status_ok || !(0.0..=100.0).contains(&used_percent) {
             continue;
         }
-        windows.push(QuotaWindow {
-            label: label.into(),
+        windows.push(quota_window(
+            label,
             used_percent,
-            remaining_percent: 100.0 - used_percent,
-            resets_at: window
+            100.0 - used_percent,
+            // OpenCode 的 `resetsAt` 已是 RFC3339，直接透传（不做时间戳归一化）。
+            window
                 .get("resetsAt")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-        });
-    }
-    if windows.is_empty() {
-        return Err(invalid_payload());
+        ));
     }
     Ok(BalanceReading {
-        windows,
+        windows: require_windows(windows)?,
         ..BalanceReading::default()
     })
 }
 
-/// Command Code `whoami`: `org.id`, `orgId` or `org.orgId`.
+/// Command Code `whoami`：`org.id`、`orgId` 或 `org.orgId`。
 pub fn command_code_org_id(whoami: &[u8]) -> Option<String> {
     let value: Value = serde_json::from_slice(whoami).ok()?;
     // 官方 CLI 读取 `data.org.id`（`/alpha/whoami` 的 usage 包装），社区实现
@@ -1778,7 +1997,7 @@ fn quota_reset_at(value: &Value) -> Option<String> {
 /// 在 `windowLimits.fiveHour/weekly`；因此**零 credits 不是无效负载**。
 ///
 /// - `remaining = monthlyCredits + purchasedCredits + freeCredits`（>0 才展示）
-/// - `used = summary.totalCost`
+/// - `used` 取 `summary.totalCost`
 /// - `total = remaining + used`（credits 未知时为 None，由窗口展示）
 /// - `fiveHour` / `weekly` → `QuotaWindow{label:"5h"/"周"}`，
 ///   `used_percent = used/cap * 100`，`resets_at` 统一为 RFC3339。
@@ -1789,7 +2008,7 @@ pub fn parse_command_code(
     subscription: Option<&[u8]>,
     org_id: &str,
 ) -> Result<BalanceReading, BalanceError> {
-    let value: Value = serde_json::from_slice(credits).map_err(|_| invalid_payload())?;
+    let value: Value = decode_body(credits)?;
     let credits_object = value.get("credits").filter(|value| value.is_object());
     let monthly = credits_object
         .and_then(|value| value.get("monthlyCredits"))
@@ -1820,12 +2039,7 @@ pub fn parse_command_code(
                 continue;
             }
             let used_percent = (used / cap * 100.0).clamp(0.0, 100.0);
-            windows.push(QuotaWindow {
-                label: label.to_owned(),
-                used_percent,
-                remaining_percent: 100.0 - used_percent,
-                resets_at: window.get("resetAt").and_then(quota_reset_at),
-            });
+            windows.push(used_window(label, used_percent, window.get("resetAt")));
         }
     }
     let summary_value: Option<Value> =
@@ -1884,10 +2098,9 @@ pub fn parse_command_code(
     })
 }
 
-/// DeepSeek `/user/balance`: string amounts, one entry per currency; the
-/// first entry is the primary display balance.
+/// DeepSeek `/user/balance`：金额为字符串，每种币种一条；第一条是主展示余额。
 pub fn parse_deepseek(body: &[u8]) -> Result<BalanceReading, BalanceError> {
-    let value: Value = serde_json::from_slice(body).map_err(|_| invalid_payload())?;
+    let value: Value = decode_body(body)?;
     let infos = value
         .get("balance_infos")
         .filter(|infos| infos.is_array())
@@ -1917,9 +2130,427 @@ pub fn parse_deepseek(body: &[u8]) -> Result<BalanceReading, BalanceError> {
     })
 }
 
-/// Custom adapter: extract fields through the configured JSON paths.
+/// 窗口构造的唯一出口：`used`/`remaining` 百分比与已归一化的 `resets_at`
+/// 都由调用方算好，这里只做纯组装。
+///
+/// 各上游的归一化规则不同（有的夹 used、有的夹 remaining、OpenCode 的
+/// `resetsAt` 已是 RFC3339 需直接透传），因此不做统一夹取，避免改动读数。
+fn quota_window(
+    label: &str,
+    used_percent: f64,
+    remaining_percent: f64,
+    resets_at: Option<String>,
+) -> QuotaWindow {
+    QuotaWindow {
+        label: label.into(),
+        used_percent,
+        remaining_percent,
+        resets_at,
+    }
+}
+
+/// 上游成功响应里一个窗口都没有 = 无效负载（形状变更或该套餐无窗口）。
+fn require_windows(windows: Vec<QuotaWindow>) -> Result<Vec<QuotaWindow>, BalanceError> {
+    if windows.is_empty() {
+        return Err(invalid_payload());
+    }
+    Ok(windows)
+}
+
+/// 由上游 “已用” 百分比构造窗口（夹取到 0–100）。
+fn used_window(label: &str, used_percent: f64, reset: Option<&Value>) -> QuotaWindow {
+    let used_percent = used_percent.clamp(0.0, 100.0);
+    quota_window(
+        label,
+        used_percent,
+        100.0 - used_percent,
+        reset.and_then(quota_reset_at),
+    )
+}
+
+/// 由上游 “剩余” 百分比构造窗口（夹取到 0–100）。
+fn percent_window(label: &str, remaining_percent: f64, reset: Option<&Value>) -> QuotaWindow {
+    let remaining_percent = remaining_percent.clamp(0.0, 100.0);
+    quota_window(
+        label,
+        100.0 - remaining_percent,
+        remaining_percent,
+        reset.and_then(quota_reset_at),
+    )
+}
+
+/// `{limit, remaining, resetTime}` → 已用百分比窗口（`limit <= 0` 时无读数）。
+fn quota_from_limit_pair(value: &Value, label: &str) -> Option<QuotaWindow> {
+    let limit = value.get("limit").and_then(number)?;
+    let remaining = value.get("remaining").and_then(number)?;
+    if limit <= 0.0 {
+        return None;
+    }
+    Some(used_window(
+        label,
+        (limit - remaining) / limit * 100.0,
+        value.get("resetTime"),
+    ))
+}
+
+/// SiliconFlow `/v1/user/info`：`data.totalBalance`；币种由域名决定
+/// （`.cn` 计 CNY，`.com` 计 USD）。
+pub fn parse_siliconflow(body: &[u8], host: &str) -> Result<BalanceReading, BalanceError> {
+    let value: Value = decode_body(body)?;
+    let data = value
+        .get("data")
+        .filter(|data| data.is_object())
+        .ok_or_else(invalid_payload)?;
+    let remaining = data
+        .get("totalBalance")
+        .and_then(number)
+        .ok_or_else(invalid_payload)?;
+    let currency = if host.contains("siliconflow.com") {
+        "USD"
+    } else {
+        "CNY"
+    };
+    Ok(BalanceReading {
+        remaining: Some(remaining),
+        currency: Some(currency.into()),
+        detail: json!({
+            "balance": data.get("balance").cloned().unwrap_or(Value::Null),
+            "chargeBalance": data.get("chargeBalance").cloned().unwrap_or(Value::Null),
+        }),
+        ..BalanceReading::default()
+    })
+}
+
+/// StepFun `/v1/accounts`：预付费账户余额（CNY）。Step Plan 的月度额度池没有
+/// 公开端点（仅控制台），所以这里是账户余额，不是订阅额度。
+pub fn parse_stepfun(body: &[u8]) -> Result<BalanceReading, BalanceError> {
+    let value: Value = decode_body(body)?;
+    let remaining = value
+        .get("balance")
+        .and_then(number)
+        .ok_or_else(invalid_payload)?;
+    Ok(BalanceReading {
+        remaining: Some(remaining),
+        currency: Some("CNY".into()),
+        detail: json!({
+            "type": value.get("type").cloned().unwrap_or(Value::Null),
+            "total_cash_balance": value.get("total_cash_balance").cloned().unwrap_or(Value::Null),
+            "total_voucher_balance": value
+                .get("total_voucher_balance")
+                .cloned()
+                .unwrap_or(Value::Null),
+        }),
+        ..BalanceReading::default()
+    })
+}
+
+/// Novita AI `/v3/user/balance`：所有金额均以 0.0001 USD 为单位。
+pub fn parse_novita(body: &[u8]) -> Result<BalanceReading, BalanceError> {
+    let value: Value = decode_body(body)?;
+    let scaled = |field: &str| {
+        value
+            .get(field)
+            .and_then(number)
+            .map(|amount| amount / NOVITA_UNITS_PER_USD)
+    };
+    let remaining = scaled("availableBalance").ok_or_else(invalid_payload)?;
+    Ok(BalanceReading {
+        remaining: Some(remaining),
+        currency: Some("USD".into()),
+        detail: json!({
+            "cashBalance": scaled("cashBalance"),
+            "creditLimit": scaled("creditLimit"),
+            "outstandingInvoices": scaled("outstandingInvoices"),
+        }),
+        ..BalanceReading::default()
+    })
+}
+
+/// Moonshot（Kimi 开放平台）`/v1/users/me/balance`：CNY 账户余额。
+pub fn parse_moonshot(body: &[u8]) -> Result<BalanceReading, BalanceError> {
+    let value: Value = decode_body(body)?;
+    let data = value
+        .get("data")
+        .filter(|data| data.is_object())
+        .ok_or_else(invalid_payload)?;
+    let remaining = data
+        .get("available_balance")
+        .and_then(number)
+        .ok_or_else(invalid_payload)?;
+    Ok(BalanceReading {
+        remaining: Some(remaining),
+        currency: Some("CNY".into()),
+        detail: json!({
+            "voucher_balance": data.get("voucher_balance").cloned().unwrap_or(Value::Null),
+            "cash_balance": data.get("cash_balance").cloned().unwrap_or(Value::Null),
+        }),
+        ..BalanceReading::default()
+    })
+}
+
+/// 智谱 GLM Coding Plan `/api/monitor/usage/quota/limit`：以已用百分比表示的
+/// 订阅窗口（`unit` 3 = 5 小时，6 = 周；缺失时按数组顺序退化为 5h / 周）。
+/// `data.level` 作为读数标签。
+pub fn parse_zhipu(body: &[u8]) -> Result<BalanceReading, BalanceError> {
+    let value: Value = decode_body(body)?;
+    let data = value
+        .get("data")
+        .filter(|data| data.is_object())
+        .ok_or_else(invalid_payload)?;
+    let mut windows = Vec::new();
+    let mut untyped = 0usize;
+    if let Some(limits) = data.get("limits").and_then(Value::as_array) {
+        for item in limits {
+            let kind = item.get("type").and_then(Value::as_str).unwrap_or_default();
+            if !(kind.eq_ignore_ascii_case("TOKENS_LIMIT")
+                || kind.eq_ignore_ascii_case("CREDIT_LIMIT"))
+            {
+                continue;
+            }
+            let Some(percentage) = item.get("percentage").and_then(number) else {
+                continue;
+            };
+            let label = match item.get("unit").and_then(number).map(|unit| unit as i64) {
+                Some(3) => "5h",
+                Some(6) => "周",
+                _ => {
+                    let label = if untyped == 0 { "5h" } else { "周" };
+                    untyped += 1;
+                    label
+                }
+            };
+            windows.push(used_window(label, percentage, item.get("nextResetTime")));
+        }
+    }
+    Ok(BalanceReading {
+        label: data.get("level").and_then(Value::as_str).map(str::to_owned),
+        windows: require_windows(windows)?,
+        detail: json!({"level": data.get("level").cloned().unwrap_or(Value::Null)}),
+        ..BalanceReading::default()
+    })
+}
+
+/// MiniMax Coding Plan 剩余额度端点 `/v1/api/openplatform/coding_plan/remains`：
+/// `general` 模型的剩余百分比（5h 间隔 + 每周）。
+pub fn parse_minimax(body: &[u8]) -> Result<BalanceReading, BalanceError> {
+    let value: Value = decode_body(body)?;
+    let status = value
+        .pointer("/base_resp/status_code")
+        .and_then(number)
+        .unwrap_or(0.0) as i64;
+    if status != 0 {
+        return Err(invalid_payload());
+    }
+    let mut windows = Vec::new();
+    if let Some(remains) = value.get("model_remains").and_then(Value::as_array) {
+        for item in remains {
+            if item.get("model_name").and_then(Value::as_str) != Some("general") {
+                continue;
+            }
+            if let Some(remaining) = item
+                .get("current_interval_remaining_percent")
+                .and_then(number)
+            {
+                windows.push(percent_window("5h", remaining, item.get("end_time")));
+            }
+            let weekly_active = item
+                .get("current_weekly_status")
+                .and_then(number)
+                .map(|status| status as i64)
+                == Some(1);
+            if weekly_active
+                && let Some(remaining) = item
+                    .get("current_weekly_remaining_percent")
+                    .and_then(number)
+            {
+                windows.push(percent_window("周", remaining, item.get("weekly_end_time")));
+            }
+        }
+    }
+    Ok(BalanceReading {
+        windows: require_windows(windows)?,
+        ..BalanceReading::default()
+    })
+}
+
+/// Kimi For Coding `/coding/v1/usages`：5h 窗口取 `limits[0].detail`，
+/// 每周窗口取顶层 `usage`（`limit`/`remaining` 对）。
+pub fn parse_kimi_code(body: &[u8]) -> Result<BalanceReading, BalanceError> {
+    let value: Value = decode_body(body)?;
+    let mut windows = Vec::new();
+    let detail = value
+        .get("limits")
+        .and_then(Value::as_array)
+        .and_then(|limits| limits.first())
+        .and_then(|item| item.get("detail"))
+        .filter(|detail| detail.is_object());
+    if let Some(window) = detail.and_then(|detail| quota_from_limit_pair(detail, "5h")) {
+        windows.push(window);
+    }
+    if let Some(usage) = value.get("usage").filter(|usage| usage.is_object())
+        && let Some(window) = quota_from_limit_pair(usage, "周")
+    {
+        windows.push(window);
+    }
+    Ok(BalanceReading {
+        windows: require_windows(windows)?,
+        ..BalanceReading::default()
+    })
+}
+
+/// OpenRouter：两种视图共用一个解析器。`data.total_credits`（Management
+/// Key → `/api/v1/credits`）是账户视图（`remaining = credits - usage`，USD）；
+/// 否则 `data.limit_remaining`/`data.usage`（任意 key → `/api/v1/key`）是
+/// key 视图（`limit` 为 null 表示无限）。
+pub fn parse_openrouter(body: &[u8]) -> Result<BalanceReading, BalanceError> {
+    let value: Value = decode_body(body)?;
+    let data = value
+        .get("data")
+        .filter(|data| data.is_object())
+        .ok_or_else(invalid_payload)?;
+    let detail = json!({
+        "is_free_tier": data.get("is_free_tier").cloned().unwrap_or(Value::Null),
+        "label": data.get("label").cloned().unwrap_or(Value::Null),
+        "limit": data.get("limit").cloned().unwrap_or(Value::Null),
+        "limit_remaining": data.get("limit_remaining").cloned().unwrap_or(Value::Null),
+        "usage": data.get("usage").cloned().unwrap_or(Value::Null),
+        "total_credits": data.get("total_credits").cloned().unwrap_or(Value::Null),
+        "total_usage": data.get("total_usage").cloned().unwrap_or(Value::Null),
+    });
+    if let Some(total_credits) = data.get("total_credits").and_then(number) {
+        let total_usage = data.get("total_usage").and_then(number).unwrap_or(0.0);
+        return Ok(BalanceReading {
+            remaining: Some(total_credits - total_usage),
+            currency: Some("USD".into()),
+            used: Some(total_usage),
+            total: Some(total_credits),
+            unlimited: false,
+            label: None,
+            windows: Vec::new(),
+            detail,
+        });
+    }
+    let remaining = data.get("limit_remaining").and_then(number);
+    let used = data.get("usage").and_then(number);
+    let limit = data.get("limit").and_then(number);
+    if remaining.is_none() && used.is_none() && limit.is_none() {
+        return Err(invalid_payload());
+    }
+    Ok(BalanceReading {
+        remaining,
+        currency: Some("USD".into()),
+        used,
+        total: limit,
+        unlimited: limit.is_none(),
+        label: data.get("label").and_then(Value::as_str).map(str::to_owned),
+        windows: Vec::new(),
+        detail,
+    })
+}
+/// 小米 MiMo Token Plan：`tokenPlan/usage` + `balance`（另可选 detail 步骤
+/// 即 `tokenPlan/detail`）。
+///
+/// - `data.usage.items[]`：`plan_total_token` → 「套餐积分」、
+///   `compensation_total_token`（`limit > 0`）→ 「补偿积分」；
+/// - items 缺失时回落 `data.usage.percent`（0–1 分数）生成单个「套餐积分」窗口；
+/// - `data.balance`（字符串数字）→ `remaining`，币种取 `data.currency`；
+/// - `detail.data.planName`/`currentPeriodEnd` → 标签与窗口 `resets_at`。
+pub fn parse_mimo(
+    usage: &[u8],
+    balance: &[u8],
+    detail: Option<&[u8]>,
+) -> Result<BalanceReading, BalanceError> {
+    let usage_value: Value = decode_body(usage)?;
+    let balance_value: Value = decode_body(balance)?;
+    let usage_data = usage_value
+        .get("data")
+        .filter(|data| data.is_object())
+        .ok_or_else(invalid_payload)?;
+    let balance_data = balance_value
+        .get("data")
+        .filter(|data| data.is_object())
+        .ok_or_else(invalid_payload)?;
+    let detail_data = detail
+        .and_then(|body| serde_json::from_slice::<Value>(body).ok())
+        .and_then(|value| value.get("data").filter(|data| data.is_object()).cloned());
+    let resets_at = detail_data
+        .as_ref()
+        .and_then(|data| data.get("currentPeriodEnd"))
+        .filter(|value| !value.is_null());
+    let mut windows = Vec::new();
+    if let Some(items) = usage_data
+        .pointer("/usage/items")
+        .and_then(Value::as_array)
+    {
+        for item in items {
+            let (Some(used), Some(limit)) = (
+                item.get("used").and_then(number),
+                item.get("limit").and_then(number),
+            ) else {
+                continue;
+            };
+            if limit <= 0.0 {
+                continue;
+            }
+            let label = match item.get("name").and_then(Value::as_str) {
+                Some("plan_total_token") => "套餐积分",
+                Some("compensation_total_token") => "补偿积分",
+                _ => continue,
+            };
+            windows.push(used_window(label, used / limit * 100.0, resets_at));
+        }
+    }
+    if windows.is_empty()
+        && let Some(percent) = usage_data.pointer("/usage/percent").and_then(number)
+    {
+        // 分数（0–1）形式的整体用量。
+        windows.push(used_window("套餐积分", percent * 100.0, resets_at));
+    }
+    let remaining = balance_data
+        .get("balance")
+        .and_then(number)
+        .ok_or_else(invalid_payload)?;
+    let label = detail_data.as_ref().and_then(|data| {
+        let plan = data.get("planName").and_then(Value::as_str)?;
+        let period = data
+            .get("currentPeriodEnd")
+            .and_then(Value::as_str)
+            .map(|end| end.chars().take(10).collect::<String>());
+        Some(match period {
+            Some(period) => format!("MiMo {plan}（到期 {period}）"),
+            None => format!("MiMo {plan}"),
+        })
+    });
+    Ok(BalanceReading {
+        remaining: Some(remaining),
+        currency: Some(
+            balance_data
+                .get("currency")
+                .and_then(Value::as_str)
+                .unwrap_or("CNY")
+                .to_owned(),
+        ),
+        unlimited: false,
+        label,
+        windows,
+        detail: json!({
+            "planName": detail_data.as_ref().and_then(|data| data.get("planName")).cloned().unwrap_or(Value::Null),
+            "planCode": detail_data.as_ref().and_then(|data| data.get("planCode")).cloned().unwrap_or(Value::Null),
+            "currentPeriodEnd": detail_data
+                .as_ref()
+                .and_then(|data| data.get("currentPeriodEnd"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "cashBalance": balance_data.get("cashBalance").cloned().unwrap_or(Value::Null),
+            "giftBalance": balance_data.get("giftBalance").cloned().unwrap_or(Value::Null),
+        }),
+        ..BalanceReading::default()
+    })
+}
+
+/// `custom` 适配器：按配置的 JSON 路径抽取字段。
 pub fn parse_custom(body: &[u8], mapping: &BalanceMapping) -> Result<BalanceReading, BalanceError> {
-    let value: Value = serde_json::from_slice(body).map_err(|_| invalid_payload())?;
+    let value: Value = decode_body(body)?;
     let read = |path: &Option<String>| -> Option<Value> {
         path.as_deref()
             .and_then(|path| json_path(&value, path))
@@ -1950,18 +2581,17 @@ pub fn parse_custom(body: &[u8], mapping: &BalanceMapping) -> Result<BalanceRead
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::Context;
-    use crate::config::AppConfig;
-    use crate::db::Database;
+    use crate::state::AppState;
     use crate::ports::{UpstreamBody, UpstreamResponse};
     use crate::runtime::RuntimeLimits;
+    use crate::test_support::TempDir;
     use futures_util::future::BoxFuture;
     use parking_lot::Mutex;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio_util::sync::CancellationToken;
 
-    // ---------------------------------------------------------------- pure
+    // ---------------------------------------------------------------- 纯函数
 
     #[test]
     fn resolve_url_handles_absolute_root_relative_and_query() {
@@ -2011,31 +2641,29 @@ mod tests {
         assert!(reading.unlimited, "unlimited_quota must win");
         assert_eq!(reading.remaining, None);
 
-        // total_granted < 0 alone is also unlimited.
+        // 仅 total_granted < 0 也算无限。
         let body = r#"{"data":{"total_granted":-1,"total_used":10}}"#;
         let reading = parse_newapi(body.as_bytes()).unwrap();
         assert!(reading.unlimited);
         assert_eq!(reading.remaining, None);
 
-        // A concrete non-negative balance wins even when the upstream set the
-        // unlimited flag (fork data: flag true while the quota is numeric).
+        // 具体且非负的余额优先，即使上游置了 unlimited 标志
+        // （分支数据：标志为真但额度是数值）。
         let body =
             r#"{"data":{"total_granted":5000000,"total_used":1250000,"unlimited_quota":true}}"#;
         let reading = parse_newapi(body.as_bytes()).unwrap();
         assert!(!reading.unlimited);
         assert_eq!(reading.remaining, Some(7.5));
 
-        // ... including when total_granted used the -1 sentinel but a real
-        // available amount is present.
+        // ……包括 total_granted 用了 -1 哨兵值、但存在真实 available 金额的情况。
         let body =
             r#"{"data":{"total_granted":-1,"total_available":3750000,"unlimited_quota":true}}"#;
         let reading = parse_newapi(body.as_bytes()).unwrap();
         assert!(!reading.unlimited);
         assert_eq!(reading.remaining, Some(7.5));
 
-        // Real CCTQ shape: the plan is overdrawn (available < 0), yet
-        // total_granted > 0 proves the quota is numeric. `unlimited_quota`
-        // must NOT hide the concrete (negative) available amount.
+        // 真实 CCTQ 形状：套餐透支（available < 0），但 total_granted > 0 证明额度
+        // 是数值。`unlimited_quota` 绝不能隐藏具体的（负的）available 金额。
         let body = r#"{"code":true,"data":{"name":"codex","total_granted":3276396,"total_used":4640192,"total_available":-1363796,"unlimited_quota":true},"message":"ok"}"#;
         let reading = parse_newapi(body.as_bytes()).unwrap();
         assert!(!reading.unlimited);
@@ -2085,7 +2713,7 @@ mod tests {
         assert!(reading.unlimited);
         assert_eq!(reading.remaining, None);
 
-        // Unrestricted mode with concrete numbers still displays them.
+        // unrestricted 模式下有具体数字时仍会展示。
         let body = r#"{"mode":"unrestricted","isValid":true,"status":"active","remaining":12.5,"unit":"USD"}"#;
         let reading = parse_sub2api(body.as_bytes()).unwrap();
         assert!(!reading.unlimited);
@@ -2134,6 +2762,296 @@ mod tests {
         let body = r#"{"usage":{"rolling":{"status":"ok","percent":120},"weekly":{"status":"ok","percent":-1}}}"#;
         assert!(parse_opencode_go(body.as_bytes()).is_err());
         assert!(parse_opencode_go(b"{}").is_err());
+    }
+
+    const ZHIPU_BODY: &str = r#"{"data":{"level":"pro","limits":[{"type":"TOKENS_LIMIT","unit":3,"percentage":12.5,"nextResetTime":1790000000000},{"type":"TOKENS_LIMIT","unit":6,"percentage":40,"nextResetTime":1795000000000}]}}"#;
+
+    #[test]
+    fn zhipu_windows_classify_unit_and_fall_back_to_array_order() {
+        let reading = parse_zhipu(ZHIPU_BODY.as_bytes()).unwrap();
+        assert_eq!(reading.label.as_deref(), Some("pro"));
+        let labels: Vec<&str> = reading
+            .windows
+            .iter()
+            .map(|window| window.label.as_str())
+            .collect();
+        assert_eq!(labels, vec!["5h", "周"]);
+        assert_eq!(reading.windows[0].used_percent, 12.5);
+        assert_eq!(reading.windows[0].remaining_percent, 87.5);
+        assert_eq!(
+            reading.windows[0].resets_at.as_deref(),
+            Some("2026-09-21T14:13:20+00:00"),
+            "millisecond nextResetTime becomes RFC3339"
+        );
+        assert_eq!(reading.windows[1].used_percent, 40.0);
+
+        // 没有 `unit`：按数组顺序退化为 5h / 周。其它 limit 类型
+        // （以及没有 percentage 的条目）会被跳过。
+        let body = r#"{"data":{"level":"lite","limits":[{"type":"OTHER","unit":3,"percentage":9},{"type":"CREDIT_LIMIT","percentage":25},{"type":"TOKENS_LIMIT","percentage":50}]}}"#;
+        let reading = parse_zhipu(body.as_bytes()).unwrap();
+        let labels: Vec<&str> = reading
+            .windows
+            .iter()
+            .map(|window| window.label.as_str())
+            .collect();
+        assert_eq!(labels, vec!["5h", "周"]);
+        assert_eq!(reading.windows[0].used_percent, 25.0);
+        assert!(reading.windows[0].resets_at.is_none());
+
+        assert!(parse_zhipu(b"{}").is_err());
+        assert!(parse_zhipu(br#"{"data":{"limits":[]}}"#).is_err());
+    }
+
+    #[test]
+    fn minimax_reads_interval_and_weekly_remaining_percent() {
+        let body = r#"{"base_resp":{"status_code":0},"model_remains":[{"model_name":"general","current_interval_remaining_percent":80.0,"end_time":1790000000000,"current_weekly_status":1,"current_weekly_remaining_percent":50.0,"weekly_end_time":1795000000000}]}"#;
+        let reading = parse_minimax(body.as_bytes()).unwrap();
+        assert_eq!(reading.remaining, None, "subscription windows only");
+        let labels: Vec<&str> = reading
+            .windows
+            .iter()
+            .map(|window| window.label.as_str())
+            .collect();
+        assert_eq!(labels, vec!["5h", "周"]);
+        assert_eq!(reading.windows[0].remaining_percent, 80.0);
+        assert_eq!(reading.windows[0].used_percent, 20.0);
+        assert_eq!(
+            reading.windows[0].resets_at.as_deref(),
+            Some("2026-09-21T14:13:20+00:00")
+        );
+        assert_eq!(reading.windows[1].remaining_percent, 50.0);
+        assert_eq!(
+            reading.windows[1].resets_at.as_deref(),
+            Some("2026-11-18T11:06:40+00:00")
+        );
+
+        // 每周额度池未激活：只保留间隔窗口。
+        let body = r#"{"base_resp":{"status_code":0},"model_remains":[{"model_name":"general","current_interval_remaining_percent":10,"current_weekly_status":0,"current_weekly_remaining_percent":99}]}"#;
+        let reading = parse_minimax(body.as_bytes()).unwrap();
+        assert_eq!(reading.windows.len(), 1);
+        assert_eq!(reading.windows[0].remaining_percent, 10.0);
+
+        let error = parse_minimax(br#"{"base_resp":{"status_code":1004}}"#).unwrap_err();
+        assert_eq!(error.to_string(), "invalid_payload");
+        assert!(parse_minimax(br#"{"base_resp":{"status_code":0}}"#).is_err());
+    }
+
+    #[test]
+    fn kimi_code_reads_limit_and_usage_windows() {
+        let body = r#"{"limits":[{"detail":{"limit":100,"remaining":70,"resetTime":"2026-09-27T06:00:00Z"}}],"usage":{"limit":1000,"remaining":250,"resetTime":"2026-10-01T00:00:00Z"}}"#;
+        let reading = parse_kimi_code(body.as_bytes()).unwrap();
+        let labels: Vec<&str> = reading
+            .windows
+            .iter()
+            .map(|window| window.label.as_str())
+            .collect();
+        assert_eq!(labels, vec!["5h", "周"]);
+        assert_eq!(reading.windows[0].used_percent, 30.0);
+        assert_eq!(reading.windows[0].remaining_percent, 70.0);
+        assert_eq!(
+            reading.windows[0].resets_at.as_deref(),
+            Some("2026-09-27T06:00:00+00:00")
+        );
+        assert_eq!(reading.windows[1].used_percent, 75.0);
+
+        // 透支的窗口夹取到 0% 剩余，而不是变成负数。
+        let body = r#"{"usage":{"limit":100,"remaining":-20}}"#;
+        let reading = parse_kimi_code(body.as_bytes()).unwrap();
+        assert_eq!(reading.windows[0].used_percent, 100.0);
+        assert_eq!(reading.windows[0].remaining_percent, 0.0);
+
+        assert!(parse_kimi_code(b"{}").is_err());
+        assert!(parse_kimi_code(br#"{"limits":[]}"#).is_err());
+    }
+
+    #[test]
+    fn moonshot_and_stepfun_read_cny_balances() {
+        let body = r#"{"code":0,"data":{"available_balance":49.58894,"voucher_balance":46.58893,"cash_balance":3.00001},"scode":"0x0","status":true}"#;
+        let reading = parse_moonshot(body.as_bytes()).unwrap();
+        assert_eq!(reading.remaining, Some(49.58894));
+        assert_eq!(reading.currency.as_deref(), Some("CNY"));
+        assert_eq!(reading.detail["voucher_balance"], 46.58893);
+        assert!(parse_moonshot(b"{}").is_err());
+
+        let body = r#"{"object":"account","type":"prepaid","balance":8.0,"total_cash_balance":0,"total_voucher_balance":26.0}"#;
+        let reading = parse_stepfun(body.as_bytes()).unwrap();
+        assert_eq!(reading.remaining, Some(8.0));
+        assert_eq!(reading.currency.as_deref(), Some("CNY"));
+        assert_eq!(reading.detail["type"], "prepaid");
+        assert_eq!(reading.detail["total_voucher_balance"], 26.0);
+        assert!(parse_stepfun(br#"{"object":"account"}"#).is_err());
+    }
+
+    #[test]
+    fn novita_scales_ten_thousand_units_to_usd() {
+        let reading = parse_novita(br#"{"availableBalance":123456}"#).unwrap();
+        assert_eq!(reading.remaining, Some(12.3456));
+        assert_eq!(reading.currency.as_deref(), Some("USD"));
+
+        let body = r#"{"availableBalance":10000,"cashBalance":5000,"creditLimit":20000,"outstandingInvoices":1500}"#;
+        let reading = parse_novita(body.as_bytes()).unwrap();
+        assert_eq!(reading.remaining, Some(1.0));
+        assert_eq!(reading.detail["cashBalance"], 0.5);
+        assert_eq!(reading.detail["creditLimit"], 2.0);
+        assert_eq!(reading.detail["outstandingInvoices"], 0.15);
+        assert!(parse_novita(br#"{"cashBalance":1}"#).is_err());
+    }
+
+    #[test]
+    fn siliconflow_currency_follows_the_site_domain() {
+        let body = r#"{"code":20000,"data":{"totalBalance":12.5,"balance":10.0,"chargeBalance":2.5}}"#;
+        let reading = parse_siliconflow(body.as_bytes(), "api.siliconflow.cn").unwrap();
+        assert_eq!(reading.remaining, Some(12.5));
+        assert_eq!(reading.currency.as_deref(), Some("CNY"));
+        assert_eq!(reading.detail["chargeBalance"], 2.5);
+        let reading = parse_siliconflow(body.as_bytes(), "api.siliconflow.com").unwrap();
+        assert_eq!(reading.currency.as_deref(), Some("USD"));
+        let reading = parse_siliconflow(body.as_bytes(), "siliconflow.internal").unwrap();
+        assert_eq!(reading.currency.as_deref(), Some("CNY"));
+
+        assert!(parse_siliconflow(br#"{"code":20000}"#, "api.siliconflow.cn").is_err());
+    }
+
+    #[test]
+    fn openrouter_account_and_key_views() {
+        let body = r#"{"data":{"total_credits":100,"total_usage":37.5}}"#;
+        let reading = parse_openrouter(body.as_bytes()).unwrap();
+        assert_eq!(reading.remaining, Some(62.5));
+        assert_eq!(reading.used, Some(37.5));
+        assert_eq!(reading.total, Some(100.0));
+        assert_eq!(reading.currency.as_deref(), Some("USD"));
+        assert!(!reading.unlimited);
+
+        let body = r#"{"data":{"label":"sk-or-v1-abc","usage":3.5,"limit":10,"limit_remaining":6.5,"is_free_tier":false}}"#;
+        let reading = parse_openrouter(body.as_bytes()).unwrap();
+        assert_eq!(reading.remaining, Some(6.5));
+        assert_eq!(reading.total, Some(10.0));
+        assert!(!reading.unlimited);
+        assert_eq!(reading.label.as_deref(), Some("sk-or-v1-abc"));
+
+        // 没有 limit 的 key 为无限（无剩余计数器）。
+        let body = r#"{"data":{"label":"sk-or-v1-free","usage":0,"limit":null,"limit_remaining":null,"is_free_tier":true}}"#;
+        let reading = parse_openrouter(body.as_bytes()).unwrap();
+        assert!(reading.unlimited);
+        assert_eq!(reading.remaining, None);
+        assert!(parse_openrouter(b"{}").is_err());
+        assert!(parse_openrouter(br#"{"data":{"is_free_tier":true}}"#).is_err());
+    }
+
+    #[test]
+    fn mimo_three_step_reading_uses_cookie_plan_and_balance() {
+        const USAGE: &str = r#"{"code":0,"data":{"usage":{"percent":0.42,"items":[{"name":"plan_total_token","used":1100000000,"limit":11000000000},{"name":"compensation_total_token","used":0,"limit":0}]}}}"#;
+        const BALANCE: &str = r#"{"code":0,"data":{"balance":"12.34","cashBalance":"10.00","giftBalance":"2.34","currency":"CNY"}}"#;
+        const DETAIL: &str = r#"{"code":0,"data":{"planName":"Pro","planCode":"pro:month","currentPeriodEnd":"2026-10-01T00:00:00Z"}}"#;
+        let reading =
+            parse_mimo(USAGE.as_bytes(), BALANCE.as_bytes(), Some(DETAIL.as_bytes())).unwrap();
+        assert_eq!(reading.remaining, Some(12.34));
+        assert_eq!(reading.currency.as_deref(), Some("CNY"));
+        assert_eq!(
+            reading.label.as_deref(),
+            Some("MiMo Pro（到期 2026-10-01）")
+        );
+        assert_eq!(reading.windows.len(), 1, "zero-limit compensation is skipped");
+        assert_eq!(reading.windows[0].label, "套餐积分");
+        assert_eq!(reading.windows[0].used_percent, 10.0);
+        assert_eq!(reading.windows[0].remaining_percent, 90.0);
+        assert_eq!(
+            reading.windows[0].resets_at.as_deref(),
+            Some("2026-10-01T00:00:00+00:00")
+        );
+        assert_eq!(reading.detail["cashBalance"], "10.00");
+
+        // 没有可选 detail 步骤时：回落到百分比窗口，无标签。
+        let reading = parse_mimo(USAGE.as_bytes(), BALANCE.as_bytes(), None).unwrap();
+        assert_eq!(reading.label, None);
+        assert_eq!(reading.windows[0].used_percent, 10.0);
+
+        // 完全没有 items 时：0–1 分数变成单个窗口。
+        let usage = r#"{"code":0,"data":{"usage":{"percent":0.42}}}"#;
+        let reading = parse_mimo(usage.as_bytes(), BALANCE.as_bytes(), None).unwrap();
+        assert_eq!(reading.windows.len(), 1);
+        assert_eq!(reading.windows[0].used_percent, 42.0);
+
+        assert!(parse_mimo(b"{}", BALANCE.as_bytes(), None).is_err());
+        assert!(parse_mimo(USAGE.as_bytes(), b"{}", None).is_err());
+    }
+
+    #[test]
+    fn new_adapter_ids_round_trip_with_their_presets() {
+        let adapters = [
+            BalanceAdapter::Mimo,
+            BalanceAdapter::OpenRouter,
+            BalanceAdapter::SiliconFlow,
+            BalanceAdapter::StepFun,
+            BalanceAdapter::Novita,
+            BalanceAdapter::Moonshot,
+            BalanceAdapter::ZhipuGlm,
+            BalanceAdapter::MiniMax,
+            BalanceAdapter::KimiCode,
+        ];
+        for adapter in adapters {
+            assert_eq!(BalanceAdapter::parse(adapter.as_str()).unwrap(), adapter);
+        }
+        assert_eq!(BalanceAdapter::Mimo.as_str(), "mimo");
+        assert_eq!(BalanceAdapter::OpenRouter.as_str(), "openrouter");
+        assert_eq!(BalanceAdapter::SiliconFlow.as_str(), "siliconflow");
+        assert_eq!(BalanceAdapter::StepFun.as_str(), "stepfun");
+        assert_eq!(BalanceAdapter::Novita.as_str(), "novita");
+        assert_eq!(BalanceAdapter::Moonshot.as_str(), "moonshot");
+        assert_eq!(BalanceAdapter::ZhipuGlm.as_str(), "zhipu");
+        assert_eq!(BalanceAdapter::MiniMax.as_str(), "minimax");
+        assert_eq!(BalanceAdapter::KimiCode.as_str(), "kimi_code");
+
+        assert_eq!(BalanceAdapter::Mimo.default_path(), None);
+        assert_eq!(BalanceAdapter::OpenRouter.default_path(), None);
+        assert_eq!(
+            BalanceAdapter::SiliconFlow.default_path(),
+            Some("/v1/user/info")
+        );
+        assert_eq!(BalanceAdapter::StepFun.default_path(), Some("/v1/accounts"));
+        assert_eq!(
+            BalanceAdapter::Novita.default_path(),
+            Some("https://api.novita.ai/v3/user/balance")
+        );
+        assert_eq!(
+            BalanceAdapter::Moonshot.default_path(),
+            Some("/v1/users/me/balance")
+        );
+        assert_eq!(
+            BalanceAdapter::ZhipuGlm.default_path(),
+            Some("/api/monitor/usage/quota/limit")
+        );
+        assert_eq!(
+            BalanceAdapter::MiniMax.default_path(),
+            Some("https://api.minimaxi.com/v1/api/openplatform/coding_plan/remains")
+        );
+        assert_eq!(
+            BalanceAdapter::KimiCode.default_path(),
+            Some("https://api.kimi.com/coding/v1/usages")
+        );
+    }
+
+    #[test]
+    fn zhipu_config_stores_raw_auth_and_others_store_bearer() {
+        let (config, _) = normalize_config(&base_input("zhipu", true)).unwrap();
+        assert_eq!(config.auth, BalanceAuth::Raw);
+        assert_eq!(config.auth.as_str(), "raw");
+        assert_eq!(
+            config.path.as_deref(),
+            Some("/api/monitor/usage/quota/limit")
+        );
+        assert_eq!(BalanceAuth::parse("raw").unwrap(), BalanceAuth::Raw);
+        assert_eq!(BalanceAuth::parse(" RAW ").unwrap(), BalanceAuth::Raw);
+
+        let (config, _) = normalize_config(&base_input("minimax", true)).unwrap();
+        assert_eq!(config.auth, BalanceAuth::Bearer);
+        let mut custom = base_input("custom", true);
+        custom.path = Some("/v1/usage".into());
+        let (config, _) = normalize_config(&custom).unwrap();
+        assert_eq!(config.auth, BalanceAuth::Bearer, "custom defaults to bearer");
+        custom.auth = Some("raw".into());
+        let (config, _) = normalize_config(&custom).unwrap();
+        assert_eq!(config.auth, BalanceAuth::Raw, "custom may pick raw explicitly");
     }
 
     #[test]
@@ -2188,7 +3106,7 @@ mod tests {
         assert!(parse_custom(b"nope", &mapping).is_err());
     }
 
-    // ------------------------------------------------------- mock upstream
+    // ------------------------------------------------------- mock 上游
 
     #[derive(Clone)]
     struct RecordedRequest {
@@ -2196,6 +3114,7 @@ mod tests {
         url: String,
         body: Option<Vec<u8>>,
         headers: HeaderMap,
+        connect_timeout: Duration,
     }
 
     enum MockReply {
@@ -2245,6 +3164,7 @@ mod tests {
                 url: request.url.to_string(),
                 body: request.body.as_ref().map(|body| body.to_vec()),
                 headers: request.headers.clone(),
+                connect_timeout: request.connect_timeout,
             };
             self.requests.lock().push(recorded.clone());
             let reply = (self.handler)(&recorded);
@@ -2270,95 +3190,26 @@ mod tests {
     async fn test_state(
         mock: Arc<dyn UpstreamClient>,
         limits: RuntimeLimits,
-    ) -> (Context, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("lagw-balance-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let db = Database::open(&dir.join("test.db")).await.unwrap();
-        let secrets = crate::crypto::SecretStore::load(&dir.join("master.key"))
-            .await
-            .unwrap();
-        let (telemetry, _rx) = crate::telemetry::Telemetry::new(1000);
-        let routes: Arc<dyn crate::ports::RouteRepository> =
-            crate::infrastructure::SqliteRouteRepository::new(db.clone());
-        let channels: Arc<dyn crate::ports::ChannelRepository> =
-            crate::infrastructure::SqliteChannelRepository::new(db.clone());
-        let clock: Arc<dyn crate::ports::Clock> = Arc::new(crate::infrastructure::SystemClock);
-        let background = crate::infrastructure::RuntimeSupervisor::new(CancellationToken::new());
-        let limits = Arc::new(limits);
-        let discovery = crate::discovery::DiscoveryService::new(
-            db.clone(),
-            secrets.clone(),
-            Arc::clone(&mock),
-            Arc::clone(&channels),
-            Arc::clone(&clock),
-            Arc::clone(&background),
-            Arc::clone(&limits),
-        );
-        let notifier: Arc<dyn crate::ports::Notifier> =
-            crate::notification::DesktopNotifier::new(Duration::from_millis(50));
-        let proxy = crate::proxy::ProxyService::new(
-            db.clone(),
-            secrets.clone(),
-            Arc::clone(&mock),
-            routes.clone(),
-            telemetry.clone(),
-            Arc::clone(&clock),
-            Arc::clone(&limits),
-            crate::notification::DesktopNotifier::new(Duration::from_millis(50)),
-        );
-        let balance = BalanceService::new(
-            db.clone(),
-            secrets.clone(),
-            Arc::clone(&mock),
-            Arc::clone(&channels),
-            Arc::clone(&clock),
-            Arc::clone(&limits),
-        );
-        let admin = crate::admin::AdminService::new(db.clone(), secrets.clone());
-        let command_code_login = crate::commandcode_login::CommandCodeLogin::new(std::sync::Arc::clone(&mock));
-        let state = Context {
-            config: Arc::new(AppConfig::default()),
-            db: db.clone(),
-            secrets,
-            http: mock,
-            routes,
-            channels,
-            clock,
-            notifier,
-            discovery,
-            proxy,
-            telemetry,
-            background,
-            limits,
-            admin,
-            balance,
-            command_code_login,
-            recovery: crate::auth::RecoverySession::new(),
-        };
+    ) -> (AppState, TempDir) {
+        // 统一夹具：临时目录 + 整套 Context；此处注入假上游与自定义运行限额。
+        let crate::test_support::TestEnv {
+            dir,
+            context: state,
+        } = crate::test_support::context_with("balance", mock, limits).await;
         (state, dir)
     }
 
     async fn seed_channel(state: &Context, base_url: &str) {
-        let time = "2026-08-04T01:00:00+00:00";
-        sqlx::query(
-            "INSERT INTO providers(id,name,base_url,created_at,updated_at) VALUES('prov-1','mock',?,?,?)",
+        crate::test_support::seed_provider(&state.db, "prov-1", "mock", base_url).await;
+        crate::test_support::seed_channel(
+            &state.db,
+            &state.secrets,
+            "ch-1",
+            "prov-1",
+            "openai_compatible",
+            "sk-channel-secret",
         )
-        .bind(base_url)
-        .bind(time)
-        .bind(time)
-        .execute(state.db.pool())
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO channels(id,provider_id,name,protocol,api_key_encrypted,api_key_hint,manual_enabled,created_at,updated_at) VALUES('ch-1','prov-1','chan','openai_compatible',?,?,0,?,?)",
-        )
-        .bind(state.secrets.encrypt("sk-channel-secret"))
-        .bind("sk-...cret")
-        .bind(time)
-        .bind(time)
-        .execute(state.db.pool())
-        .await
-        .unwrap();
+        .await;
     }
 
     fn base_input(adapter: &str, enabled: bool) -> BalanceConfigInput {
@@ -2376,7 +3227,7 @@ mod tests {
         }
     }
 
-    async fn save_balance(state: &Context, adapter: &str, enabled: bool) -> BalanceConfig {
+    async fn save_balance(state: &AppState, adapter: &str, enabled: bool) -> BalanceConfig {
         state
             .balance
             .save_config("ch-1", base_input(adapter, enabled))
@@ -2384,7 +3235,7 @@ mod tests {
             .unwrap()
     }
 
-    // ------------------------------------------------------ service paths
+    // ------------------------------------------------------ 服务路径
 
     #[tokio::test]
     async fn default_off_sends_no_request_at_all() {
@@ -2431,27 +3282,22 @@ mod tests {
             let provider_id = format!("prov-{index}");
             let channel_id = format!("ch-{index}");
             let base_url = format!("https://relay{index}.example.com");
-            sqlx::query(
-                "INSERT INTO providers(id,name,base_url,created_at,updated_at) VALUES(?,?,?,?,?)",
+            crate::test_support::seed_provider(
+                &state.db,
+                &provider_id,
+                &provider_id,
+                &base_url,
             )
-            .bind(&provider_id)
-            .bind(&provider_id)
-            .bind(&base_url)
-            .bind(time)
-            .bind(time)
-            .execute(state.db.pool())
-            .await
-            .unwrap();
-            sqlx::query("INSERT INTO channels(id,provider_id,name,protocol,api_key_encrypted,api_key_hint,manual_enabled,created_at,updated_at) VALUES(?,?,'chan','openai_compatible',?,?,0,?,?)")
-                .bind(&channel_id)
-                .bind(&provider_id)
-                .bind(state.secrets.encrypt("sk-channel-secret"))
-                .bind("sk-...cret")
-                .bind(time)
-                .bind(time)
-                .execute(state.db.pool())
-                .await
-                .unwrap();
+            .await;
+            crate::test_support::seed_channel(
+                &state.db,
+                &state.secrets,
+                &channel_id,
+                &provider_id,
+                "openai_compatible",
+                "sk-channel-secret",
+            )
+            .await;
             sqlx::query("INSERT INTO channel_balance_configs(channel_id,adapter,enabled,method,path,auth,headers_json,body_json,mapping_json,created_at,updated_at) VALUES(?,'newapi',1,'GET','/api/usage/token/','bearer',NULL,NULL,NULL,?,?)")
                 .bind(&channel_id)
                 .bind(time)
@@ -2636,6 +3482,154 @@ mod tests {
         );
     }
 
+    /// zhipu：预设 path 解析到渠道主机上，请求携带裸 token
+    /// （智谱拒绝 `Bearer` 前缀）。
+    #[tokio::test]
+    async fn zhipu_queries_console_quota_with_a_raw_token() {
+        let mock = MockUpstream::always(200, ZHIPU_BODY);
+        let (state, _dir) = test_state(mock.clone(), RuntimeLimits::default()).await;
+        seed_channel(&state, "https://open.bigmodel.cn").await;
+        save_balance(&state, "zhipu", true).await;
+
+        let snapshot = state.balance.query(&state, "ch-1").await.unwrap();
+        assert_eq!(snapshot.status, "ok");
+        assert_eq!(snapshot.label.as_deref(), Some("pro"));
+        assert_eq!(snapshot.windows.len(), 2);
+        assert_eq!(snapshot.status_code, Some(200));
+        let recorded = mock.requests();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0].url,
+            "https://open.bigmodel.cn/api/monitor/usage/quota/limit"
+        );
+        assert_eq!(
+            recorded[0]
+                .headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "sk-channel-secret",
+            "raw auth must not add the Bearer prefix"
+        );
+    }
+
+    /// openrouter：`/credits` 需要 Management Key；普通 key 在那里会得到 403，
+    /// 流程回落到 key 视图。
+    #[tokio::test]
+    async fn openrouter_falls_back_from_credits_to_the_key_view() {
+        const KEY_BODY: &str =
+            r#"{"data":{"label":"sk-or-v1-abc","usage":3.5,"limit":10,"limit_remaining":6.5}}"#;
+        let mock = MockUpstream::new(|request| {
+            if request.url.ends_with("/credits") {
+                MockReply::Json(403, r#"{"error":{"message":"management key required"}}"#.into())
+            } else {
+                MockReply::Json(200, KEY_BODY.into())
+            }
+        });
+        let (state, _dir) = test_state(mock.clone(), RuntimeLimits::default()).await;
+        seed_channel(&state, "https://relay.example.com").await;
+        let mut input = base_input("openrouter", true);
+        input.token = Some("sk-or-v1-abc".into());
+        state.balance.save_config("ch-1", input).await.unwrap();
+
+        let snapshot = state.balance.query(&state, "ch-1").await.unwrap();
+        assert_eq!(snapshot.status, "ok");
+        assert_eq!(snapshot.remaining, Some(6.5));
+        assert_eq!(snapshot.used, Some(3.5));
+        assert_eq!(snapshot.total, Some(10.0));
+        let urls: Vec<String> = mock
+            .requests()
+            .into_iter()
+            .map(|request| request.url)
+            .collect();
+        assert_eq!(
+            urls,
+            [
+                "https://openrouter.ai/api/v1/credits",
+                "https://openrouter.ai/api/v1/key"
+            ]
+        );
+    }
+
+    /// 多步适配器（openrouter / mimo / command_code）构造请求时的连接超时必须
+    /// 取运行时设置，而不是写死的 10s。
+    #[tokio::test]
+    async fn multi_step_connect_timeout_follows_the_runtime_setting() {
+        const KEY_BODY: &str =
+            r#"{"data":{"label":"sk-or-v1-abc","usage":3.5,"limit":10,"limit_remaining":6.5}}"#;
+        let mock = MockUpstream::always(200, KEY_BODY);
+        let (state, _dir) = test_state(mock.clone(), RuntimeLimits::default()).await;
+        seed_channel(&state, "https://relay.example.com").await;
+        save_balance(&state, "openrouter", true).await;
+        sqlx::query(
+            "INSERT INTO settings(key,value_json,updated_at) VALUES('connect_timeout_seconds','7',?) \
+             ON CONFLICT(key) DO UPDATE SET value_json='7'",
+        )
+        .bind("2026-08-04T01:00:00+00:00")
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+
+        let snapshot = state.balance.query(&state, "ch-1").await.unwrap();
+        assert_eq!(snapshot.status, "ok");
+        let recorded = mock.requests();
+        assert_eq!(recorded.len(), 1, "openrouter 成功路径只发一次请求");
+        assert_eq!(
+            recorded[0].connect_timeout,
+            Duration::from_secs(7),
+            "连接超时必须跟随运行时设置（connect_timeout_seconds=7），不是写死的 10s"
+        );
+    }
+
+    /// mimo：控制台 Cookie 流程（usage + balance 必需，detail 可选）。
+    #[tokio::test]
+    async fn mimo_queries_console_cookie_and_skips_a_failing_detail_step() {
+        const USAGE: &str = r#"{"code":0,"data":{"usage":{"percent":0.42,"items":[{"name":"plan_total_token","used":1100000000,"limit":11000000000}]}}}"#;
+        const BALANCE: &str = r#"{"code":0,"data":{"balance":"12.34","currency":"CNY"}}"#;
+        let mock = MockUpstream::new(|request| {
+            if request.url.ends_with("/api/v1/tokenPlan/usage") {
+                MockReply::Json(200, USAGE.into())
+            } else if request.url.ends_with("/api/v1/balance") {
+                MockReply::Json(200, BALANCE.into())
+            } else {
+                MockReply::Json(404, r#"{"code":404}"#.into())
+            }
+        });
+        let (state, _dir) = test_state(mock.clone(), RuntimeLimits::default()).await;
+        seed_channel(&state, "https://relay.example.com").await;
+        let mut input = base_input("mimo", true);
+        input.token = Some("SESSION=abc; other=1".into());
+        state.balance.save_config("ch-1", input).await.unwrap();
+
+        let snapshot = state.balance.query(&state, "ch-1").await.unwrap();
+        assert_eq!(snapshot.status, "ok", "detail is optional");
+        assert_eq!(snapshot.remaining, Some(12.34));
+        assert_eq!(snapshot.currency.as_deref(), Some("CNY"));
+        assert_eq!(snapshot.windows[0].used_percent, 10.0);
+        let recorded = mock.requests();
+        assert_eq!(recorded.len(), 3, "usage + balance + the failing detail");
+        assert_eq!(
+            recorded[0].url,
+            "https://platform.xiaomimimo.com/api/v1/tokenPlan/usage"
+        );
+        assert_eq!(
+            recorded[1].url,
+            "https://platform.xiaomimimo.com/api/v1/balance"
+        );
+        for request in &recorded {
+            assert_eq!(
+                request.headers.get("cookie").unwrap().to_str().unwrap(),
+                "SESSION=abc; other=1",
+                "the dedicated token is the console Cookie string"
+            );
+            assert!(
+                !request.headers.contains_key("authorization"),
+                "MiMo authenticates by Cookie only"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn delete_config_returns_to_default_off() {
         let mock = MockUpstream::always(200, NEWAPI_BODY);
@@ -2653,7 +3647,7 @@ mod tests {
         assert_eq!(mock.calls(), 1, "delete must not produce requests");
     }
 
-    // ------------------------------------------------- custom and secrets
+    // ------------------------------------------------- 自定义与密钥
 
     #[tokio::test]
     async fn custom_adapter_renders_templates_and_never_persists_secrets() {
@@ -2704,8 +3698,7 @@ mod tests {
             Some(br#"{"key":"sk-channel-secret","label":"sk-channel-secret"}"#.as_slice())
         );
 
-        // The rendered request (and therefore the channel key) must never be
-        // written into the snapshot tables.
+        // 渲染后的请求（乃至渠道 key）绝不能写入快照表。
         let stored: (String,) = sqlx::query_as(
             "SELECT COALESCE(windows_json,'') || COALESCE(detail_json,'') || \
                     COALESCE(label,'') || COALESCE(currency,'') || COALESCE(error_kind,'') \
@@ -2726,8 +3719,7 @@ mod tests {
         assert!(!config_dump.0.contains("sk-channel-secret"));
     }
 
-    /// Minimal one-shot HTTP upstream that captures the raw request text and
-    /// answers with `body`.
+    /// 最小的一次性 HTTP 上游：捕获原始请求文本并返回 `body`。
     async fn spawn_http_upstream(
         body: &'static str,
     ) -> (u16, tokio::sync::mpsc::UnboundedReceiver<String>) {
@@ -2781,8 +3773,7 @@ mod tests {
         (port, rx)
     }
 
-    /// The custom adapter's PUT (and its request body) must reach a real
-    /// upstream through the shared HTTP client port.
+    /// `custom` 适配器的 PUT（及其请求体）必须经共享 HTTP 客户端端口到达真实上游。
     #[tokio::test]
     async fn custom_put_reaches_a_real_http_upstream_with_body() {
         let (port, mut requests) = spawn_http_upstream(r#"{"data":{"remaining":3.5}}"#).await;
@@ -2838,7 +3829,7 @@ mod tests {
             "panel-token-secret"
         );
 
-        // An empty token string keeps the stored one; clear_token removes it.
+        // 空 token 字符串保留原值；clear_token 则删除它。
         let mut keep = base_input("newapi", true);
         keep.token = Some(String::new());
         state.balance.save_config("ch-1", keep).await.unwrap();
@@ -2857,7 +3848,7 @@ mod tests {
         let (state, _dir) = test_state(mock.clone(), RuntimeLimits::default()).await;
         seed_channel(&state, "https://relay.example.com").await;
 
-        // custom without a path
+        // custom 缺少 path
         let error = state
             .balance
             .save_config("ch-1", base_input("custom", true))
@@ -2865,7 +3856,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, BalanceError::Invalid(_)));
 
-        // unknown adapter
+        // 未知适配器
         let error = state
             .balance
             .save_config("ch-1", base_input("auto", true))
@@ -2873,7 +3864,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, BalanceError::Invalid(_)));
 
-        // too many headers
+        // header 过多
         let mut too_many = BTreeMap::new();
         for index in 0..=MAX_CUSTOM_HEADERS {
             too_many.insert(format!("X-Test-{index}"), "value".into());
@@ -2884,21 +3875,21 @@ mod tests {
         let error = state.balance.save_config("ch-1", input).await.unwrap_err();
         assert!(matches!(error, BalanceError::Invalid(_)));
 
-        // oversized body
+        // body 过大
         let mut input = base_input("custom", true);
         input.path = Some("/balance".into());
         input.body = Some("x".repeat(MAX_CUSTOM_BODY_BYTES + 1));
         let error = state.balance.save_config("ch-1", input).await.unwrap_err();
         assert!(matches!(error, BalanceError::Invalid(_)));
 
-        // mapping path must be a JSON path
+        // mapping path 必须是 JSON 路径
         let mut input = base_input("custom", true);
         input.path = Some("/balance".into());
         input.mapping.remaining = Some("data.balance".into());
         let error = state.balance.save_config("ch-1", input).await.unwrap_err();
         assert!(matches!(error, BalanceError::Invalid(_)));
 
-        // unsupported method
+        // 不支持的方法
         let mut input = base_input("custom", true);
         input.path = Some("/balance".into());
         input.method = Some("DELETE".into());
@@ -2907,7 +3898,7 @@ mod tests {
         assert_eq!(mock.calls(), 0, "validation must never hit the network");
     }
 
-    // ------------------------------------------------------ maintenance
+    // ------------------------------------------------------ 维护任务
 
     #[tokio::test]
     async fn maintenance_refreshes_enabled_channels_on_its_interval() {
@@ -2978,7 +3969,7 @@ mod tests {
             Some("org_3")
         );
         assert!(command_code_org_id(br#"{"user":{"userName":"x"}}"#).is_none());
-        // The usage summary is optional: credits/windows still parse.
+        // 用量汇总可选：credits/窗口仍能解析。
         let fallback = parse_command_code(whoami, credits, None, None, "org_1").unwrap();
         assert_eq!(fallback.used, None);
         assert_eq!(fallback.total, Some(16.0));
@@ -3010,8 +4001,8 @@ mod tests {
         assert!(parse_command_code(whoami, b"{}", None, None, "org_1").is_err());
     }
 
-    /// Command Code quota is a three-step read-only flow: whoami → credits →
-    /// usage summary, all with the channel API key.
+    /// Command Code 额度是四步只读流程：whoami → credits → usage summary
+    /// → subscriptions，全部用渠道 API key。
     #[tokio::test]
     async fn command_code_balance_queries_whoami_credits_and_summary() {
         let mock = MockUpstream::new(|request| {
@@ -3166,8 +4157,8 @@ mod tests {
         assert!(requests.iter().any(|r| r.url.ends_with("/alpha/billing/credits")));
     }
 
-    /// The global Command Code switch gates the balance sidecar too: while
-    /// disabled the query is classified and performs zero upstream requests.
+    /// 全局 Command Code 开关同样管控余额旁路：禁用时查询被归类为 `disabled`，
+    /// 且不发出任何上游请求。
     #[tokio::test]
     async fn command_code_balance_is_blocked_while_disabled() {
         let mock = MockUpstream::always(200, "{}");

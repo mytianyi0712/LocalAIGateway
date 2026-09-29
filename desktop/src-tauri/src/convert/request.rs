@@ -1,9 +1,14 @@
-//! 请求方向转换：入口协议 → 上游协议（request.rs）。
+//! 请求方向转换：入口协议 → 上游协议。
+//!
+//! 职责：按 `ConversionStrategy` 注册表把入口请求体转换为目标上游协议的请求体。
+//! 边界：只做报文形态转换；不支持的方向直接报错，不在此处做路由或模型映射。
+//! 关键不变量：转换结果的顶层 `model` 一律替换为上游模型名；未知协议对报错而非
+//! 静默透传。
 
 use super::*;
 
 impl ConversionStrategy {
-    /// Registry: which strategy converts `entry` requests for `upstream`.
+    /// 注册表：`entry` 的请求由哪种策略转换给 `upstream`。
     pub fn for_pair(entry: &str, upstream: &str) -> Option<Self> {
         use ConversionStrategy::*;
         match (entry, upstream) {
@@ -12,8 +17,8 @@ impl ConversionStrategy {
             ("claude", "openai_responses") => Some(ClaudeToResponses),
             ("claude", "gemini") => Some(ClaudeToGemini),
             ("claude", "command_code") => Some(ClaudeToCommandCode),
-            // OpenAI chat entry: identity for the Provider-API companion body,
-            // and silent conversion into Command Code for direct requests.
+            // OpenAI chat 入口：Provider API 伴生体保持原样，
+            // 直连请求则静默转换为 Command Code。
             ("openai_compatible", "openai_compatible") => Some(Passthrough),
             ("openai_compatible", "command_code") => Some(ChatToCommandCode),
             ("openai_responses", "openai_compatible") => Some(ResponsesToChat),
@@ -217,8 +222,8 @@ pub(super) fn claude_to_responses_value(upstream_model: &str, data: &Value) -> V
         "input": items,
         "stream": data.get("stream").and_then(Value::as_bool).unwrap_or(false),
     });
-    if data.get("max_tokens").is_some_and(|value| value.is_i64()) {
-        payload["max_output_tokens"] = data.get("max_tokens").cloned().unwrap();
+    if let Some(value) = data.get("max_tokens").filter(|value| value.is_i64()) {
+        payload["max_output_tokens"] = value.clone();
     }
     for key in ["temperature", "top_p"] {
         if let Some(value) = data.get(key) {
@@ -354,10 +359,10 @@ pub(super) fn claude_to_gemini(upstream_model: &str, data: &Value) -> Value {
         payload["tools"] = Value::Array(tools);
     }
     let mut generation_config = serde_json::Map::new();
-    if data.get("max_tokens").is_some_and(|value| value.is_i64()) {
+    if let Some(value) = data.get("max_tokens").filter(|value| value.is_i64()) {
         generation_config.insert(
             "maxOutputTokens".into(),
-            data.get("max_tokens").cloned().unwrap(),
+            value.clone(),
         );
     }
     for (from, to) in [
@@ -391,9 +396,11 @@ pub(super) fn claude_to_gemini(upstream_model: &str, data: &Value) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// Responses entry helpers
+// Responses 入口助手
 // ---------------------------------------------------------------------------
 
+// 与 mod.rs::text / content_text 的差异：Option 入参、只认 input_text/text 块、
+// 空结果回落 None（而非空串）；不合并。
 pub(super) fn responses_instructions_text(value: Option<&Value>) -> Option<String> {
     match value {
         None => None,
@@ -419,6 +426,7 @@ pub(super) fn responses_instructions_text(value: Option<&Value>) -> Option<Strin
     }
 }
 
+// 与 mod.rs::text 的差异：不处理数组、Object 只取 .text、缺失时返回 None（text 返回空串）；不合并。
 pub(super) fn responses_text(value: &Value) -> Option<String> {
     match value {
         Value::String(value) => Some(value.clone()),
@@ -427,6 +435,8 @@ pub(super) fn responses_text(value: &Value) -> Option<String> {
     }
 }
 
+// 与 commandcode.rs::responses_tools_to_cc 的差异：输出为嵌套的
+// {"type":"function","function":{...}} 而非 CC 的扁平 name/input_schema；不合并。
 pub(super) fn responses_tools_to_openai(tools: &Value) -> Option<Vec<Value>> {
     let mut result = Vec::new();
     for tool in tools.as_array()? {
@@ -465,6 +475,7 @@ pub(super) fn responses_tool_choice(tool_choice: &Value) -> Option<Value> {
     None
 }
 
+// 与 responses_tools_to_openai 的差异：输出 Anthropic 形（顶层 name/description/input_schema）；不合并。
 pub(super) fn responses_tools_to_claude(tools: &Value) -> Option<Vec<Value>> {
     let mut result = Vec::new();
     for tool in tools.as_array()? {
@@ -488,6 +499,7 @@ pub(super) fn responses_tools_to_claude(tools: &Value) -> Option<Vec<Value>> {
     }
 }
 
+// 与 responses_tools_to_openai/claude 的差异：整体包一层 {"functionDeclarations": [...]}；不合并。
 pub(super) fn responses_tools_to_gemini(tools: &Value) -> Option<Vec<Value>> {
     let mut declarations = Vec::new();
     for tool in tools.as_array()? {
@@ -642,11 +654,11 @@ pub(super) fn responses_to_chat(upstream_model: &str, data: &Value) -> Value {
         "messages": messages,
         "stream": data.get("stream").and_then(Value::as_bool).unwrap_or(false),
     });
-    if data
+    if let Some(value) = data
         .get("max_output_tokens")
-        .is_some_and(|value| value.is_i64())
+        .filter(|value| value.is_i64())
     {
-        payload["max_tokens"] = data.get("max_output_tokens").cloned().unwrap();
+        payload["max_tokens"] = value.clone();
     }
     for key in ["temperature", "top_p"] {
         if let Some(value) = data.get(key) {
@@ -735,11 +747,11 @@ pub(super) fn responses_to_claude(upstream_model: &str, data: &Value) -> Value {
         "messages": messages,
         "stream": data.get("stream").and_then(Value::as_bool).unwrap_or(false),
     });
-    if data
+    if let Some(value) = data
         .get("max_output_tokens")
-        .is_some_and(|value| value.is_i64())
+        .filter(|value| value.is_i64())
     {
-        payload["max_tokens"] = data.get("max_output_tokens").cloned().unwrap();
+        payload["max_tokens"] = value.clone();
     }
     for key in ["temperature", "top_p"] {
         if let Some(value) = data.get(key) {
@@ -846,13 +858,13 @@ pub(super) fn responses_to_gemini(upstream_model: &str, data: &Value) -> Value {
         payload["tools"] = Value::Array(tools);
     }
     let mut generation_config = serde_json::Map::new();
-    if data
+    if let Some(value) = data
         .get("max_output_tokens")
-        .is_some_and(|value| value.is_i64())
+        .filter(|value| value.is_i64())
     {
         generation_config.insert(
             "maxOutputTokens".into(),
-            data.get("max_output_tokens").cloned().unwrap(),
+            value.clone(),
         );
     }
     for key in ["temperature", "topP"] {
@@ -867,7 +879,7 @@ pub(super) fn responses_to_gemini(upstream_model: &str, data: &Value) -> Value {
     payload
 }
 
-/// Entry-agnostic request conversion (mirrors convert_mapped_request).
+/// 与入口协议无关的请求转换入口。
 pub fn convert_request(
     entry: &str,
     upstream_protocol: &str,
@@ -915,5 +927,5 @@ pub fn convert_request(
 }
 
 // ---------------------------------------------------------------------------
-// upstream -> Claude response conversion (non-streaming)
+// 上游 → Claude 响应转换（非流式）
 // ---------------------------------------------------------------------------

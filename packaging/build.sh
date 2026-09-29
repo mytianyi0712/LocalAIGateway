@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# 打包入口：按目标分发到各构建脚本，并把当前版本的产物收集进 releases/。
+#
+# 用法：packaging/build.sh <windows|appimage|arch|windows-wine|all>
+# 前提：需要 cargo 与目标平台对应的工具链（Tauri CLI / makepkg / Wine）；
+#       releases/ 中与当前 VERSION 不匹配的旧产物会被清理。
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -44,8 +49,7 @@ run_target() {
       esac
       (
         cd "${ROOT_DIR}/desktop/src-tauri"
-        # Tauri leaves stale NSIS bundles; drop them so releases/ only sees
-        # the current VERSION.
+        # Tauri 会残留上一次的 NSIS 产物；先清掉，保证 releases/ 只看到当前 VERSION 的成品。
         rm -rf target/release/bundle/nsis
         cargo tauri build --bundles nsis
       )
@@ -85,9 +89,8 @@ collect_artifacts() {
       files=("${ROOT_DIR}/target/packages/windows-wine/"*.exe)
       ;;
   esac
-  # Tauri leaves stale bundles from previous versions in target/; copy only
-  # artifacts whose name carries the current VERSION (both the semver form and
-  # the Arch underscore form, e.g. 0.2.1-fix1 vs 0.2.1_fix1).
+  # target/ 里会残留旧版本的 bundle；只复制文件名带当前 VERSION 的产物
+  #（semver 形式与 Arch 下划线形式都算，例如 0.2.1-fix1 与 0.2.1_fix1）。
   local version
   version="$(read_project_version)"
   local patterns=("${version}" "${version//-/_}")
@@ -124,11 +127,9 @@ if [[ -z "$TARGET" || "$TARGET" == "-h" || "$TARGET" == "--help" ]]; then
   [[ -z "$TARGET" ]] && exit 2 || exit 0
 fi
 
-# The releases/ folder is a pure artifact directory. Every build removes
-# stale artifacts of previous versions (identified by the current VERSION in
-# both the semver form and the Arch underscore form), while keeping artifacts
-# of the current version so step-by-step builds (appimage, then arch, then
-# windows) accumulate into one complete release set.
+# releases/ 是纯产物目录：每次构建都清掉不属于当前 VERSION 的旧产物
+#（按 semver 与 Arch 下划线两种形式识别），但保留当前版本的产物，
+# 让分步构建（先 appimage、再 arch、后 windows）能累积成完整的一套发布件。
 clean_stale_releases() {
   local version
   version="$(read_project_version)"

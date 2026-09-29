@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# 构建 Arch Linux 包：把 packaging/arch/PKGBUILD 模板拷进构建目录，用 Cargo.toml 的版本
+# 覆盖 pkgver，再交给 makepkg 产出 .pkg.tar.zst。
+#
+# 用法：packaging/build-arch.sh（可用 MAKEPKG_FLAGS 覆盖默认的 makepkg 参数）
+# 前提：需要 makepkg（base-devel）与 cargo；仓库根目录会以符号链接 repo 暴露给 PKGBUILD。
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,8 +31,8 @@ if not match:
 print(match.group(1))
 PY
 )"
-# Arch pkgver forbids hyphens (allowed: alphanumerics, ., _, +); map the
-# semver prerelease separator to an underscore, e.g. 0.2.0-fix1 -> 0.2.0_fix1.
+# Arch 的 pkgver 不允许连字符（只允许字母数字与 . _ +），因此把 semver 预发布
+# 分隔符映射为下划线，例如 0.2.0-fix1 -> 0.2.0_fix1。
 VERSION="${VERSION//-/_}"
 
 chmod -R u+rwX "${BUILD_DIR}" 2>/dev/null || true

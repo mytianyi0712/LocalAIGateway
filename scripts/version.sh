@@ -23,6 +23,9 @@
 # 只读取 tauri.conf.json（tauri-build 2.6.3 src/lib.rs），删除该字段会让
 # Windows 构建产物丢失版本元数据。因此保留并同步 tauri.conf.json 的 version，
 # 而不是把 Cargo.toml 当作 Tauri 侧唯一来源。
+#
+# 前提：需要 python3（或 python）读写版本字面量；`sync` 需 cargo 重新解析
+# `Cargo.lock`，`check` 只读取现有文件，不需要 cargo。
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -7,11 +7,13 @@
 # 产物写入 releases/：
 #   - Local AI Gateway_<ver>_x64-setup.exe      本机 cargo tauri (NSIS)
 #   - Local AI Gateway_<ver>_amd64.AppImage     Arch WSL
-#   - local-ai-gateway_<ver>_amd64.deb          Arch WSL
+#   - Local AI Gateway_<ver>_amd64.deb          Arch WSL
 #   - local-ai-gateway-<pkgver>-1-x86_64.pkg.tar.zst  Arch WSL
 #
 # Linux 宿主：AppImage/deb/Arch 本机构建，Windows 走 Wine 交叉编译。
 # 首次配置 WSL：make wsl-setup
+#
+# 前提：需要 make 与 bash；Windows 宿主还需可用的 WSL(archlinux) 发行版与已配置的 builder 用户。
 
 .DEFAULT_GOAL := help
 
@@ -21,14 +23,14 @@
 	check-layers wsl-setup \
 	desktop-build-linux desktop-build-windows
 
-# Recipes are POSIX. MSYS make already uses /bin/sh; cmd.exe make gets bash.
+# 配方按 POSIX 编写：MSYS make 本身用 /bin/sh；cmd.exe 下的 make 则切到 bash。
 ifeq ($(OS),Windows_NT)
 HOST := windows
 ifneq ($(findstring cmd,$(SHELL)),)
 SHELL := bash
 .SHELLFLAGS := -c
 endif
-# Mixed Windows path (D:/...) for wsl --cd and human logs.
+# 供 wsl --cd 与人工查看日志使用的 Windows 混合路径（D:/…）。
 ifneq ($(shell command -v cygpath 2>/dev/null),)
 WIN_ROOT := $(shell cygpath -m "$(CURDIR)")
 else
@@ -49,12 +51,11 @@ BASH ?= bash
 VERSION_SH = $(BASH) scripts/version.sh
 BUILD_SH = $(BASH) packaging/build.sh
 
-# $1 is a bash command run at the repo root.
-# Windows: Arch WSL as non-root builder (makepkg refuses root).
-# Cargo artifacts go to $HOME/.cache so they never share target/ with the
-# Windows host (same `release/` name, different ABI) and so chmod/exec work
-# — drvfs on /mnt/d cannot set the execute bit.
-# Unix: the same command on the host.
+# $1 为在仓库根目录执行的 bash 命令。
+# Windows：经 Arch WSL 以非 root 的 builder 用户执行（makepkg 拒绝 root 运行）。
+# Cargo 产物写入 $HOME/.cache，避免与 Windows 宿主共用 target/（同名 `release/`
+# 但 ABI 不同），同时保证 chmod/exec 可用——/mnt/d 的 drvfs 无法设置可执行位。
+# Unix：直接在宿主执行同一命令。
 ifeq ($(HOST),windows)
 define linux_sh
 	$(WSL) -d $(WSL_DISTRO) -u $(WSL_BUILDER) -e bash -lc 'export CARGO_TARGET_DIR="$$HOME/.cache/local-ai-gateway/target"; mkdir -p "$$CARGO_TARGET_DIR"; cd "$(WSL_ROOT)" && $(1)'

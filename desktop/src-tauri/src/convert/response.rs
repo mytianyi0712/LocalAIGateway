@@ -1,4 +1,9 @@
-//! 非流式响应转换：上游协议 → 入口协议，含 DSML 工具调用解析（response.rs）。
+//! 非流式响应转换：上游协议 → 入口协议，含 DSML 工具调用解析。
+//!
+//! 职责：把非流式上游响应体转换为入口协议响应；把文本中的 DSML（DeepSeek
+//! 风格）工具调用标记解析成结构化 function_call。
+//! 边界：只处理非流式响应，流式转换在 `stream.rs`，错误响应在 `error.rs`。
+//! 关键不变量：同协议映射按字节透传；usage 换算保持上游与入口语义一致。
 
 use super::*;
 
@@ -22,6 +27,7 @@ pub(super) fn stop_reason_gemini(reason: &str) -> &'static str {
     }
 }
 
+// 与 responses_usage 的差异：输出 Anthropic 形，且仅当缓存数 > 0 才写出缓存字段；不合并。
 pub(super) fn claude_usage(
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
@@ -32,13 +38,25 @@ pub(super) fn claude_usage(
         "input_tokens": input_tokens.unwrap_or(0),
         "output_tokens": output_tokens.unwrap_or(0),
     });
-    if cache_read.is_some_and(|value| value > 0) {
-        usage["cache_read_input_tokens"] = json!(cache_read.unwrap());
+    if let Some(value) = cache_read.filter(|value| *value > 0) {
+        usage["cache_read_input_tokens"] = json!(value);
     }
-    if cache_write.is_some_and(|value| value > 0) {
-        usage["cache_creation_input_tokens"] = json!(cache_write.unwrap());
+    if let Some(value) = cache_write.filter(|value| *value > 0) {
+        usage["cache_creation_input_tokens"] = json!(value);
     }
     usage
+}
+
+/// 上游把 `prompt_tokens` 当作含缓存命中的总数，而 Anthropic 的
+/// `input_tokens` 只算未命中部分。非流式（[`openai_compatible_to_claude`]）与
+/// 流式（`stream::anthropic_input_tokens`）的换算式完全一致，故共用本函数；
+/// 两边仅「是否启用换算」的判据来源不同（JSON 标记 vs 累积标志）。
+pub(super) fn uncached_input_tokens(
+    total: Option<i64>,
+    cache_read: Option<i64>,
+    cache_write: Option<i64>,
+) -> Option<i64> {
+    total.map(|total| (total - cache_read.unwrap_or(0) - cache_write.unwrap_or(0)).max(0))
 }
 
 pub(super) fn openai_compatible_to_claude(claude_model: &str, data: &Value) -> Value {
@@ -98,18 +116,15 @@ pub(super) fn openai_compatible_to_claude(claude_model: &str, data: &Value) -> V
         .get("prompt_tokens")
         .or_else(|| usage.get("input_tokens"))
         .and_then(Value::as_i64);
-    // Hard pit 9: Command Code marks `prompt_tokens` as a total including
-    // cache hits; Anthropic `input_tokens` is the non-cached part. The
-    // marker only exists on Command Code bodies, so other upstreams keep
-    // their existing semantics.
+    // Command Code 把 `prompt_tokens` 视为含缓存命中的总数，而 Anthropic 的
+    // `input_tokens` 只算未命中部分。该标记只出现在 Command Code 报文里，
+    // 其它上游保持原有语义。
     let input_tokens = if usage
-        .get(super::commandcode::INPUT_INCLUDES_CACHE)
+        .get(INPUT_INCLUDES_CACHE)
         .and_then(Value::as_bool)
         == Some(true)
     {
-        input_tokens.map(|total| {
-            (total - cache_read.unwrap_or(0) - cache_write.unwrap_or(0)).max(0)
-        })
+        uncached_input_tokens(input_tokens, cache_read, cache_write)
     } else {
         input_tokens
     };
@@ -244,9 +259,10 @@ pub(super) fn gemini_to_claude(claude_model: &str, data: &Value) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// Responses envelope / usage / DSML
+// Responses 信封 / usage / DSML
 // ---------------------------------------------------------------------------
 
+// 与 claude_usage 的差异：输出 Responses 形（含 total_tokens 与 *_details），缓存/推理缺省写 0；不合并。
 pub(super) fn responses_usage(
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
@@ -303,7 +319,7 @@ pub(super) fn responses_envelope(
     })
 }
 
-// -- DSML (DeepSeek tool-invocation markup) parsing -------------------------
+// -- DSML（DeepSeek 工具调用标记）解析 -----------------------------------------
 
 pub(super) const DSML_BLOCK_NAMES: [&str; 2] = ["tool_calls", "function_calls"];
 pub(super) const DSML_BAR_VARIANTS: [&str; 4] = ["|", "｜", "||", "｜｜"];
@@ -322,9 +338,8 @@ pub(super) struct TagMatch {
     closing: bool,
 }
 
-/// Match `<{bars}DSML{bars}{name} ...>` / `</{bars}DSML{bars}{name}>` at `at`
-/// (which must point at `<`). Returns the tag name, its attribute text and the
-/// byte index just past `>`.
+/// 在 `at` 处匹配 `<{bars}DSML{bars}{name} ...>` / `</{bars}DSML{bars}{name}>`
+/// （`at` 必须指向 `<`）。返回标签名、属性文本以及 `>` 之后一字节的索引。
 pub(super) fn match_tag(text: &str, at: usize) -> Option<TagMatch> {
     let rest = &text[at + 1..];
     let (closing, body) = if let Some(rest) = rest.strip_prefix('/') {
@@ -364,9 +379,8 @@ pub(super) fn match_tag(text: &str, at: usize) -> Option<TagMatch> {
     })
 }
 
-/// Find the start of a DSML block via substring matching — mirrors the Python
-/// `_find_dsml_start` (markers intentionally omit the trailing bar run, so the
-/// real `<|DSML|tool_calls|>` prefix-matches `<|DSML|tool_calls>`).
+/// 用子串匹配定位 DSML 块的起点。标记有意省略结尾的竖线串，因此真实的
+/// `<|DSML|tool_calls|>` 会前缀匹配 `<|DSML|tool_calls>`。
 pub(super) fn find_dsml_start(text: &str) -> Option<(usize, String, String)> {
     let mut found: Option<(usize, String, String)> = None;
     for name in DSML_BLOCK_NAMES {
@@ -383,7 +397,7 @@ pub(super) fn find_dsml_start(text: &str) -> Option<(usize, String, String)> {
     found
 }
 
-/// Earliest occurrence of a `<bars>DSML<bars>memory pass:` noise marker.
+/// `<bars>DSML<bars>memory pass:` 噪声标记的最早出现位置。
 pub(super) fn find_dsml_noise_start(text: &str) -> Option<usize> {
     let mut found: Vec<usize> = Vec::new();
     for bars in DSML_BAR_VARIANTS {
@@ -403,8 +417,7 @@ pub(super) fn dsml_partial_prefix_length(text: &str) -> usize {
                 format!("<{bars}DSML{bars}{name}>"),
                 format!("<{bars}DSML{bars}memory pass:"),
             ] {
-                // Test only char-boundary prefixes (markers may contain the
-                // multi-byte fullwidth bar '｜').
+                // 只测字符边界上的前缀（标记里可能含多字节的全角竖线 '｜'）。
                 for (index, _) in marker.char_indices() {
                     if index == 0 || index >= marker.len() {
                         continue;
@@ -561,7 +574,7 @@ pub(super) fn dsml_arguments(body: &str) -> Value {
     Value::Object(arguments)
 }
 
-/// Find the matching closing tag for `name`; returns (content_end, tag_end).
+/// 找到 `name` 的配对闭合标签；返回 (内容结束, 标签结束)。
 pub(super) fn find_closing_tag(text: &str, from: usize, name: &str) -> Option<(usize, usize)> {
     let mut at = from;
     while let Some(relative) = text[at..].find('<') {
@@ -577,7 +590,7 @@ pub(super) fn find_closing_tag(text: &str, from: usize, name: &str) -> Option<(u
     None
 }
 
-/// Parse the tool invocations inside one DSML block (invoke + message forms).
+/// 解析一个 DSML 块内的工具调用（invoke 与 message 两种形式）。
 pub(super) fn parse_dsml_invocations(block: &str) -> Vec<Value> {
     let mut matches: Vec<(usize, String, Value)> = Vec::new();
     let mut at = 0;
@@ -595,7 +608,7 @@ pub(super) fn parse_dsml_invocations(block: &str) -> Vec<Value> {
                 at = close.1;
                 continue;
             }
-            // message blocks close with </...invoke> (Python parity)
+            // message 块用 </...invoke> 闭合（沿用既有实现约定）。
             if !tag.closing
                 && tag.name == "message"
                 && let Some(close) = find_closing_tag(block, tag.end, "invoke")
@@ -623,7 +636,7 @@ pub(super) fn parse_dsml_invocations(block: &str) -> Vec<Value> {
         .collect()
 }
 
-/// Split chat text into plain-text and DSML function-call segments.
+/// 把 chat 文本拆成纯文本段与 DSML function_call 段。
 pub(super) fn split_dsml_content(text: &str) -> Vec<(String, Value)> {
     let mut segments: Vec<(String, Value)> = Vec::new();
     let mut remaining = text;
@@ -893,7 +906,7 @@ pub(super) fn gemini_to_responses(codex_model: &str, data: &Value) -> Value {
     )
 }
 
-/// Entry-agnostic non-streaming response conversion (convert_mapped_response).
+/// 与入口协议无关的非流式响应转换入口。
 pub fn convert_response(
     entry: &str,
     upstream_protocol: &str,
@@ -904,8 +917,7 @@ pub fn convert_response(
     let strategy = ConversionStrategy::for_pair(entry, upstream_protocol).ok_or_else(|| {
         anyhow::anyhow!("Unsupported conversion pair: {entry} -> {upstream_protocol}")
     })?;
-    // Same-protocol mapping is a pure pass-through: re-synthesizing would drop
-    // tool calls, reasoning items and usage (mirrors the Python adapters).
+    // 同协议映射按字节透传：重新序列化会丢失工具调用、推理项与 usage。
     if strategy == Passthrough {
         return Ok(body.to_vec());
     }
@@ -930,5 +942,5 @@ pub fn convert_response(
 }
 
 // ---------------------------------------------------------------------------
-// streaming conversion (MappedStreamConverter)
+// 流式转换（MappedStreamConverter）
 // ---------------------------------------------------------------------------

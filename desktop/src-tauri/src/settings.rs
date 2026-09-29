@@ -1,3 +1,11 @@
+//! 运行时设置的读取、校验与访问控制。
+//!
+//! 职责：从 `settings` 表读取运行时设置行并解码为 [`RuntimeSettings`]；校验写入
+//! 设置必须落在允许范围内；解密访问密钥并完成请求鉴权与密钥损坏状态查询。
+//! 边界：本模块只管设置/密钥的读写与鉴权，不负责代理转发，也不负责后台维护调度。
+//! 关键不变量：读取路径 fail-closed —— 任一行无法解码即报 [`ConfigCorrupted`]，
+//! 只有数据库中不存在的键才回退默认值；损坏的行绝不静默降级为默认值。
+
 use std::collections::HashMap;
 
 use anyhow::{Result, bail};
@@ -20,25 +28,23 @@ pub struct RuntimeSettings {
     pub stream_idle_timeout_seconds: i64,
     pub non_stream_total_timeout_seconds: i64,
     pub max_request_body_mb: i64,
-    /// Hard cap on the buffered plaintext/raw upstream response body for
-    /// paths that must convert (mapped non-stream). Streaming paths are
-    /// never buffered beyond this. (P1-1)
+    /// 必须转换的路径（非流式的映射路径）所缓冲的上游明文/原始响应体的硬上限。
+    /// 流式路径的缓冲绝不会超过该值。
     pub max_buffered_upstream_body_mb: i64,
     pub model_discovery_interval_hours: i64,
     pub log_retention_days: i64,
-    /// Command Code integration master switch (default off: zero upstream
-    /// Command Code requests while disabled).
+    /// Command Code 集成总开关（默认关闭：关闭期间不向上游发起任何 Command Code
+    /// 请求）。
     pub command_code_enabled: bool,
-    /// Idle timeout for the Command Code NDJSON stream (silent
-    /// `tool-input-*` windows included).
+    /// Command Code NDJSON 流的空闲超时（包含静默的 `tool-input-*` 窗口）。
     pub command_code_idle_timeout_seconds: i64,
-    /// Fingerprint/lifecycle re-init throttle (community baseline: 8h).
+    /// 指纹/生命周期重新初始化的节流间隔（社区基线：8 小时）。
     pub command_code_init_interval_hours: i64,
-    /// npm `latest` drift check cadence.
+    /// npm `latest` 版本漂移检查的周期。
     pub command_code_version_check_interval_hours: i64,
-    /// Command Code quota (balance) refresh cadence.
+    /// Command Code 配额（余额）刷新的周期。
     pub command_code_quota_interval_minutes: i64,
-    /// Max in-flight `/alpha/generate` requests per channel (one account).
+    /// 每个渠道（一个账号）在途 `/alpha/generate` 请求数的上限。
     pub command_code_max_concurrency: i64,
 }
 
@@ -69,14 +75,15 @@ impl Default for RuntimeSettings {
 }
 
 impl RuntimeSettings {
-    pub fn as_value(&self) -> Value {
-        serde_json::to_value(self).expect("settings serialize")
+    /// 序列化成设置页/接口用的 JSON。失败返回错误而不是 panic（release 构建
+    /// `panic=abort`，设置读取路径不该因为一次序列化失败杀死进程）。
+    pub fn as_value(&self) -> Result<Value, serde_json::Error> {
+        serde_json::to_value(self)
     }
 }
 
-/// Keys that belong to [`RuntimeSettings`]. Only these rows are read into
-/// the runtime settings object — preset caches and other non-runtime keys
-/// never leak in (P1-3).
+/// 属于 [`RuntimeSettings`] 的键。只有这些行会被读入运行时设置对象 —— 预设缓存
+/// 等非运行时键绝不会混入。
 const RUNTIME_SETTING_KEYS: &[&str] = &[
     "trust_local_network",
     "failure_threshold",
@@ -99,9 +106,8 @@ const RUNTIME_SETTING_KEYS: &[&str] = &[
     "command_code_max_concurrency",
 ];
 
-/// Raised when a stored runtime setting row cannot be decoded exactly (bad
-/// JSON, wrong type, or out of range). Reading must fail closed — a corrupt
-/// `trust_local_network` must never silently become `true` (P1-3).
+/// 当存储的运行时设置行无法被严格解码（JSON 非法或类型不符）时抛出。读取必须
+/// fail-closed —— 损坏的 `trust_local_network` 绝不能静默变成 `true`。
 #[derive(Debug)]
 pub struct ConfigCorrupted(pub String);
 
@@ -112,8 +118,7 @@ impl std::fmt::Display for ConfigCorrupted {
 }
 impl std::error::Error for ConfigCorrupted {}
 
-/// Integer value ranges per runtime setting; shared by the write-path
-/// validator and the strict read-path decode.
+/// 每个运行时设置的整数值范围；由写入路径的校验器与读取路径的严格解码共用。
 fn setting_ranges() -> HashMap<&'static str, (i64, i64)> {
     HashMap::from([
         ("failure_threshold", (1, 20)),
@@ -136,13 +141,11 @@ fn setting_ranges() -> HashMap<&'static str, (i64, i64)> {
     ])
 }
 
-/// Strict type + JSON check for ONE stored runtime setting row. The write
-/// path validates ranges via [`validate_updates`]; the read path rejects
-/// only STRUCTURAL corruption (bad JSON, wrong type) — out-of-range but
-/// well-typed values stay usable (consumers clamp defensively, e.g.
-/// `max(1)`), so a legitimate legacy configuration can never brick the
-/// gateway at startup. `trust_local_network` in particular can never
-/// silently degrade to `true` (P1-3).
+/// 对单条存储的运行时设置行做严格的类型 + JSON 校验。写入路径通过
+/// [`validate_updates`] 校验范围；读取路径只拒绝结构损坏（JSON 非法、类型不
+/// 符）—— 类型正确但越界的值仍可使用（消费方会防御性钳制，例如 `max(1)`），
+/// 因此合法的历史配置绝不会让网关在启动时瘫痪。尤其是 `trust_local_network`
+/// 绝不会静默降级为 `true`。
 fn strict_setting_check(key: &str, parsed: &Value) -> Result<(), ConfigCorrupted> {
     if matches!(key, "trust_local_network" | "command_code_enabled") {
         if !parsed.is_boolean() {
@@ -177,13 +180,11 @@ async fn runtime_setting_rows(db: &Database) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-/// Settings load from a raw pool handle (used by services that do not hold
-/// the full context, P2-1). Fail-closed (P1-3): any stored runtime row that
-/// is not exactly valid JSON of the right type and range is reported as
-/// [`ConfigCorrupted`] — the default is only used for keys absent from the
-/// database, never for corrupt rows.
+/// 从裸连接池句柄加载设置（供不持有完整 context 的服务使用）。fail-closed：任何
+/// 存储的运行时行若不是类型正确且合法的 JSON，都会以 [`ConfigCorrupted`] 报错 ——
+/// 默认值只用于数据库中不存在的键，绝不用于损坏的行。
 pub async fn runtime_settings_from(db: &Database) -> Result<RuntimeSettings> {
-    let mut value = RuntimeSettings::default().as_value();
+    let mut value = RuntimeSettings::default().as_value()?;
     for (key, raw) in runtime_setting_rows(db).await? {
         let parsed: Value = serde_json::from_str(&raw)
             .map_err(|error| ConfigCorrupted(format!("{key}: {error}")))?;
@@ -193,12 +194,18 @@ pub async fn runtime_settings_from(db: &Database) -> Result<RuntimeSettings> {
     Ok(serde_json::from_value(value)?)
 }
 
-/// Best-effort runtime settings for the settings page only: corrupt rows
-/// are skipped and reported by key so the page can show a repair hint
-/// instead of dying. Auth, proxying and maintenance NEVER use this — they
-/// fail closed via [`runtime_settings_from`].
+/// 仅供设置页使用的最佳努力运行时设置：损坏的行会被跳过并按键上报，以便页面
+/// 显示修复提示而不是直接失败。auth 与代理转发的读取走 [`runtime_settings_from`]，
+/// fail-closed；而维护调度中的 Command Code 路径当前实现为 fail-open（读取失败按
+/// 默认值处理，见 `maintenance.rs` 中的该调度分支）。
 pub async fn runtime_settings_ui(db: &Database) -> (RuntimeSettings, Vec<String>) {
-    let mut value = RuntimeSettings::default().as_value();
+    let mut value = match RuntimeSettings::default().as_value() {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(error = ?error, "runtime settings defaults are not serializable");
+            return (RuntimeSettings::default(), Vec::new());
+        }
+    };
     let mut corrupt = Vec::new();
     let rows = match runtime_setting_rows(db).await {
         Ok(rows) => rows,
@@ -241,7 +248,7 @@ pub struct AccessPolicy {
     pub gateway_key: String,
 }
 
-/// Raised when a stored access key cannot be parsed or decrypted.
+/// 当存储的访问密钥无法解析或解密时抛出。
 #[derive(Debug)]
 pub struct CorruptKey(pub String);
 
@@ -278,8 +285,8 @@ pub async fn access_policy(state: &Context) -> Result<AccessPolicy> {
     access_policy_from(&state.db, &state.secrets).await
 }
 
-/// Read-only corruption status of the two access keys, for admin UI hints.
-/// Never propagates errors: a corrupt store reports `corrupt` instead.
+/// 两个访问密钥的只读损坏状态，用于管理端 UI 提示。绝不向上传播错误：存储损坏
+/// 时改为上报 `corrupt`。
 pub async fn key_statuses(state: &Context) -> Result<(bool, bool)> {
     let rows = sqlx::query("SELECT key, CAST(value_json AS TEXT) value_json FROM settings WHERE key IN ('admin_access_key', 'gateway_access_key')")
         .fetch_all(state.db.pool()).await?;
@@ -391,6 +398,36 @@ pub fn validate_updates(value: &Value) -> Result<()> {
     Ok(())
 }
 
+/// 读取 `settings` 表中的原始字符串值（键不存在返回 `None`）。
+///
+/// 返回的是存储文本本身（即 JSON 文本，字符串值带引号）；调用方按需解析。
+/// 单键读写只有这一处实现：`commandcode` 的 JSON 助手、opencode 会话 id 与
+/// 管理端状态页都经它访问 KV 表。
+pub async fn read_setting(db: &Database, key: &str) -> Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar::<_, String>("SELECT CAST(value_json AS TEXT) FROM settings WHERE key=?")
+            .bind(key)
+            .fetch_optional(db.pool())
+            .await?,
+    )
+}
+
+/// 写入 `settings` 表的字符串值（upsert；`value` 必须是合法 JSON 文本）。
+///
+/// 需要在调用方事务内写入时用 [`save_setting_tx`]，本函数走连接池。
+pub async fn write_setting(db: &Database, key: &str, value: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO settings(key, value_json, updated_at) VALUES(?, ?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
+    )
+    .bind(key)
+    .bind(value)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
 pub async fn save_setting_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     key: &str,
@@ -409,7 +446,13 @@ pub fn settings_with_hints(
     admin_corrupt: bool,
     gateway_corrupt: bool,
 ) -> Value {
-    let mut value = settings.as_value();
+    let mut value = match settings.as_value() {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(error = ?error, "settings serialization failed");
+            Value::Null
+        }
+    };
     let status = |corrupt: bool, key: &str| {
         if corrupt {
             "corrupt".to_owned()
@@ -454,11 +497,10 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
-/// Stable per-install id used as the fallback `x-opencode-session` value
-/// for OpenCode Zen/Go upstreams (see `protocol::apply_opencode_session`).
-/// Persisted once so the upstream keeps the same session across restarts;
-/// when the row cannot be read or written an ephemeral id keeps proxying
-/// alive, because the header only affects upstream routing/caching.
+/// 稳定的一次性安装 id，用作 OpenCode Zen/Go 上游的兜底 `x-opencode-session`
+/// 值（见 `protocol::apply_opencode_session`）。持久化一次，使上游在重启后保持
+/// 同一会话；当该行无法读写时用一个临时 id 维持代理可用，因为该请求头只影响
+/// 上游的路由/缓存。
 pub async fn opencode_session_id(db: &Database) -> String {
     match load_or_create_opencode_session_id(db).await {
         Ok(value) => value,
@@ -470,108 +512,35 @@ pub async fn opencode_session_id(db: &Database) -> String {
 }
 
 async fn load_or_create_opencode_session_id(db: &Database) -> Result<String> {
-    let existing: Option<String> = sqlx::query_scalar::<_, String>(
-        "SELECT CAST(value_json AS TEXT) FROM settings WHERE key='opencode_session_id'",
-    )
-    .fetch_optional(db.pool())
-    .await?
-    .and_then(|raw| serde_json::from_str::<String>(&raw).ok())
-    .filter(|value| HeaderValue::from_str(value).is_ok() && !value.is_empty());
+    let existing = read_setting(db, "opencode_session_id")
+        .await?
+        .and_then(|raw| serde_json::from_str::<String>(&raw).ok())
+        .filter(|value| HeaderValue::from_str(value).is_ok() && !value.is_empty());
     if let Some(value) = existing {
         return Ok(value);
     }
     let value = uuid::Uuid::new_v4().to_string();
-    sqlx::query(
-        "INSERT INTO settings(key, value_json, updated_at) VALUES('opencode_session_id', ?, ?) \
-         ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
-    )
-    .bind(serde_json::to_string(&value)?)
-    .bind(chrono::Utc::now().to_rfc3339())
-    .execute(db.pool())
-    .await?;
+    write_setting(db, "opencode_session_id", &serde_json::to_string(&value)?).await?;
     Ok(value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{application::Context, config::AppConfig, db::Database};
-    use std::sync::Arc;
+    use crate::state::AppState;
+    use crate::test_support::TempDir;
 
-    async fn test_state() -> (Context, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("lagw-settings-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let db = Database::open(&dir.join("test.db")).await.unwrap();
-        let secrets = crate::crypto::SecretStore::load(&dir.join("master.key"))
-            .await
-            .unwrap();
-        let (telemetry, _rx) = crate::telemetry::Telemetry::new(1000);
-        let http: Arc<dyn crate::ports::UpstreamClient> =
-            Arc::new(crate::infrastructure::HttpClientPool::default());
-        let routes: Arc<dyn crate::ports::RouteRepository> =
-            crate::infrastructure::SqliteRouteRepository::new(db.clone());
-        let channels: Arc<dyn crate::ports::ChannelRepository> =
-            crate::infrastructure::SqliteChannelRepository::new(db.clone());
-        let clock: Arc<dyn crate::ports::Clock> = Arc::new(crate::infrastructure::SystemClock);
-        let background = crate::infrastructure::RuntimeSupervisor::new(
-            tokio_util::sync::CancellationToken::new(),
-        );
-        let limits = Arc::new(crate::runtime::RuntimeLimits::default());
-        let discovery = crate::discovery::DiscoveryService::new(
-            db.clone(),
-            secrets.clone(),
-            Arc::clone(&http),
-            Arc::clone(&channels),
-            Arc::clone(&clock),
-            Arc::clone(&background),
-            Arc::clone(&limits),
-        );
-        let notifier: std::sync::Arc<dyn crate::ports::Notifier> =
-            crate::notification::DesktopNotifier::new(std::time::Duration::from_millis(50));
-        let proxy = crate::proxy::ProxyService::new(
-            db.clone(),
-            secrets.clone(),
-            Arc::clone(&http),
-            routes.clone(),
-            telemetry.clone(),
-            Arc::clone(&clock),
-            Arc::clone(&limits),
-            crate::notification::DesktopNotifier::new(std::time::Duration::from_millis(50)),
-        );
-        let balance = crate::balance::BalanceService::new(
-            db.clone(),
-            secrets.clone(),
-            Arc::clone(&http),
-            channels.clone(),
-            Arc::clone(&clock),
-            Arc::clone(&limits),
-        );
-        let command_code_login = crate::commandcode_login::CommandCodeLogin::new(std::sync::Arc::clone(&http));
-        let state = crate::application::Context {
-            config: Arc::new(AppConfig::default()),
-            db: db.clone(),
-            secrets: secrets.clone(),
-            http,
-            routes,
-            channels,
-            clock,
-            notifier,
-            discovery,
-            proxy,
-            telemetry,
-            background,
-            limits,
-            balance,
-            admin: crate::admin::AdminService::new(db.clone(), secrets.clone()),
-            command_code_login,
-            recovery: crate::auth::RecoverySession::new(),
-        };
+    async fn test_state() -> (AppState, TempDir) {
+        // 统一夹具：临时目录 + 整套 Context（见 `crate::test_support`）。
+        let crate::test_support::TestEnv {
+            dir,
+            context: state,
+        } = crate::test_support::context("settings").await;
         (state, dir)
     }
 
-    /// P2-8: an undecryptable stored key surfaces as a typed CorruptKey
-    /// (for the admin API) and as a `corrupt` status (for the settings page)
-    /// instead of being silently treated as missing.
+    /// 无法解密的存储密钥会以类型化的 CorruptKey（面向管理端 API）以及
+    /// `corrupt` 状态（面向设置页）暴露，而不是被静默当作缺失处理。
     #[tokio::test]
     async fn corrupt_access_key_surfaces_as_corrupt() {
         let (state, dir) = test_state().await;
@@ -598,9 +567,8 @@ mod tests {
         let _ = dir;
     }
 
-    /// P1-3: a corrupt `trust_local_network` row must fail the read (never
-    /// silently fall back to the default `true`), and auth must reject —
-    /// the gateway can never become "trust local network" from corruption.
+    /// 损坏的 `trust_local_network` 行必须让读取失败（绝不静默回退到默认的
+    /// `true`），且鉴权必须拒绝 —— 损坏绝不能让网关变成“信任本地网络”。
     #[tokio::test]
     async fn corrupt_trust_local_network_fails_closed() {
         let (state, dir) = test_state().await;
@@ -622,8 +590,7 @@ mod tests {
             error.to_string().contains("trust_local_network"),
             "the corrupt key must be named in the error: {error}"
         );
-        // Auth reads fail closed too: no request may be admitted because a
-        // stored row is broken.
+        // 鉴权读取同样 fail-closed：不能因为某行存储损坏就放行任何请求。
         let headers = axum::http::HeaderMap::new();
         assert!(
             authorize_admin(&state, &headers).await.is_err(),
@@ -635,13 +602,13 @@ mod tests {
                 .is_err(),
             "gateway auth must reject when trust setting is corrupt"
         );
-        // The settings page still loads and names the corrupt key for repair.
+        // 设置页仍能加载并点名损坏的键，供修复使用。
         let (_values, corrupt) = runtime_settings_ui(&state.db).await;
         assert!(
             corrupt.iter().any(|key| key == "trust_local_network"),
             "settings page must report the corrupt key: {corrupt:?}"
         );
-        // Repair: overwriting the row with a valid value restores reads.
+        // 修复：用合法值覆盖该行即可恢复读取。
         let mut tx = state.db.pool().begin().await.unwrap();
         save_setting_tx(&mut tx, "trust_local_network", &json!(false))
             .await
@@ -652,10 +619,9 @@ mod tests {
         let _ = dir;
     }
 
-    /// P1-3: corrupt integer rows (bad JSON, wrong type) fail closed with
-    /// the key named; absent keys still use defaults. (Range violations are
-    /// a write-path concern — `validate_updates` rejects them; well-typed
-    /// out-of-range values remain readable so legacy configs keep working.)
+    /// 损坏的整数行（JSON 非法、类型不符）会点名键并 fail-closed；缺失的键仍使用
+    /// 默认值。（范围违规属于写入路径的关注点 —— `validate_updates` 会拒绝它们；
+    /// 类型正确但越界的值仍可读取，以便历史配置继续工作。）
     #[tokio::test]
     async fn corrupt_integer_settings_fail_closed_with_key_name() {
         let (state, dir) = test_state().await;
@@ -686,15 +652,15 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // Absent keys are not corruption: defaults apply.
+        // 缺失的键不算损坏：应用默认值。
         let settings = runtime_settings(&state).await.unwrap();
         assert_eq!(settings.failure_threshold, 3);
         assert_eq!(settings.max_buffered_upstream_body_mb, 64);
         let _ = dir;
     }
 
-    /// P1-3: non-runtime settings rows (e.g. preset caches) must never leak
-    /// into the runtime settings object, even with garbage values.
+    /// 非运行时设置行（例如预设缓存）绝不能混入运行时设置对象，即使其值是垃圾
+    /// 数据也一样。
     #[tokio::test]
     async fn non_runtime_keys_are_ignored_by_runtime_settings() {
         let (state, dir) = test_state().await;
@@ -710,8 +676,8 @@ mod tests {
         let _ = dir;
     }
 
-    /// The OpenCode session id must be stable across calls and persisted,
-    /// so upstream sessions survive gateway restarts.
+    /// OpenCode 会话 id 必须在多次调用间稳定并被持久化，使上游会话能跨网关重启
+    /// 存活。
     #[tokio::test]
     async fn opencode_session_id_is_stable_and_persisted() {
         let (state, dir) = test_state().await;
@@ -729,8 +695,7 @@ mod tests {
         let _ = dir;
     }
 
-    /// A malformed stored row is replaced instead of being forwarded as an
-    /// invalid header value.
+    /// 畸形的存储行会被替换，而不是作为非法的请求头值被转发出去。
     #[tokio::test]
     async fn opencode_session_id_replaces_invalid_row() {
         let (state, dir) = test_state().await;

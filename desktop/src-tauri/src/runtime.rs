@@ -1,48 +1,38 @@
-//! Internal safety bounds and scheduling intervals (P2-10).
+//! 内部安全边界与调度间隔：决定资源占用、关闭流程与外部 I/O 行为的常量。
 //!
-//! These constants decide resource, shutdown, and external-I/O behavior.
-//! They used to be scattered across modules (server reaper 500 ms, health
-//! 20 s/5 s, discovery 120 s/50 pages, proxy 1 MiB, controller/Tauri 30 s/
-//! 10 s shutdown) with mutually conflicting shutdown deadlines. One
-//! immutable [`RuntimeLimits`] snapshot is built at startup and shared by
-//! every supervisor, so a limit change happens in exactly one place.
+//! 历史上这些常量散落在各模块且互有冲突；现在启动时构建唯一一份不可变
+//! [`RuntimeLimits`] 快照，由所有 supervisor 共享，因此调整某个上限只需改一处。
 //!
-//! User-configurable upstream timeouts live in
-//! [`crate::settings::RuntimeSettings`]; this module is the fixed
-//! operational layer. Tests inject short values instead of relying on
-//! production constants.
+//! 边界：用户可配置的上游超时在 [`crate::settings::RuntimeSettings`]，
+//! 本模块只负责固定的运维层；测试注入短值而非依赖生产常量。
 
 use std::time::Duration;
 
-/// Immutable operational limits, constructed once per runtime.
+/// 不可变的运维上限，每个运行时只构建一次。
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeLimits {
-    /// One-shot task reaper poll interval (was 500 ms in `reap_loop`).
+    /// 一次性任务回收轮的轮询间隔。
     pub reaper_interval: Duration,
-    /// Hard timeout for a single health probe (was 20 s).
+    /// 单次健康探测的硬超时。
     pub probe_timeout: Duration,
-    /// Health supervisor poll interval (was 5 s).
+    /// 健康 supervisor 的轮询间隔。
     pub probe_interval: Duration,
-    /// Hard timeout for one discovery run (was 120 s).
+    /// 单次发现运行的硬超时。
     pub discovery_timeout: Duration,
-    /// Discovery pagination cap (was 50 pages).
+    /// 发现分页上限（页数）。
     pub discovery_max_pages: usize,
-    /// Maintenance supervisor cadence (was 60 s).
+    /// 维护 supervisor 的节拍。
     pub maintenance_interval: Duration,
-    /// Log cleanup cadence inside the maintenance loop (was 3600 s).
+    /// 维护循环内日志清理的节拍。
     pub cleanup_interval: Duration,
-    /// Absolute timeout for one channel balance query (upstream exchange
-    /// plus body read); balance queries are a sidecar and must never hold a
-    /// connection for long.
+    /// 单次渠道余额查询的绝对超时（上游往返加 body 读取）；余额查询是旁路，
+    /// 绝不能长时间占用连接。
     pub balance_timeout: Duration,
-    /// Background cadence for refreshing channels with balance queries
-    /// enabled (was 3600 s, i.e. hourly). Tests inject short values.
+    /// 后台刷新启用余额查询的渠道的节拍。测试注入短值。
     pub balance_interval: Duration,
-    /// Non-2xx upstream error body replay cap (was 1 MiB).
+    /// 非 2xx 上游错误体回放的上限。
     pub error_body_max: usize,
-    /// Absolute shutdown deadline: after cancel, this long to drain every
-    /// task; anything still running is aborted and joined (was the
-    /// conflicting controller 30 s / Tauri 10 s pair).
+    /// 绝对关闭期限：取消后，用这么久排空所有任务；仍在运行的会被中止并 join。
     pub shutdown_deadline: Duration,
 }
 

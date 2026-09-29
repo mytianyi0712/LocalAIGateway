@@ -1,12 +1,16 @@
-//! admin API 域模块：供应商预设目录（provider preset 域）
+//! admin API 域模块：供应商预设目录（provider preset 域）。
 //!
 //! 预设是纯静态数据：前端用 `base_url` / `protocol` / `kind` 自动填充新建
-//! 供应商表单。`command_code_go` 首项携带强制风险提示（路线 B 的越界面），
-//! 前端必须显示并要求二次确认。
+//! 供应商表单。`command_code_go` 首项携带强制风险提示（该套餐没有官方 API，
+//! 只有在服务端以 403 upgrade_required 拒绝后才降级到 CLI 兼容路径），前端
+//! 必须显示并要求二次确认。
 
-use super::*;
+use super::{ApiResult, ok};
+use crate::auth::AdminAuth;
+use serde_json::{Value, json};
 
-/// One preset: `{id,name,base_url,protocol,kind,docs_url,warning}`.
+/// 预设目录响应：`{items:[…]}`，每项含
+/// `{id,name,base_url,protocol,kind,auth,docs_url,warning}` 这些键。
 pub(super) fn provider_presets() -> Value {
     json!({
         "items": [

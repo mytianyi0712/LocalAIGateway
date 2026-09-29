@@ -14,8 +14,8 @@
 - Claude 模型映射助手：对外暴露 Claude Code 标准模型名（如 `claude-opus-5`），控制台按模型独立配置上游协议与候选渠道，请求时自动完成协议转换（参考 CLIProxyAPI 的转换思路），路由实时生效。
 - Codex 模型映射助手：对外暴露 Codex 标准模型名（如 `gpt-5-codex`），与 Claude 映射同一套转换体系，让 Codex CLI 通过独立入口 `/codex` 使用任意上游模型。
 - 模型能力档案：内置 `capability_profiles` 表收集可复用的模型能力集合，支持手动创建/编辑/删除；在「模型路由 → 配置能力」中可直接选择档案应用（多个模型可共用同一套能力，如 GPT-5.6 Sol/Terra/Luna），修改档案自动同步到所有引用模型；成本仍按模型独立配置。
-- 渠道余额查询（旁路、默认关闭）：按渠道手动选择 New API、Sub2API、OpenCode Go、DeepSeek 或自定义适配器；启用后每小时自动刷新，也可在渠道表单内「立即查询」或使用工具栏「刷新余额」批量刷新。上游失败只写归一化快照与稳定错误分类，不影响代理路径，也不保存原始响应正文或令牌。
-- Command Code 集成（上游专用协议、默认关闭）：为 Go 套餐渠道提供「先官方 Provider API、403 `upgrade_required` 后降级 CLI 兼容路径」的 transport router，自动注入 CLI 身份头（会话/指纹/版本，按渠道独立持久化），把 NDJSON 流转换为 Claude / Codex 入口可用的响应，并支持额度（5h/周/credits）查询。凭据通过内建**网页登录授权**获取（与官方 `cmd login` 同一 loopback 流程，密钥不经过浏览器页面），也可从 CLI 凭据文件导入。风险与合规提示见下文。
+- 渠道余额查询（旁路、默认关闭）：按渠道手动选择适配器（New API、Sub2API、OpenCode Go、DeepSeek、小米 MiMo、OpenRouter、SiliconFlow、StepFun、Novita、Moonshot、智谱 GLM Coding Plan、MiniMax Coding Plan、Kimi For Coding、Command Code 或自定义）；启用后每小时自动刷新，也可在渠道表单内「立即查询」或使用工具栏「刷新余额」批量刷新。上游失败只写归一化快照与稳定错误分类，不影响代理路径，也不保存原始响应正文或令牌。
+- Command Code 集成（默认关闭）：为 Go 套餐渠道提供「先官方 Provider API、403 `upgrade_required` 后降级 CLI 兼容路径」的 transport router，自动注入 CLI 身份头（会话/指纹/版本，按渠道独立持久化），把 NDJSON 流转换为 Claude / Codex 入口可用的响应，并支持额度（5h/周/credits）查询。渠道模型同时绑定 Claude / OpenAI Chat / OpenAI Responses 三种入口协议，可直接在「模型路由」中作为这些协议路由的候选使用（网关按入口自动转换请求体），无需再建 `command_code` 协议的路由或映射。凭据通过内建**网页登录授权**获取（与官方 `cmd login` 同一 loopback 流程，密钥不经过浏览器页面），也可从 CLI 凭据文件导入。风险与合规提示见下文。
 - 原生管理端覆盖供应商、渠道、模型探测、路由、能力档案、Claude 映射、Codex 映射、日志、健康状态和运行设置，无需 Node.js 或前端构建步骤。
 
 ## 使用说明
@@ -26,7 +26,7 @@
 - 必须在路由中配置模型以及路由规则，才能在v1/models端点检索到模型，并通过对应端点调用。
 - 「添加路由」支持自定义模型：模型 ID 可直接填写（不必是已探测模型），勾选请求格式后保存，再在候选抽屉里选择「渠道 + 模型」作为请求源——不同渠道、上游 ID 不同的模型可以混排到同一个自定义模型下，网关按候选优先级转发并自动改写上游 `model`。抽屉只列出已添加的候选（可拖拽排序、逐个启停、移除），点「添加模型」才进入选择面板：可按渠道筛选、按模型名模糊搜索（默认填入当前模型名，`deepseek-v4.1-flash` 也会命中 `deepseek-flash`、`deepseek-v4-pro`，并按相似度排序），候选池只含仍可用的模型（上游可见、渠道启用且未熔断）；已配置的候选在渠道删除/停用后仍会保留并标注「渠道当前不可用」，需要手动删除。
 - 模型能力（上下文、最大输出、图像/思考支持、成本）可在「模型路由 → 配置能力」中手动配置；内置「能力档案」页可创建可复用的能力集合，在配置能力抽屉中选择档案即可一键应用并建立关联（如 GPT-5.6 Sol/Terra/Luna 共用一套），也可直接点「保存为档案」把当前表单存为新档案，修改档案会同步到所有引用它的模型。
-- 渠道余额查询默认关闭且不产生任何探测请求：编辑渠道 →「余额查询」选择适配器并打开开关即可；「立即查询」只查当前渠道，每个渠道余额右侧还有独立的刷新按钮，工具栏「刷新余额」批量刷新全部已启用渠道，后台每小时自动刷新一次。未配置或 `enabled=0` 的渠道不参与后台/批量刷新；OpenCode Go 渠道按 5h / 周 / 月展示剩余百分比。New API（如 CCTQ）：渠道 API Key 只能读该令牌额度，把面板生成的「系统访问令牌 / PAT」填入「独立令牌」后，会改为查询并显示账户可用余额。
+- 渠道余额查询默认关闭且不产生任何探测请求：编辑渠道 →「余额查询」选择适配器并打开开关即可；「立即查询」只查当前渠道，每个渠道余额右侧还有独立的刷新按钮，工具栏「刷新余额」批量刷新全部已启用渠道，后台每小时自动刷新一次。未配置或 `enabled=0` 的渠道不参与后台/批量刷新。New API（如 CCTQ）：渠道 API Key 只能读该令牌额度，把面板生成的「系统访问令牌 / PAT」填入「独立令牌」后，会改为查询并显示账户可用余额；OpenCode Go 渠道按 5h / 周 / 月展示剩余百分比；智谱 GLM Coding Plan、MiniMax Coding Plan、Kimi For Coding 展示订阅的 5 小时 / 周配额窗口（不是账户余额）；OpenRouter 填普通 Key 看该 Key 的额度、填 Management Key 看账户余额；小米 MiMo 需把浏览器 Cookie 填进「独立令牌」（约 1 天过期，Token Plan 没有 API Key 查询接口）；SiliconFlow、StepFun、Novita、Moonshot 展示账户余额（币种随平台，StepFun 的 Step Plan 月度 Credit 无公开接口）。
 - 本项目模型路由只对请求进行简单转发，不进行任何额外处理，因此在配置渠道端点时务必确保上游支持所选端点。
 - Claude 模型映射助手（Claude Code 标准名 → 系统中已配置的模型，独立于常规请求）：
   1. 先在供应商与渠道页配置好上游渠道并探测/登记模型，再到「模型路由」页为上游模型配置候选优先级（候选渠道直接在系统中已配置的模型里选择，映射无需单独配置候选）。
@@ -202,8 +202,8 @@ sudo systemctl enable --now local-ai-gateway
 
 ## 核心边界
 
-- 支持 OpenAI Compatible、OpenAI Responses、Claude、Gemini 四种入口协议；Command Code 是**上游专用**协议（经 Claude/Codex 映射接入，没有客户端入口）。
-- 模型路由功能只在完全相同的协议内进行故障转移，不做跨协议转换。
+- 支持 OpenAI Compatible、OpenAI Responses、Claude、Gemini 四种入口协议；Command Code 没有客户端入口（`command_code` 不提供服务端点），`kind='command_code'` 的渠道模型绑定 Claude / OpenAI Chat / OpenAI Responses 三种入口协议，可直接作为这些路由的候选使用。
+- 模型路由功能只在完全相同的协议内进行故障转移，不做跨协议转换；Command Code 渠道是唯一例外——请求按入口协议转换成 CC 线协议后再发送，响应再转换回入口格式。
 - 用户请求体、上游响应体和最终上游 HTTP 错误保持原始字节不变；Command Code 是唯一例外（入口请求/响应需按 CLI 线协议转换）。
 - 网关只处理路由、认证替换、逐跳头处理、故障转移、旁路统计和健康检查。
 - 不进行价格或费用计算。
@@ -229,7 +229,7 @@ sudo systemctl enable --now local-ai-gateway
    `COMMAND_CODE_API_KEY`）。密钥会先经 `GET /alpha/whoami` 校验，失败会在表单内提示原因
    （拒绝 / 超时 / 校验失败 / 网络错误 / 已取消）。若浏览器无法回传，可在授权页复制 key 到「API Key」输入框手动粘贴。
 4. 为渠道探测/手工登记模型（目录端点 `GET /provider/v1/models`；Go 套餐被 403 拒绝时请手工添加模型）。
-5. 在「Claude 映射」或「Codex 映射」中把标准模型名映射到 `command_code` 上游模型——Command Code 只通过映射接入。
+5. 在「模型路由」中新建路由：请求格式勾选 Claude / OpenAI Chat / OpenAI Responses 任一种，再把该渠道的模型加入候选即可——CC 渠道模型自动绑定这三种入口协议，网关按入口转换请求与响应（无需 `command_code` 协议的路由）。也可继续用「Claude 映射」/「Codex 映射」把标准模型名映射到 `command_code` 上游模型。
 6. 「设置」→ 打开 **Command Code 集成** 开关并确认风险；同一面板显示 CLI 版本与协议基准的漂移告警。
 7. 可选：编辑渠道 →「余额查询」选择 `Command Code` 适配器并启用，显示 5h/周窗口与 credits。
 

@@ -1,3 +1,9 @@
+//! 统一错误模型与请求关联中间件：`ApiError` 把状态码、稳定的机器可读错误码
+//! 与消息打包为 JSON 响应；`correlation_middleware` 为每个管理端响应附加
+//! `request_id`，并把非 JSON 的拒绝也规范成同一错误信封。
+//!
+//! 边界：本模块只负责响应形态与关联 id，不决定业务错误语义（由各 handler 决定）。
+//! 关键不变量：内部错误文本绝不外泄（只进日志）；每个状态码都有显式错误码映射。
 use axum::{
     Json,
     http::StatusCode,
@@ -6,7 +12,7 @@ use axum::{
 use serde_json::{Value, json};
 use tracing::Instrument;
 
-/// Stable machine-readable error code, serialized as kebab-case.
+/// 稳定的机器可读错误码，序列化为 kebab-case。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCode {
     BadRequest,
@@ -23,8 +29,8 @@ pub enum ErrorCode {
     GatewayTimeout,
     NotImplemented,
     ConfigCorrupted,
-    /// A balance query was requested manually for a channel that has no
-    /// balance adapter configured (default-off semantics).
+    /// 手动为未配置余额适配器的渠道发起余额查询时使用
+    /// （默认关闭的语义）。
     BalanceNotConfigured,
 }
 
@@ -57,15 +63,14 @@ pub struct ApiError {
     pub message: String,
 }
 
-/// Request-id extension injected by the correlation middleware, so handlers
-/// (and future log paths) can reference the client-visible id.
+/// 由关联中间件注入的请求 id 扩展，使 handler（及后续日志路径）
+/// 能引用客户端可见的 id。
 #[derive(Debug, Clone)]
 pub struct RequestId(pub String);
 
-/// Stable machine-readable code for a status, used both by `ApiError::new`
-/// and by the middleware's non-JSON error envelope (P2-3). Every status the
-/// gateway actually produces has an explicit mapping (P2-7); anything else
-/// logs a warning instead of silently collapsing into `internal`.
+/// 给定状态码的稳定机器可读错误码，`ApiError::new` 与中间件的非 JSON
+/// 错误信封都会用到。网关实际产生的每个状态码都有显式映射；
+/// 其余状态码会记一条告警日志，而不是静默塌缩为 `internal`。
 fn code_for_status(status: StatusCode) -> ErrorCode {
     match status {
         StatusCode::BAD_REQUEST => ErrorCode::BadRequest,
@@ -114,8 +119,8 @@ impl ApiError {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, message)
     }
-    /// Manual balance query without a saved adapter: 422 with a stable code
-    /// so the UI can offer "configure balance" instead of a generic error.
+    /// 未保存适配器时的手动余额查询：422 加稳定错误码，
+    /// 使 UI 能提示“配置余额”而非泛化错误。
     pub fn balance_not_configured() -> Self {
         Self {
             status: StatusCode::UNPROCESSABLE_ENTITY,
@@ -126,8 +131,7 @@ impl ApiError {
     pub fn not_implemented(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_IMPLEMENTED, message)
     }
-    /// Internal failures never leak the underlying error text: it goes to the
-    /// logs only, and the client sees a fixed message.
+    /// 内部故障绝不泄露底层错误文本：它只进日志，客户端看到固定消息。
     pub fn internal(error: impl std::fmt::Display) -> Self {
         tracing::error!(error = %error, "internal error");
         Self {
@@ -136,14 +140,13 @@ impl ApiError {
             message: "Internal server error".into(),
         }
     }
-    /// The access-key store is corrupt; the admin UI needs a distinct signal
-    /// so it can offer regeneration instead of failing the settings page.
+    /// 访问密钥存储损坏；管理端 UI 需要独立信号，
+    /// 以便提示重新生成，而不是让设置页直接失败。
     pub fn config_corrupted() -> Self {
         Self::config_corrupted_with("访问密钥配置损坏，请重新生成访问密钥")
     }
 
-    /// Any persisted configuration row is structurally corrupt. The message
-    /// names the table/key only — never the stored value.
+    /// 任一持久化配置行结构损坏。消息只点名表/键，绝不包含存储的值。
     pub fn config_corrupted_with(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -175,16 +178,15 @@ impl From<sqlx::Error> for ApiError {
 }
 impl From<serde_json::Error> for ApiError {
     fn from(_error: serde_json::Error) -> Self {
-        // Generalized so stored JSON text never leaks into responses.
+        // 泛化处理，使存储的 JSON 文本绝不泄露到响应里。
         Self::validation("Invalid JSON data")
     }
 }
 
-/// Attaches `request_id` to every admin response that carries one (client-
-/// supplied `x-request-id` or a fresh UUID), and injects it into JSON error
-/// bodies so failures are traceable end to end. Non-JSON rejections (Axum
-/// extractor failures, admin 404s) are rebuilt as a stable JSON envelope
-/// with the same `code`/`message`/`request_id` shape (P2-3).
+/// 为每个带有 `request_id` 的管理端响应（客户端提供的 `x-request-id`
+/// 或新生成的 UUID）附加该 id，并把它注入 JSON 错误体，使失败可端到端追溯。
+/// 非 JSON 的拒绝（Axum 提取器失败、管理端 404）会被重建为稳定 JSON 信封，
+/// 保持同样的 `code`/`message`/`request_id` 形状。
 pub async fn correlation_middleware(
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
@@ -199,9 +201,8 @@ pub async fn correlation_middleware(
     request
         .extensions_mut()
         .insert(RequestId(request_id.clone()));
-    // P2-7: every event inside the handler (including `ApiError::internal`'s
-    // error log) inherits this span, so the client-visible request id can
-    // locate the log lines that carry the real underlying error.
+    // handler 内的每个事件（包括 `ApiError::internal` 的错误日志）都继承该
+    // span，因此客户端可见的 request id 能定位到携带真实底层错误的日志行。
     let span = tracing::info_span!("admin_request", request_id = %request_id, path = %path);
     let mut response = next.run(request).instrument(span).await;
     if let Ok(value) = axum::http::HeaderValue::from_str(&request_id) {
@@ -221,9 +222,9 @@ pub async fn correlation_middleware(
                         if let Some(object) = value.as_object_mut() {
                             object.insert("request_id".into(), json!(request_id));
                         }
-                        // Rebuild: content-type is re-set by `Json`, the stale
-                        // content-length is dropped, every other header is kept —
-                        // and the error status must survive the rebuild.
+                        // 重建：content-type 由 `Json` 重新设置，过期的
+                        // content-length 丢弃，其余头保留——且错误状态码必须
+                        // 在重建后依然保持。
                         let status = parts.status;
                         response = axum::Json(value).into_response();
                         *response.status_mut() = status;
@@ -245,9 +246,8 @@ pub async fn correlation_middleware(
                 }
             }
         } else {
-            // Non-JSON rejection (extractor failure, admin 404): normalize to
-            // the stable error envelope. `message` is the HTTP spec's
-            // canonical reason — fixed text, no internals.
+            // 非 JSON 的拒绝（提取器失败、管理端 404）：规范化为稳定错误信封。
+            // `message` 取 HTTP 规范的 canonical reason——固定文本，不含内部信息。
             let status = parts.status;
             let body = json!({
                 "code": code_for_status(status).as_str(),
