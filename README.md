@@ -198,7 +198,7 @@ sudo systemctl enable --now local-ai-gateway
 - [总体架构](docs/architecture.md)
 - [API 设计](docs/api-design.md)
 - [数据模型](docs/data-model.md)
-- [实现计划](docs/implementation-plan.md)
+- [变更日志](CHANGELOG.md)
 
 ## 核心边界
 
