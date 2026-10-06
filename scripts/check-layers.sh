@@ -75,7 +75,6 @@ check_admin_handlers src/admin/channels.rs
 check_admin_handlers src/admin/commandcode.rs
 check_admin_handlers src/admin/discovery.rs
 check_admin_handlers src/admin/logs.rs
-check_admin_handlers src/admin/mappings.rs
 check_admin_handlers src/admin/models.rs
 check_admin_handlers src/admin/mod.rs
 check_admin_handlers src/admin/presets.rs

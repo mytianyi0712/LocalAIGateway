@@ -1,5 +1,4 @@
-//! 模型目录与信息端点：目录鉴权、各协议的原生列表形状，以及
-//! claudecode / codex 的信息端点。
+//! 模型目录与信息端点：目录鉴权与各协议的原生列表形状。
 
 use anyhow::Result;
 use axum::{
@@ -114,7 +113,7 @@ pub(super) async fn authorize_catalog(
 }
 
 /// OpenAI 列表形式的单个目录条目（`id`/`object`/`owned_by`/`created`）。
-/// 各协议目录、映射目录与 `/v1/models` 聚合共用同一字段集合。
+/// 各协议目录与 `/v1/models` 聚合共用同一字段集合。
 pub(super) fn openai_model_value(item: &RoutableModel) -> Value {
     json!({
         "id": item.id,
@@ -235,68 +234,6 @@ pub async fn aggregate_models(
     }
 }
 
-pub async fn mapped_models(
-    State(state): State<AppState>,
-    request: Request,
-    entry: &'static str,
-) -> Response<Body> {
-    if let Some(response) = authorize_catalog(&state, request.headers(), request.uri().query(), entry, "catalog").await {
-        return response;
-    }
-    let items = match state.routes.list_mapping_models(entry).await {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::error!(error = %error, "mapping model catalog query failed");
-            return gateway_error(
-                entry,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "database_error",
-                "Database error",
-                "catalog",
-            );
-        }
-    };
-    json_response(
-        StatusCode::OK,
-        json!({"object":"list","data":items.iter().map(openai_model_value).collect::<Vec<_>>() }),
-    )
-}
-
-pub async fn claudecode_info(State(state): State<AppState>, request: Request) -> Response<Body> {
-    if let Some(response) = authorize_catalog(
-        &state,
-        request.headers(),
-        request.uri().query(),
-        "claude",
-        "info",
-    )
-    .await
-    {
-        return response;
-    }
-    json_response(
-        StatusCode::OK,
-        json!({"protocol":"claude","endpoint":"/claudecode/v1/messages","models":"/claudecode/v1/models"}),
-    )
-}
-pub async fn codex_info(State(state): State<AppState>, request: Request) -> Response<Body> {
-    if let Some(response) = authorize_catalog(
-        &state,
-        request.headers(),
-        request.uri().query(),
-        "openai_responses",
-        "info",
-    )
-    .await
-    {
-        return response;
-    }
-    json_response(
-        StatusCode::OK,
-        json!({"protocol":"openai_responses","endpoint":"/codex/v1/responses","models":"/codex/v1/models"}),
-    )
-}
-
 /// `GET /v1/models`。协议选择顺序：`protocol` 查询参数、
 /// `X-Local-Gateway-Protocol` 头，或 `anthropic-version` 头（Claude SDK）；
 /// 各自返回对应协议的原生目录。选择器不在白名单
@@ -320,8 +257,7 @@ pub async fn openai_models(State(state): State<AppState>, request: Request) -> R
         });
     if let Some(protocol) = selected.as_deref() {
         // 入口协议白名单：Command Code 没有面向客户端的目录端点
-        // （其模型经 claude / openai 路由或 claude/codex 映射到达），
-        // 因此在此被有意拒绝。
+        // （其模型经 claude / openai 路由到达），因此在此被有意拒绝。
         if matches!(protocol, "openai_compatible" | "openai_responses" | "claude") {
             return models(State(state), request, protocol).await;
         }
@@ -344,13 +280,4 @@ pub async fn claude_models(State(state): State<AppState>, request: Request) -> R
 }
 pub async fn gemini_models(State(state): State<AppState>, request: Request) -> Response<Body> {
     models(State(state), request, "gemini").await
-}
-pub async fn claudecode_models(
-    State(state): State<AppState>,
-    request: Request,
-) -> Response<Body> {
-    mapped_models(State(state), request, "claude").await
-}
-pub async fn codex_models(State(state): State<AppState>, request: Request) -> Response<Body> {
-    mapped_models(State(state), request, "openai_responses").await
 }

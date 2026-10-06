@@ -28,7 +28,6 @@ mod channels;
 mod commandcode;
 mod discovery;
 mod logs;
-mod mappings;
 mod models;
 mod presets;
 mod profiles;
@@ -49,11 +48,6 @@ use commandcode::{
 };
 use discovery::{discover_models, get_discovery_run, list_discovery_runs, manual_probe};
 use logs::{clear_logs, get_request, list_health_probes, list_requests};
-use mappings::{
-    claude_presets, codex_presets, create_claude_mapping, create_codex_mapping,
-    delete_claude_mapping, delete_codex_mapping, list_claude_mappings, list_codex_mappings,
-    patch_claude_mapping, patch_codex_mapping, refresh_claude_presets, refresh_codex_presets,
-};
 use models::{create_manual_model, delete_channel_model, list_channel_models, patch_channel_model};
 use presets::list_provider_presets;
 use profiles::{
@@ -167,32 +161,6 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/admin/v1/model-capabilities/{*model_id}",
             get(get_capabilities).put(put_capabilities),
-        )
-        .route("/api/admin/v1/claude-presets", get(claude_presets))
-        .route(
-            "/api/admin/v1/claude-presets/refresh",
-            post(refresh_claude_presets),
-        )
-        .route(
-            "/api/admin/v1/claude-mappings",
-            get(list_claude_mappings).post(create_claude_mapping),
-        )
-        .route(
-            "/api/admin/v1/claude-mappings/{id}",
-            patch(patch_claude_mapping).delete(delete_claude_mapping),
-        )
-        .route("/api/admin/v1/codex-presets", get(codex_presets))
-        .route(
-            "/api/admin/v1/codex-presets/refresh",
-            post(refresh_codex_presets),
-        )
-        .route(
-            "/api/admin/v1/codex-mappings",
-            get(list_codex_mappings).post(create_codex_mapping),
-        )
-        .route(
-            "/api/admin/v1/codex-mappings/{id}",
-            patch(patch_codex_mapping).delete(delete_codex_mapping),
         )
         .route("/api/admin/v1/requests", get(list_requests))
         .route("/api/admin/v1/requests/{id}", get(get_request))
@@ -2263,185 +2231,6 @@ mod tests {
         );
     }
 
-    /// 预设刷新为符合条件的启用渠道排队真实的 discovery 运行并返回其 ID；
-    /// 没有符合条件渠道时明确失败，而不是伪报“已排队”。
-    #[tokio::test]
-    async fn preset_refresh_queues_real_discovery_runs() {
-        let (state, _dir) = test_state().await;
-        // 尚无渠道：明确的冲突，绝不是伪造的 202。
-        let error = refresh_claude_presets(AdminAuth, State(state.clone()))
-            .await
-            .expect_err("no eligible channel must fail clearly");
-        assert_eq!(error.status, StatusCode::CONFLICT);
-
-        let time = "2026-08-04T01:00:00+00:00";
-        sqlx::query("INSERT INTO providers(id,name,base_url,created_at,updated_at) VALUES('prov-1','mock','http://127.0.0.1:1',?,?)")
-            .bind(time)
-            .bind(time)
-            .execute(state.db.pool())
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO channels(id,provider_id,name,protocol,api_key_encrypted,api_key_hint,manual_enabled,created_at,updated_at) VALUES('ch-1','prov-1','chan','claude',X'00','',1,?,?)")
-            .bind(time)
-            .bind(time)
-            .execute(state.db.pool())
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO channel_protocols(channel_id,protocol) VALUES('ch-1','claude')")
-            .execute(state.db.pool())
-            .await
-            .unwrap();
-        let response = refresh_claude_presets(AdminAuth, State(state.clone()))
-            .await
-            .expect("refresh must succeed with an eligible channel");
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let value: Value = serde_json::from_slice(&body).unwrap();
-        let run_ids = value["run_ids"].as_array().expect("run_ids array");
-        assert_eq!(run_ids.len(), 1, "exactly one channel was queued");
-        let runs: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM discovery_runs WHERE channel_id='ch-1'")
-                .fetch_one(state.db.pool())
-                .await
-                .unwrap();
-        assert_eq!(runs, 1, "a real discovery run row must exist");
-        // Codex 刷新不得为仅支持 claude 的渠道排队。
-        let error = refresh_codex_presets(AdminAuth, State(state.clone()))
-            .await
-            .expect_err("a claude-only channel cannot feed Codex presets");
-        assert_eq!(error.status, StatusCode::CONFLICT);
-        // 排队的 discovery 任务最终会因端口 1 失败；等它结束，
-        // 以免其存活时间超过测试监管进程。
-        let run_id = run_ids[0].as_str().unwrap();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let finished: Option<String> = sqlx::query_scalar(
-                "SELECT finished_at FROM discovery_runs WHERE id=?",
-            )
-            .bind(run_id)
-            .fetch_one(state.db.pool())
-            .await
-            .unwrap();
-            if finished.is_some() {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the queued run must reach a terminal state"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
-
-    /// GET presets 把实时渠道模型与内置默认值聚合，去重，
-    /// 并把不同协议族分开。
-    #[tokio::test]
-    async fn presets_aggregate_live_channel_models_with_defaults() {
-        let (state, _dir) = test_state().await;
-        let time = "2026-08-04T01:00:00+00:00";
-        sqlx::query("INSERT INTO providers(id,name,base_url,created_at,updated_at) VALUES('prov-1','mock','http://127.0.0.1:1',?,?)")
-            .bind(time)
-            .bind(time)
-            .execute(state.db.pool())
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO channels(id,provider_id,name,protocol,api_key_encrypted,api_key_hint,manual_enabled,created_at,updated_at) VALUES('ch-1','prov-1','chan','claude',X'00','',1,?,?)")
-            .bind(time)
-            .bind(time)
-            .execute(state.db.pool())
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO channel_models(id,channel_id,model_id,display_name,source,available,first_seen_at,created_at,updated_at) VALUES('cm-1','ch-1','channel-model-x','Channel X',1,1,?,?,?)")
-            .bind(time)
-            .bind(time)
-            .bind(time)
-            .execute(state.db.pool())
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO channel_models(id,channel_id,model_id,display_name,source,available,first_seen_at,created_at,updated_at) VALUES('cm-2','ch-1','codex-only-model','Codex Only',1,1,?,?,?)")
-            .bind(time)
-            .bind(time)
-            .bind(time)
-            .execute(state.db.pool())
-            .await
-            .unwrap();
-        // 同一模型经两行出现两次：去重后只能产生一个条目。
-        sqlx::query("INSERT INTO channel_model_protocols(channel_model_id,protocol) VALUES('cm-1','claude')")
-            .execute(state.db.pool())
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO channel_model_protocols(channel_model_id,protocol) VALUES('cm-1','openai_responses')")
-            .execute(state.db.pool())
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO channel_model_protocols(channel_model_id,protocol) VALUES('cm-2','openai_compatible')")
-            .execute(state.db.pool())
-            .await
-            .unwrap();
-        // 不可用的模型不是预设。
-        sqlx::query("INSERT INTO channel_models(id,channel_id,model_id,display_name,source,available,first_seen_at,created_at,updated_at) VALUES('cm-3','ch-1','unavailable-model',NULL,1,0,?,?,?)")
-            .bind(time)
-            .bind(time)
-            .bind(time)
-            .execute(state.db.pool())
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO channel_model_protocols(channel_model_id,protocol) VALUES('cm-3','claude')")
-            .execute(state.db.pool())
-            .await
-            .unwrap();
-
-        let claude = claude_presets(AdminAuth, State(state.clone()))
-            .await
-            .expect("claude presets must load");
-        let body = axum::body::to_bytes(claude.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let value: Value = serde_json::from_slice(&body).unwrap();
-        let ids: Vec<String> = value["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|item| item["id"].as_str().map(str::to_owned))
-            .collect();
-        assert!(ids.contains(&"claude-opus-5".into()), "defaults survive");
-        assert!(
-            ids.contains(&"channel-model-x".into()),
-            "live channel models are aggregated"
-        );
-        assert!(
-            !ids.contains(&"codex-only-model".into()),
-            "codex-only models must not leak into claude presets"
-        );
-        assert!(
-            !ids.contains(&"unavailable-model".into()),
-            "unavailable models are not presets"
-        );
-        let count = ids
-            .iter()
-            .filter(|id| id.as_str() == "channel-model-x")
-            .count();
-        assert_eq!(count, 1, "duplicate protocols must not duplicate presets");
-
-        let codex = codex_presets(AdminAuth, State(state.clone()))
-            .await
-            .expect("codex presets must load");
-        let body = axum::body::to_bytes(codex.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let value: Value = serde_json::from_slice(&body).unwrap();
-        let ids: Vec<String> = value["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|item| item["id"].as_str().map(str::to_owned))
-            .collect();
-        assert!(ids.contains(&"codex-only-model".into()));
-        assert!(ids.contains(&"channel-model-x".into()), "responses-capable models feed codex presets");
-        assert!(!ids.contains(&"claude-opus-5".into()), "claude defaults do not leak into codex presets");
-    }
     /// `GET /command-code/status` 透出开关、已验证的协议基线和版本漂移；
     /// 它不得泄露任何凭据材料。
     #[tokio::test]

@@ -11,12 +11,10 @@
 - 请求、成功响应和最终上游 HTTP 错误保持原始字节不变。
 - 连续错误自动熔断 15 分钟，到期后以最小 `OK` 请求探测并静默恢复。
 - 旁路统计首字节、首 Token、TPS 与输出 Token，并透传上游 usage 中的提示词缓存统计（缓存读取/写入/未命中）。
-- Claude 模型映射助手：对外暴露 Claude Code 标准模型名（如 `claude-opus-5`），控制台按模型独立配置上游协议与候选渠道，请求时自动完成协议转换（参考 CLIProxyAPI 的转换思路），路由实时生效。
-- Codex 模型映射助手：对外暴露 Codex 标准模型名（如 `gpt-5-codex`），与 Claude 映射同一套转换体系，让 Codex CLI 通过独立入口 `/codex` 使用任意上游模型。
 - 模型能力档案：内置 `capability_profiles` 表收集可复用的模型能力集合，支持手动创建/编辑/删除；在「模型路由 → 配置能力」中可直接选择档案应用（多个模型可共用同一套能力，如 GPT-5.6 Sol/Terra/Luna），修改档案自动同步到所有引用模型；成本仍按模型独立配置。
 - 渠道余额查询（旁路、默认关闭）：按渠道手动选择适配器（New API、Sub2API、OpenCode Go、DeepSeek、小米 MiMo、OpenRouter、SiliconFlow、StepFun、Novita、Moonshot、智谱 GLM Coding Plan、MiniMax Coding Plan、Kimi For Coding、Command Code 或自定义）；启用后每小时自动刷新，也可在渠道表单内「立即查询」或使用工具栏「刷新余额」批量刷新。上游失败只写归一化快照与稳定错误分类，不影响代理路径，也不保存原始响应正文或令牌。
-- Command Code 集成（默认关闭）：为 Go 套餐渠道提供「先官方 Provider API、403 `upgrade_required` 后降级 CLI 兼容路径」的 transport router，自动注入 CLI 身份头（会话/指纹/版本，按渠道独立持久化），把 NDJSON 流转换为 Claude / Codex 入口可用的响应，并支持额度（5h/周/credits）查询。渠道模型同时绑定 Claude / OpenAI Chat / OpenAI Responses 三种入口协议，可直接在「模型路由」中作为这些协议路由的候选使用（网关按入口自动转换请求体），无需再建 `command_code` 协议的路由或映射。凭据通过内建**网页登录授权**获取（与官方 `cmd login` 同一 loopback 流程，密钥不经过浏览器页面），也可从 CLI 凭据文件导入。风险与合规提示见下文。
-- 原生管理端覆盖供应商、渠道、模型探测、路由、能力档案、Claude 映射、Codex 映射、日志、健康状态和运行设置，无需 Node.js 或前端构建步骤。
+- Command Code 集成（默认关闭）：为 Go 套餐渠道提供「先官方 Provider API、403 `upgrade_required` 后降级 CLI 兼容路径」的 transport router，自动注入 CLI 身份头（会话/指纹/版本，按渠道独立持久化），把 NDJSON 流转换为调用方入口协议可用的响应，并支持额度（5h/周/credits）查询。渠道模型同时绑定 Claude / OpenAI Chat / OpenAI Responses 三种入口协议，可直接在「模型路由」中作为这些协议路由的候选使用（网关按入口自动转换请求体），无需再建 `command_code` 协议的路由。凭据通过内建**网页登录授权**获取（与官方 `cmd login` 同一 loopback 流程，密钥不经过浏览器页面），也可从 CLI 凭据文件导入。风险与合规提示见下文。
+- 原生管理端覆盖供应商、渠道、模型探测、路由、能力档案、日志、健康状态和运行设置，无需 Node.js 或前端构建步骤。
 
 ## 使用说明
 
@@ -28,40 +26,13 @@
 - 模型能力（上下文、最大输出、图像/思考支持、成本）可在「模型路由 → 配置能力」中手动配置；内置「能力档案」页可创建可复用的能力集合，在配置能力抽屉中选择档案即可一键应用并建立关联（如 GPT-5.6 Sol/Terra/Luna 共用一套），也可直接点「保存为档案」把当前表单存为新档案，修改档案会同步到所有引用它的模型。
 - 渠道余额查询默认关闭且不产生任何探测请求：编辑渠道 →「余额查询」选择适配器并打开开关即可；「立即查询」只查当前渠道，每个渠道余额右侧还有独立的刷新按钮，工具栏「刷新余额」批量刷新全部已启用渠道，后台每小时自动刷新一次。未配置或 `enabled=0` 的渠道不参与后台/批量刷新。New API（如 CCTQ）：渠道 API Key 只能读该令牌额度，把面板生成的「系统访问令牌 / PAT」填入「独立令牌」后，会改为查询并显示账户可用余额；OpenCode Go 渠道按 5h / 周 / 月展示剩余百分比；智谱 GLM Coding Plan、MiniMax Coding Plan、Kimi For Coding 展示订阅的 5 小时 / 周配额窗口（不是账户余额）；OpenRouter 填普通 Key 看该 Key 的额度、填 Management Key 看账户余额；小米 MiMo 需把浏览器 Cookie 填进「独立令牌」（约 1 天过期，Token Plan 没有 API Key 查询接口）；SiliconFlow、StepFun、Novita、Moonshot 展示账户余额（币种随平台，StepFun 的 Step Plan 月度 Credit 无公开接口）。
 - 本项目模型路由只对请求进行简单转发，不进行任何额外处理，因此在配置渠道端点时务必确保上游支持所选端点。
-- Claude 模型映射助手（Claude Code 标准名 → 系统中已配置的模型，独立于常规请求）：
-  1. 先在供应商与渠道页配置好上游渠道并探测/登记模型，再到「模型路由」页为上游模型配置候选优先级（候选渠道直接在系统中已配置的模型里选择，映射无需单独配置候选）。
-  2. 打开「Claude 映射」页，点击「添加映射」：可从预设下拉快速选择 Anthropic 当前模型名（如 `claude-opus-5`，内置默认 + 经已配置的 Claude 渠道实时刷新），再从「上游模型」下拉选择——数据源直接来自「模型路由」页已配置路由的模型，并按所选上游协议自动过滤；再选择该模型独立使用的上游协议（OpenAI Chat / OpenAI Responses / Claude 原生 / Gemini）。
-  3. 保存后立即生效。候选渠道自动继承上游模型在「模型路由」中的配置，修改路由实时生效，无需单独设置映射候选。
-  4. 映射仅通过独立入口 `/claudecode` 提供服务，不影响其他应用调用常规 `/v1/*` 端点：
-     - `GET /claudecode`：接入信息（端点清单与配置提示）
-     - `GET /claudecode/v1/models`、`GET /claudecode/v1/messages/models`：Claude Code 探测模型目录（Claude 格式）
-     - `POST /claudecode/v1/messages`：模型请求入口，自动转换请求为上游协议、转发并故障转移，再把响应转换回 Claude 格式（流式响应逐事件转换）
-  5. Claude Code 接入：设置 `ANTHROPIC_BASE_URL=http://<网关地址>:3000/claudecode`，`ANTHROPIC_API_KEY` 任意值，`ANTHROPIC_MODEL` 填映射名（如 `claude-opus-5`）。
-- Codex 模型映射助手（Codex 标准名 → 系统中已配置的模型，独立于常规请求）：
-  1. 配置方式与 Claude 映射相同：先在供应商与渠道页配置好上游渠道并探测/登记模型，再到「模型路由」页为上游模型配置候选优先级，然后打开「Codex 映射」页添加映射（预设下拉含 `gpt-5-codex` 等 Codex 标准模型名，内置默认 + 经已配置的 OpenAI Responses 渠道实时刷新；上游模型与上游协议选择同 Claude 映射）。
-  2. 保存后立即生效。候选渠道自动继承上游模型在「模型路由」中的配置，修改路由实时生效，无需单独设置映射候选。
-  3. 映射仅通过独立入口 `/codex` 提供服务，不影响其他应用调用常规 `/v1/*` 端点：
-     - `GET /codex`：接入信息（端点清单与配置提示）
-     - `GET /codex/v1/models`、`GET /codex/v1/responses/models`：Codex 探测模型目录（OpenAI 格式）
-     - `POST /codex/v1/responses`：模型请求入口，自动转换请求为上游协议、转发并故障转移，再把响应转换回 OpenAI Responses 格式（流式响应逐事件转换）；支持 `input` 末尾带 `compaction_trigger` 的 V2 远程压缩请求
-     - `POST /codex/v1/responses/compact`：Codex V1 远程压缩专属端点（仅 `openai_responses` 上游）
-  4. Codex CLI 接入：在 `~/.codex/config.toml` 中设置（Codex 会向 base URL 追加 `/responses` 与 `/models`，因此必须带 `/v1` 前缀）：
-     ```toml
-     openai_base_url = "http://<网关地址>:3000/codex/v1"
-     model = "gpt-5-codex" # 映射名，如 gpt-5-codex
-     ```
-     并设置任意值的 `OPENAI_API_KEY`。也可以改用自定义 provider（可同时关闭 WebSocket 探测，避免先连 WS 失败再回退 HTTP）：
-     ```toml
-     model = "gpt-5-codex"
-     model_provider = "gateway"
 
-     [model_providers.gateway]
-     name = "Local AI Gateway"
-     base_url = "http://<网关地址>:3000/codex/v1"
-     env_key = "LOCAL_GATEWAY_KEY"
-     supports_websockets = false
-     ```
-  5. Codex 远程压缩（Remote Compaction）：仅映射到 `openai_responses` 上游时可用。模型探测会自动探测渠道的 V1/V2 能力并原子落库；压缩请求在向客户端输出任何字节前完成校验，并按渠道优先级故障转移。管理端渠道列表会显示各渠道的 V1/V2 能力徽标。
+### 远程压缩（Remote Compaction）
+
+- V2：普通 `POST /v1/responses` 请求，`input` 末尾追加恰好一个 `{"type":"compaction_trigger"}` 条目。
+- V1：专用端点 `POST /v1/responses/compact`。
+
+两条路径都仅在模型路由绑定 `openai_responses` 上游协议时可用。压缩请求在向客户端输出任何字节前完成校验，并按渠道优先级故障转移；模型探测会自动探测渠道的 V1/V2 能力并原子落库，管理端渠道列表会显示各渠道的 V1/V2 能力徽标。
 
 ### 控制台操作示意
 
@@ -229,7 +200,7 @@ sudo systemctl enable --now local-ai-gateway
    `COMMAND_CODE_API_KEY`）。密钥会先经 `GET /alpha/whoami` 校验，失败会在表单内提示原因
    （拒绝 / 超时 / 校验失败 / 网络错误 / 已取消）。若浏览器无法回传，可在授权页复制 key 到「API Key」输入框手动粘贴。
 4. 为渠道探测/手工登记模型（目录端点 `GET /provider/v1/models`；Go 套餐被 403 拒绝时请手工添加模型）。
-5. 在「模型路由」中新建路由：请求格式勾选 Claude / OpenAI Chat / OpenAI Responses 任一种，再把该渠道的模型加入候选即可——CC 渠道模型自动绑定这三种入口协议，网关按入口转换请求与响应（无需 `command_code` 协议的路由）。也可继续用「Claude 映射」/「Codex 映射」把标准模型名映射到 `command_code` 上游模型。
+5. 在「模型路由」中新建路由：请求格式勾选 Claude / OpenAI Chat / OpenAI Responses 任一种，再把该渠道的模型加入候选即可——CC 渠道模型自动绑定这三种入口协议，网关按入口转换请求与响应（无需 `command_code` 协议的路由），保存后可直接从 `/v1/chat/completions`、`/v1/messages`、`/v1/responses` 调用。
 6. 「设置」→ 打开 **Command Code 集成** 开关并确认风险；同一面板显示 CLI 版本与协议基准的漂移告警。
 7. 可选：编辑渠道 →「余额查询」选择 `Command Code` 适配器并启用，显示 5h/周窗口与 credits。
 

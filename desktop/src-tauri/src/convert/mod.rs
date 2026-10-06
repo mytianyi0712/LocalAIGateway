@@ -17,14 +17,13 @@ use serde_json::{Value, json};
 // ---------------------------------------------------------------------------
 
 mod commandcode;
-mod error;
+mod content;
 mod request;
 mod response;
 mod scan;
 mod stream;
 pub use commandcode::{CommandCodeDecoder, ndjson_to_chat_completion};
-pub use error::chunk_has_content;
-pub use error::convert_error;
+pub use content::chunk_has_content;
 pub use request::convert_request;
 pub use response::convert_response;
 pub use scan::{StreamScan, stream_completed, stream_error_message};
@@ -44,21 +43,21 @@ pub const INPUT_INCLUDES_CACHE: &str = "prompt_tokens_includes_cache";
 /// 由 `scan.rs` 的 `conversion_strategy_registry_is_exhaustive` 测试守护。
 /// 流式转换对应的枚举是 [`ConverterKind`]；仅与上游有关的行为（SSE 扫描、
 /// 完成判定）仍按单轴分发。
+///
+/// 注册表只登记实际可达的方向：可跨协议的入口是 Command Code 的静默回退
+/// （三种普通入口 → `command_code`，见 `routing::fallback_upstream_protocol`），
+/// 其余方向一律同协议直通。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConversionStrategy {
     /// 两端协议相同：只替换模型名。
     Passthrough,
     ClaudeToChat,
-    ClaudeToResponses,
-    ClaudeToGemini,
     /// 入口报文 → Command Code `/alpha/generate` 请求体（仅上游侧协议）。
     ClaudeToCommandCode,
     /// OpenAI chat 入口 → Command Code `/alpha/generate` 请求体
-    /// （直连 `/v1/chat/completions` 请求的静默转换；不经映射）。
+    /// （直连 `/v1/chat/completions` 请求的静默转换）。
     ChatToCommandCode,
     ResponsesToChat,
-    ResponsesToClaude,
-    ResponsesToGemini,
     /// 入口报文 → Command Code `/alpha/generate` 请求体（仅上游侧协议）。
     ResponsesToCommandCode,
 }

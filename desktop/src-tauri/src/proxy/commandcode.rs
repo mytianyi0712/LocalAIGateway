@@ -16,7 +16,6 @@ use crate::domain::TransportFailure;
 use crate::protocol;
 
 use super::attempt::*;
-use super::prepare::*;
 use super::service::*;
 
 /// 一轮 Command Code 传输的推进结果。
@@ -129,24 +128,10 @@ impl ProxyService {
                 ),
             }
         } else {
-            (
-                ctx.request
-                    .mapping
-                    .map(|value| {
-                        mapped_path(
-                            value,
-                            path,
-                            ctx.request.stream_requested,
-                            &value.upstream_model,
-                            ctx.request.compaction_mode,
-                        )
-                    })
-                    .unwrap_or_else(|| path.to_owned()),
-                ctx.converted_body.clone(),
-            )
+            (path.to_owned(), ctx.converted_body.clone())
         };
-        // 在 `mapped_path` 之后改写（它会为 gemini 重新插入映射的
-        // 模型），这样候选真实的 id 才能胜出。
+        // 候选真实的上游模型 id 与路由名不同时改写正文与路径
+        // （gemini 的路径里内嵌模型名）。
         let (target_path, request_body) = match ctx.candidate_model {
             Some(model) => {
                 let (path, body) =

@@ -1,4 +1,4 @@
-//! 非流式响应路径：有界缓冲、无损解码与映射正文的一次性响应。
+//! 非流式响应路径：有界缓冲、无损解码与转换正文的一次性响应。
 
 use std::time::Duration;
 
@@ -56,7 +56,7 @@ pub(super) fn transformed_body_response(
     response
 }
 
-/// 解码一个已完整缓冲的上游响应体（映射非流式与映射压缩路径共用）。
+/// 解码一个已完整缓冲的上游响应体（转换非流式与压缩路径共用）。
 ///
 /// 必须走 [`compression::RequiredDecoder::feed_all`]：单次 feed 的输出被
 /// [`compression::FEED_LIMIT`] 截断，直接判 `finished()` 会把超过 2 MiB 的
@@ -128,7 +128,7 @@ pub(super) enum NonStreamResult {
     FailOver(Option<TransportFailure>),
 }
 
-/// 非流式成功响应（映射与非映射）：有界缓冲、映射转换所需的无损解码、
+/// 非流式成功响应（转换与同协议直通）：有界缓冲、转换所需的无损解码、
 /// 转换，以及统一的终态遥测。
 pub(super) async fn bounded_non_stream(
     env: AttemptEnv<'_>,
@@ -136,7 +136,7 @@ pub(super) async fn bounded_non_stream(
     status: axum::http::StatusCode,
     response_headers: axum::http::HeaderMap,
 ) -> NonStreamResult {
-    // 映射的非流式响应必须完整缓冲才能转换，
+    // 转换的非流式响应必须完整缓冲才能转换，
     // 但缓冲是有界的——先预检 Content-Length，
     // 再由分块累积执行硬上限。
     let buffered_cap = (env.runtime.max_buffered_upstream_body_mb.max(1) as usize) * 1024 * 1024;
@@ -181,7 +181,7 @@ pub(super) async fn bounded_non_stream(
 
 #[allow(clippy::result_large_err)]
 /// 读取并解码非流式正文：Content-Length 预检 → 有界读取 → 无损解码
-/// （映射路径）或尽力而为解码（非映射路径）→ Command Code NDJSON 聚合。
+/// （转换路径）或尽力而为解码（同协议直通）→ Command Code NDJSON 聚合。
 ///
 /// 返回 `(原始字节, 解码后字节)`；失败时返回已终结遥测的终态结果。
 async fn read_decoded_body(
@@ -265,10 +265,11 @@ async fn read_decoded_body(
             return Err(NonStreamResult::FailOver(Some(failure)));
         }
     };
-    // 映射转换必须有明文：解码失败是终态——给出稳定的网关错误，
-    // 绝不把截断的正文交给转换器。
-    // 非映射响应只需要尽力而为的可观测性，因此其解码是软失败。
-    let decoded = if env.mapping.is_some() {
+    // 协议转换必须有明文：解码失败是终态——给出稳定的网关错误，
+    // 绝不把截断的正文交给转换器。Command Code 上游正文同样要被解析
+    // （NDJSON 聚合或 Provider API 转换），因此与转换路径同一口径。
+    // 同协议直通只需要尽力而为的可观测性，因此其解码是软失败。
+    let decoded = if env.upstream_protocol == "command_code" {
         match decode_required_buffered(response_headers.get("content-encoding"), &raw, buffered_cap)
         {
             Ok(decoded) => decoded,
@@ -278,7 +279,7 @@ async fn read_decoded_body(
                     request_id = %env.request_id,
                     channel_id = %env.candidate.channel_id,
                     error = ?error,
-                    "mapped response decode failed"
+                    "converted response decode failed"
                 );
                 decode_failure(env, env.attempts < env.candidates_len, raw.len() as i64);
                 return Err(NonStreamResult::Respond(gateway_error(
@@ -340,10 +341,9 @@ struct NonStreamResponse {
 
 /// 入口协议转换与响应组装。
 ///
-/// 客户端期望的入口协议：映射入口总是转换；非映射的 Command Code 尝试会把
-/// 解码出的 OpenAI 正文转回入口协议——与流式路径的
-/// `MappedStreamConverter::new(entry, "openai_compatible", …)` 同一对协议。
-/// `entry == openai_compatible` 的情形本身就是解码后的正文。
+/// 客户端期望的入口协议：Command Code 尝试会把解码出的 OpenAI 正文转回入口协议
+/// ——与流式路径的 `MappedStreamConverter::new(entry, "openai_compatible", …)`
+/// 同一对协议。`entry == openai_compatible` 的情形本身就是解码后的正文。
 fn respond_non_stream(
     env: &AttemptEnv<'_>,
     status: axum::http::StatusCode,
@@ -353,14 +353,12 @@ fn respond_non_stream(
     body_protocol: &str,
     usage: Usage,
 ) -> NonStreamResponse {
-    let target_entry = match env.mapping {
-        Some(value) => Some(value.entry.as_str()),
-        None if env.upstream_protocol == "command_code"
-            && env.entry_protocol != "openai_compatible" =>
-        {
-            Some(env.entry_protocol)
-        }
-        None => None,
+    let target_entry = if env.upstream_protocol == "command_code"
+        && env.entry_protocol != "openai_compatible"
+    {
+        Some(env.entry_protocol)
+    } else {
+        None
     };
     let (result_body, conversion_failed, mapped) = if let Some(entry) = target_entry {
         match convert::convert_response(entry, body_protocol, env.entry_model, decoded) {
@@ -383,12 +381,12 @@ fn respond_non_stream(
             }
         }
     } else if env.upstream_protocol == "command_code" {
-        // 非映射的 Command Code：上游字节是 NDJSON（generate）或 Provider-API JSON，
+        // Command Code 直通入口：上游字节是 NDJSON（generate）或 Provider-API JSON，
         // 而 `decoded` 是客户端协议期望的规范 OpenAI 正文。
         // 标记为已转换会丢掉原来的 content-length/content-encoding 头。
         (decoded.to_vec(), false, true)
     } else {
-        // 非映射：用原始头转发原始字节（含 content-length——正文是完整的）。
+        // 同协议直通：用原始头转发原始字节（含 content-length——正文是完整的）。
         (raw.to_vec(), false, false)
     };
     let result = if mapped {
@@ -441,7 +439,7 @@ fn finalize_non_stream_attempt(
     );
 }
 
-/// 映射压缩响应的共享无损解码。失败时终结该次尝试，并返回携带真实失败原因的
+/// 压缩响应转换的共享无损解码。失败时终结该次尝试，并返回携带真实失败原因的
 /// [`CompactionResult`]——没有可回放的上游错误体时，最终响应仍要说明是解码
 /// 失败，而不是笼统的 502。
 pub(super) fn decode_mapped_response(

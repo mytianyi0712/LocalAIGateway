@@ -65,7 +65,6 @@ desktop/src-tauri/src/
 │   ├── models.rs             # 渠道模型清单
 │   ├── routes.rs             # 路由与候选（协议支持校验 P2-6）
 │   ├── profiles.rs           # 能力画像（写入校验 P2-4、删除事务化）
-│   ├── mappings.rs           # Claude/Codex 映射与预设
 │   ├── settings.rs           # 设置/密钥/系统状态（含恢复 nonce 流程）
 │   ├── logs.rs / stats.rs / discovery.rs
 ├── proxy.rs                  # 代理热路径（ProxyService：prepare/attempt/stream 策略/终态）
@@ -89,37 +88,37 @@ desktop/src-tauri/src/
 
 分层方向（当前已落地）：
 
-- `ports.rs` 定义五个应用端口：`UpstreamClient`（上游 HTTP）、`RouteRepository`（候选/目录/映射查询）、`ChannelRepository`（渠道行加载）、`EventSink`（遥测）、`Clock`（时间）。
+- `ports.rs` 定义五个应用端口：`UpstreamClient`（上游 HTTP）、`RouteRepository`（候选/目录查询）、`ChannelRepository`（渠道行加载）、`EventSink`（遥测）、`Clock`（时间）。
 - `infrastructure.rs` 提供全部端口实现与运行时所有权：`HttpClientPool`（reqwest 池）、`SqliteRouteRepository`/`SqliteChannelRepository`、`SystemClock`、`RuntimeSupervisor`。
 - `application::Context` 只持有端口与组合好的服务：`http`/`routes`/`channels`/`clock`/`discovery`。业务模块（proxy/health/discovery/routing）经端口访问基础设施——proxy 不再直接 import `reqwest`/`sqlx`；`server.rs` 退化为纯组装根（build/serve/spawn_background），业务模块不再反向引用它（P2-1/P2-2）。
 - `DiscoveryService`（discovery.rs）与 `ProxyService`（proxy.rs，纯端口依赖：db/secrets/http/routes/telemetry/clock/limits）按端口/窄依赖组织；`AdminService`（admin/mod.rs，db+secrets 窄服务）承载 provider/channel 域 SQL（P2-1）。`AttemptFinalizer` 经 `EventSink` 端口发遥测。
 - 协议身份收敛为 `protocol::ProtocolId` 枚举 + `ProtocolAdapter` registry（认证、入口解析、发现、健康探测/判定、usage 观察、公开错误外形）；转换矩阵收敛为 `convert::ConversionStrategy` registry（`(entry, upstream) -> strategy`，覆盖请求/响应/流式转换的调度）；前端协议列表来自 `/system/protocols`（P2-3）。
 - `scripts/check-layers.sh`（CI 门禁）：`application`/`domain`/`ports` 层禁止直接 import `axum`/`sqlx`/`reqwest`；已迁移的 admin 域文件（providers.rs、channels.rs）额外受 handler 范围检查——handler 函数体内禁止出现 `sqlx::`（SQL 只允许在 `impl AdminService` 或存储 helper 中），其余子域迁移完成后加入该检查列表。
 - P2-1 已落地：`AdminService`/`ProxyService` 结构形式化；provider 域双实现已删除（router 只绑定服务用例）；`proxy()` 函数级拆分（bounded_non_stream/final_gateway_response）完成。
-- 迁移状态（进行中，按报告附录逐子域推进）：models/routes/profiles/mappings/settings/logs/stats 仍以直写 SQL 的 handler 为主，尚未全部迁入 `AdminService`；`Context` 仍是宽 service locator。这些是已知的进行中事项，不作为已完成边界描述。
+- 迁移状态（进行中，按报告附录逐子域推进）：models/routes/profiles/settings/logs/stats 仍以直写 SQL 的 handler 为主，尚未全部迁入 `AdminService`；`Context` 仍是宽 service locator。这些是已知的进行中事项，不作为已完成边界描述。
 
 ## 4. 代理热路径（proxy.rs）
 
 `proxy()` 由四个阶段组成（P2-4 已拆分）：
 
-1. `prepare_request`：设置读取、请求体有界读取、网关鉴权、模型识别、映射解析、候选路由；失败直接返回网关错误。
+1. `prepare_request`：设置读取、请求体有界读取、网关鉴权、模型识别、候选路由；失败直接返回网关错误。
 2. 候选尝试循环：逐渠道尝试，全部失败按最后状态分类收尾（502/504）。
 3. 响应策略：
-   - `transparent_stream`：非映射流式 2xx 原样转发，明文观察有界（P1-1）。
-   - `mapped_stream`：映射流式（prelude 缓冲 + 增量转换），prelude 失败可故障转移。
-   - 非流式（映射与非映射统一）：有界缓冲 + RequiredDecoder + 转换（P1-1/P1-2）。
+   - `transparent_stream`：非转换流式 2xx 原样转发，明文观察有界（P1-1）。
+   - `mapped_stream`：转换流式（prelude 缓冲 + 增量转换），prelude 失败可故障转移。
+   - 非流式（转换与非转换统一）：有界缓冲 + RequiredDecoder + 转换（P1-1/P1-2）。
 4. 终态：所有路径共用 `AttemptFinalizer::finalize`（P1-5）——channel/attempt/request 三类事件由单一 `AttemptOutcome` 驱动，不再可能互相矛盾。
 
 ### 4.1 上游响应内存边界（P1-1）
 
-- 非映射流式：全程流式转发，无整体缓冲。
-- 映射非流式：`Content-Length` 预检 + chunk 累计硬上限 `max_buffered_upstream_body_mb`；超限返回稳定 `502 upstream_response_too_large`，绝不把部分 JSON 交给转换器。
+- 非转换流式：全程流式转发，无整体缓冲。
+- 转换非流式：`Content-Length` 预检 + chunk 累计硬上限 `max_buffered_upstream_body_mb`；超限返回稳定 `502 upstream_response_too_large`，绝不把部分 JSON 交给转换器。
 - 非 2xx 错误体：只保留 `RuntimeLimits::error_body_max`（1 MiB），截断记录 `body_truncated=true`。
 
 ### 4.2 解码器（P1-2）
 
 - `ObservableDecoder`：仅用于透明转发的 usage 观察；超限/失败后静默停喂，转发不受影响。
-- `RequiredDecoder`：用于映射转换；保留未消费输入余量（无损续传）、累计明文硬上限、`finished()` 截断检测；任何失败都是终态错误，绝不静默截断。
+- `RequiredDecoder`：用于协议转换；保留未消费输入余量（无损续传）、累计明文硬上限、`finished()` 截断检测；任何失败都是终态错误，绝不静默截断。
 
 ### 4.3 转换失败终态（P1-5）
 
@@ -151,7 +150,7 @@ desktop/src-tauri/src/
 
 - 原生 SPA：History API + 网关静态回退；`app.js` 单一入口。
 - 导航竞态（P2-9）：mutation 开始时捕获 `{path, renderVersion}`，数据写入照常完成，但 reload/render 只在页面仍匹配时执行；`loadX` 内部校验目标 path；纯查询可被导航丢弃。
-- 预设刷新（P1-5）：按钮触发后端真实 discovery 排队（Claude→`claude` 协议渠道；Codex→`openai_responses`/`openai_compatible` 渠道），前端轮询各 run 终态，完成后重新 GET presets 并刷新下拉；无渠道/部分失败/导航离开/重复点击均有确定状态。预设列表由 `channel_models + channel_model_protocols` 实时聚合，无第二份缓存。
+- 导航页面：概览、供应商与渠道、模型路由、能力档案、请求日志、运行设置。
 - 设置表单（P1-7）：数字字段由单一 schema（`SETTINGS_SECTIONS`）驱动渲染、提交载荷与前端范围校验；`max_buffered_upstream_body_mb` 随 schema 一并提交；设置损坏时页面显示 `config_corrupted_keys` 提示并可重新保存修复。
 - 渠道保存（P2-3）：API key 并入单个原子 PATCH，不再拆成两个请求。
 - 协议列表数据驱动自 `/system/protocols`（常量仅作离线兜底）。

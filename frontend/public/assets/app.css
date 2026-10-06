@@ -505,32 +505,3 @@ button:disabled { cursor: not-allowed; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
 }
-
-/* 模型映射助手（Claude / Codex） */
-.entry-banner {
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  flex-wrap: wrap;
-  padding: 14px 16px;
-  border: 1px solid var(--line-strong);
-  border-radius: var(--radius);
-  background: linear-gradient(135deg, var(--accent-faint), var(--surface-raised));
-  box-shadow: var(--shadow-panel);
-}
-.entry-banner-copy { min-width: 0; flex: 1 1 420px; }
-.entry-banner-copy strong { display: block; margin-bottom: 4px; color: var(--text); font-size: 14px; }
-.entry-banner-copy p { margin: 0; color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
-.entry-banner-copy code { padding: 1px 5px; border-radius: 4px; background: var(--accent-soft); color: var(--accent-strong); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
-.entry-banner-actions { min-width: 0; max-width: 100%; display: flex; align-items: center; gap: 8px; }
-.entry-banner-actions code.mono { min-width: 0; overflow: hidden; padding: 6px 10px; border: 1px solid var(--line-strong); border-radius: var(--radius-small); background: var(--surface); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
-.preset-row { display: flex; align-items: center; gap: 8px; }
-.preset-row .select { flex: 1; }
-
-@media (max-width: 520px) {
-  .entry-banner { display: grid; gap: 12px; padding: 14px; }
-  .entry-banner-copy, .entry-banner-actions { width: 100%; }
-  .entry-banner-actions code.mono { flex: 1; }
-}

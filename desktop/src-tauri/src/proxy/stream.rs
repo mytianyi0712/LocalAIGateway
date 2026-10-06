@@ -1,4 +1,4 @@
-//! 流式响应路径：透明转发（`transparent_stream`）与映射转换
+//! 流式响应路径：透明转发（`transparent_stream`）与协议转换
 //! （`mapped_stream`），以及可观测性扫描用的 usage 归集。
 
 use std::{
@@ -127,7 +127,7 @@ pub(super) fn scan_observable_lines(
     terminal
 }
 
-/// 由映射流转换器取出 usage 快照：仅在转换干净时有意义。
+/// 由转换流取出 usage 快照：仅在转换干净时有意义。
 /// cache-miss 由 [`crate::domain::cache_miss_input`] 统一推导（见 [`usage_from_parts`]）。
 /// 转换失败时返回默认（空）usage。
 pub(super) fn converter_usage(
@@ -188,7 +188,7 @@ fn drain_decoder(
     }
 }
 
-/// 非映射 2xx 的流式路径：透明转发，明文读取有界。压缩的上游响应
+/// 同协议 2xx 的流式路径：透明转发，明文读取有界。压缩的上游响应
 /// 被增量解码后转发，因此被截断的上游流在下游表现为一个干净中断的
 /// 明文流，而不会是一个客户端无法解压的损坏压缩体
 /// （如 omp 的 `ZlibError`）。本路径从不对正文整体缓冲；
@@ -544,7 +544,7 @@ pub(super) fn transparent_stream(
     *result.headers_mut() = response_headers_for_client;
     result
 }
-/// 映射流构造器的结果：要么返回一个响应，要么是一个 prelude 级失败——
+/// 转换流构造器的结果：要么返回一个响应，要么是一个 prelude 级失败——
 /// 后者已经发出终态遥测，
 /// 应 failover 到下一个候选。
 pub(super) enum MappedStreamResult {
@@ -686,7 +686,7 @@ impl UpstreamStreamAdapter {
     pub(super) fn feed<'a>(&mut self, decoded: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
         match self {
             // 普通流量直接重新借用：无需适配的协议，
-            // 映射管线不应为每个 chunk 多付一次拷贝。
+            // 转换管线不应为每个 chunk 多付一次拷贝。
             Self::Plain => std::borrow::Cow::Borrowed(decoded),
             Self::CommandCode(decoder) => std::borrow::Cow::Owned(decoder.feed(decoded)),
         }
@@ -701,7 +701,7 @@ impl UpstreamStreamAdapter {
     }
 }
 
-/// 映射流式：先缓冲一小段 prelude（这样 200 的错误正文仍能 failover），
+/// 转换流式：先缓冲一小段 prelude（这样 200 的错误正文仍能 failover），
 /// 再对实时流做增量转换。prelude 解码是无损的（`RequiredDecoder`），
 /// 损坏或超限的正文会让该次尝试失败，
 /// 而不是把流截断。
@@ -759,7 +759,7 @@ pub(super) async fn mapped_stream(
     );
     let stats = Arc::new(SharedStreamStats::default());
     let mut upstream_stream = response.body.into_stream();
-    // 映射转换必须有明文——解码失败
+    // 协议转换必须有明文——解码失败
     // 必须让该次尝试失败，绝不能退化成静默。
     let mut decoder = compression::RequiredDecoder::new(
         compression::ContentDecoder::from_encoding(response_headers.get("content-encoding")),

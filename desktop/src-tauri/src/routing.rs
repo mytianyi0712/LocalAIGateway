@@ -1,7 +1,7 @@
 //! 路由领域层：上游回退协议映射与按协议组装目录入口端点。
 //!
 //! 边界：本模块只做纯映射，不读写数据库、不发起请求。
-//! 共享的数据形状（`Candidate` / `RoutableModel` / `MappingTarget`）已移入
+//! 共享的数据形状（`Candidate` / `RoutableModel`）已移入
 //! `domain`，此处不再定义类型。
 //! 关键不变量：入口端点顺序由调用方保证（生产调用方在 SQL 中按
 //! `PROTOCOL_ORDER` 排序）；本模块只按输入顺序映射并丢弃未知协议。
@@ -10,7 +10,7 @@
 ///
 /// 目前是三种客户端入口协议 → `command_code`：这三种入口都有对应的请求与流式
 /// 转换器，所以直接发往 `/v1/chat/completions`、`/v1/messages`、`/v1/responses`
-/// 的请求无需 Claude/Codex 映射即可驱动 `command_code` 路由。`gemini` 不在其中
+/// 的请求即可驱动 `command_code` 路由。`gemini` 不在其中
 /// ——它没有指向 `command_code` 的转换器。
 pub fn fallback_upstream_protocol(entry: &str) -> Option<&'static str> {
     // 判定来自转换注册表（`converts_to_command_code`），不再维护第二份白名单。
@@ -20,8 +20,8 @@ pub fn fallback_upstream_protocol(entry: &str) -> Option<&'static str> {
 /// 每个协议在模型目录中公布的主代理入口点。
 /// OpenAI Compatible 只公布 `/v1/chat/completions`——embeddings 与 completions
 /// 刻意不做猜测（见 requirements.md 3.7）。
-/// Command Code 没有面向客户端的入口端点（只能经 claude / openai 路由或
-/// claude/codex 映射抵达），因此从目录中剔除。
+/// Command Code 没有面向客户端的入口端点（只能经 claude / openai 路由抵达），
+/// 因此从目录中剔除。
 pub fn protocol_main_endpoint(protocol: &str, model_id: &str) -> Option<String> {
     crate::protocol::main_path(protocol, model_id, false)
 }

@@ -78,15 +78,9 @@ pub(super) fn parse_gemini_events(chunk: &[u8], buffer: &mut Vec<u8>) -> Vec<Par
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum ConverterKind {
     ClaudeOpenai,
-    ClaudeResponses,
-    ClaudeGemini,
-    ClaudePassthrough,
     /// entry 为 OpenAI chat 时的直通（Command Code 的静默转换目标）。
     ChatPassthrough,
     ResponsesOpenai,
-    ResponsesClaude,
-    ResponsesGemini,
-    ResponsesPassthrough,
 }
 
 #[derive(Clone)]
@@ -121,7 +115,6 @@ pub struct MappedStreamConverter {
     pending_finish_reason: Option<String>,
     tool_index_by_id: HashMap<String, i64>,
     tool_index_by_upstream: HashMap<i64, i64>,
-    item_index_by_id: HashMap<String, i64>,
     // responses 侧状态
     output: Vec<Value>,
     next_output_index: i64,
@@ -134,8 +127,6 @@ pub struct MappedStreamConverter {
     tool_key_by_id: HashMap<String, String>,
     tool_key_by_index: HashMap<i64, String>,
     tool_key_index: i64,
-    open_block_types: HashMap<i64, String>,
-    function_key_by_block: HashMap<i64, String>,
     /// 每个打开中的 block 累积的 thinking 文本；上游不提供 signature 时
     /// 用它合成 Anthropic 的 `signature_delta`（Command Code / OpenAI 兼容
     /// 的推理路径）。
@@ -152,14 +143,11 @@ impl MappedStreamConverter {
         use ConversionStrategy::*;
         let kind = match ConversionStrategy::for_pair(entry, upstream_protocol) {
             Some(ClaudeToChat) => ConverterKind::ClaudeOpenai,
-            Some(ClaudeToResponses) => ConverterKind::ClaudeResponses,
-            Some(Passthrough) if entry == "claude" => ConverterKind::ClaudePassthrough,
             Some(Passthrough) if entry == "openai_compatible" => ConverterKind::ChatPassthrough,
-            Some(ClaudeToGemini) => ConverterKind::ClaudeGemini,
             Some(ResponsesToChat) => ConverterKind::ResponsesOpenai,
-            Some(Passthrough) => ConverterKind::ResponsesPassthrough,
-            Some(ResponsesToClaude) => ConverterKind::ResponsesClaude,
-            Some(ResponsesToGemini) => ConverterKind::ResponsesGemini,
+            Some(Passthrough) => bail!(
+                "Unsupported stream conversion pair: {entry} -> {upstream_protocol}"
+            ),
             Some(ClaudeToCommandCode)
             | Some(ResponsesToCommandCode)
             | Some(ChatToCommandCode) => bail!(
@@ -183,7 +171,6 @@ impl MappedStreamConverter {
             pending_finish_reason: None,
             tool_index_by_id: HashMap::new(),
             tool_index_by_upstream: HashMap::new(),
-            item_index_by_id: HashMap::new(),
             output: Vec::new(),
             next_output_index: 0,
             text_item_id: None,
@@ -195,8 +182,6 @@ impl MappedStreamConverter {
             tool_key_by_id: HashMap::new(),
             tool_key_by_index: HashMap::new(),
             tool_key_index: 0,
-            open_block_types: HashMap::new(),
-            function_key_by_block: HashMap::new(),
             thinking_text: HashMap::new(),
             dsml_text_buffer: String::new(),
             dsml_start_marker: None,
@@ -222,15 +207,10 @@ impl MappedStreamConverter {
         if self.finished {
             return Vec::new();
         }
-        let passthrough = matches!(
-            self.kind,
-            ConverterKind::ClaudePassthrough
-                | ConverterKind::ChatPassthrough
-                | ConverterKind::ResponsesPassthrough
-        );
+        let passthrough = self.kind == ConverterKind::ChatPassthrough;
         if passthrough {
-            // 同协议映射的流原样转发字节，但仍须观察 usage：
-            // 否则 claude/responses 渠道上的改名映射会在日志里记成 0 token。
+            // 直通（Command Code 的静默转换目标）原样转发字节，但仍须观察 usage：
+            // 否则 openai_compatible 入口的流会在日志里记成 0 token。
             self.observe_passthrough_usage(chunk);
             return chunk.to_vec();
         }
@@ -243,51 +223,27 @@ impl MappedStreamConverter {
         self.buffer.extend_from_slice(&normalize_crlf(chunk));
         for block in crate::sse::split_blocks(&mut self.buffer) {
             if let Some(ParsedEvent::Json(value)) = sse_block_events(&block) {
-                let usage = match self.kind {
-                    ConverterKind::ClaudePassthrough => value
-                        .get("message")
-                        .and_then(|message| message.get("usage"))
-                        .or_else(|| value.get("usage")),
-                    ConverterKind::ChatPassthrough => value.get("usage"),
-                    _ => value
-                        .get("usage")
-                        .or_else(|| value.get("response").and_then(|item| item.get("usage"))),
-                };
+                let usage = value.get("usage");
                 if let Some(usage) = usage.filter(|item| item.is_object()) {
-                    match self.kind {
-                        ConverterKind::ClaudePassthrough => self.usage.merge_claude(usage),
-                        ConverterKind::ChatPassthrough => self.usage.merge_openai(usage),
-                        _ => self.usage.merge_responses(usage),
-                    }
+                    self.usage.merge_openai(usage);
                 }
             }
         }
     }
 
     fn feed_impl(&mut self, chunk: &[u8]) -> Vec<u8> {
-        // 非 gemini 类型：buffer 必须包含新分片。
-        let events = if matches!(
-            self.kind,
-            ConverterKind::ClaudeGemini | ConverterKind::ResponsesGemini
-        ) {
-            parse_gemini_events(chunk, &mut self.buffer)
-        } else {
-            self.buffer.extend_from_slice(&normalize_crlf(chunk));
-            let mut events = Vec::new();
-            for block in crate::sse::split_blocks(&mut self.buffer) {
-                if let Some(event) = sse_block_events(&block) {
-                    events.push(event);
-                }
+        self.buffer.extend_from_slice(&normalize_crlf(chunk));
+        let mut events = Vec::new();
+        for block in crate::sse::split_blocks(&mut self.buffer) {
+            if let Some(event) = sse_block_events(&block) {
+                events.push(event);
             }
-            events
-        };
+        }
         let mut output = Vec::new();
         for event in events {
             match event {
                 ParsedEvent::Done => match self.kind {
-                    ConverterKind::ClaudeOpenai
-                    | ConverterKind::ClaudeResponses
-                    | ConverterKind::ClaudeGemini => {
+                    ConverterKind::ClaudeOpenai => {
                         let reason = self
                             .pending_finish_reason
                             .clone()
@@ -298,9 +254,7 @@ impl MappedStreamConverter {
                         output.extend(self.drain_dsml_text(None, true));
                         output.extend(self.finish_responses(self.status.clone()));
                     }
-                    _ => {
-                        output.extend(self.finish_responses(self.status.clone()));
-                    }
+                    ConverterKind::ChatPassthrough => {}
                 },
                 ParsedEvent::Json(value) => output.extend(self.consume(&value)),
             }
@@ -313,9 +267,7 @@ impl MappedStreamConverter {
             return Vec::new();
         }
         match self.kind {
-            ConverterKind::ClaudeOpenai
-            | ConverterKind::ClaudeResponses
-            | ConverterKind::ClaudeGemini => {
+            ConverterKind::ClaudeOpenai => {
                 let reason = self
                     .pending_finish_reason
                     .clone()
@@ -327,34 +279,12 @@ impl MappedStreamConverter {
                 output.extend(self.finish_responses(self.status.clone()));
                 output
             }
-            ConverterKind::ResponsesClaude | ConverterKind::ResponsesGemini => {
-                self.finish_responses(self.status.clone())
-            }
-            ConverterKind::ClaudePassthrough
-            | ConverterKind::ChatPassthrough
-            | ConverterKind::ResponsesPassthrough => Vec::new(),
+            ConverterKind::ChatPassthrough => Vec::new(),
         }
     }
 
     pub fn error_event(&mut self, message: &str) -> Vec<u8> {
         match self.kind {
-            ConverterKind::ClaudePassthrough => sse(
-                "error",
-                &json!({
-                    "type": "error",
-                    "error": {"type": GATEWAY_ERROR_TYPE, "message": message},
-                    "request_id": self.request_id,
-                }),
-            ),
-            ConverterKind::ResponsesPassthrough => {
-                let mut output = self.ensure_start_responses();
-                output.extend(self.responses_event("response.failed", &json!({
-                    "type": "response.failed",
-                    "response": self.envelope("failed", Some(json!({"code": "gateway_error", "message": message}))),
-                })));
-                self.finished = true;
-                output
-            }
             ConverterKind::ChatPassthrough => {
                 self.finished = true;
                 sse(
@@ -373,27 +303,19 @@ impl MappedStreamConverter {
                 output.extend(self.error_event_responses(message));
                 output
             }
-            _ => {
-                if matches!(
-                    self.kind,
-                    ConverterKind::ClaudeOpenai
-                        | ConverterKind::ClaudeResponses
-                        | ConverterKind::ClaudeGemini
-                ) {
-                    if !self.started {
-                        self.ensure_start_claude();
-                    }
-                    self.finished = true;
-                    return sse(
-                        "error",
-                        &json!({
-                            "type": "error",
-                            "error": {"type": GATEWAY_ERROR_TYPE, "message": message},
-                            "request_id": self.request_id,
-                        }),
-                    );
+            ConverterKind::ClaudeOpenai => {
+                if !self.started {
+                    self.ensure_start_claude();
                 }
-                self.error_event_responses(message)
+                self.finished = true;
+                sse(
+                    "error",
+                    &json!({
+                        "type": "error",
+                        "error": {"type": GATEWAY_ERROR_TYPE, "message": message},
+                        "request_id": self.request_id,
+                    }),
+                )
             }
         }
     }
@@ -409,14 +331,8 @@ impl MappedStreamConverter {
     fn consume(&mut self, event: &Value) -> Vec<u8> {
         match self.kind {
             ConverterKind::ClaudeOpenai => self.consume_claude_openai(event),
-            ConverterKind::ClaudeResponses => self.consume_claude_responses(event),
-            ConverterKind::ClaudeGemini => self.consume_gemini_to_claude(event),
             ConverterKind::ResponsesOpenai => self.consume_responses_openai(event),
-            ConverterKind::ResponsesClaude => self.consume_responses_claude(event),
-            ConverterKind::ResponsesGemini => self.consume_gemini_to_responses(event),
-            ConverterKind::ClaudePassthrough
-            | ConverterKind::ChatPassthrough
-            | ConverterKind::ResponsesPassthrough => Vec::new(),
+            ConverterKind::ChatPassthrough => Vec::new(),
         }
     }
 

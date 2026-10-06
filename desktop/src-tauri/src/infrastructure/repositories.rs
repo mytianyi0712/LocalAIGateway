@@ -6,7 +6,7 @@ use sqlx::Row;
 
 use crate::{
     db::Database,
-    domain::{Candidate, CompactionMode, CompactionSupport, MappingTarget, RoutableModel},
+    domain::{Candidate, CompactionMode, CompactionSupport, RoutableModel},
     ports::{
         ChannelRepository, ChannelRow, Clock, RouteRepository, UpstreamClient,
     },
@@ -223,35 +223,6 @@ impl RouteRepository for SqliteRouteRepository {
         })
     }
 
-    fn resolve_mapping(
-        &self,
-        entry: &str,
-        model: &str,
-    ) -> futures_util::future::BoxFuture<'static, Result<Option<MappingTarget>>> {
-        let db = self.db.clone();
-        let entry = entry.to_owned();
-        let model = model.to_owned();
-        Box::pin(async move {
-            let (table, id_column) = match entry.as_str() {
-                "claude" => ("claude_model_mappings", "claude_model_id"),
-                "openai_responses" => ("codex_model_mappings", "codex_model_id"),
-                _ => return Ok(None),
-            };
-            let sql = format!(
-                "SELECT upstream_protocol,upstream_model_id FROM {table} WHERE {id_column}=? AND enabled=1"
-            );
-            let row = sqlx::query(&sql)
-                .bind(model)
-                .fetch_optional(db.pool())
-                .await?;
-            Ok(row.map(|row| MappingTarget {
-                entry: entry.to_owned(),
-                upstream_protocol: row.get("upstream_protocol"),
-                upstream_model: row.get("upstream_model_id"),
-            }))
-        })
-    }
-
     fn routable_endpoints_for_model(
         &self,
         model_id: &str,
@@ -279,39 +250,6 @@ impl RouteRepository for SqliteRouteRepository {
                 &protocols.iter().map(String::as_str).collect::<Vec<_>>(),
                 &model_id,
             ))
-        })
-    }
-
-    fn list_mapping_models(
-        &self,
-        kind: &str,
-    ) -> futures_util::future::BoxFuture<'static, Result<Vec<RoutableModel>>> {
-        let db = self.db.clone();
-        let kind = kind.to_owned();
-        Box::pin(async move {
-            let (table, id_column) = match kind.as_str() {
-                "claude" => ("claude_model_mappings", "claude_model_id"),
-                // codex 映射按入口协议 openai_responses 标识（proxy::mapped_models 传 entry）
-                "openai_responses" => ("codex_model_mappings", "codex_model_id"),
-                _ => return Ok(Vec::new()),
-            };
-            let sql = format!(
-                "SELECT m.{id_column} AS id, COALESCE(m.display_name, m.{id_column}) AS display_name, m.created_at \
-             FROM {table} m WHERE m.enabled = 1 AND EXISTS (SELECT 1 FROM model_routes mr \
-               JOIN route_candidates rc ON rc.route_id = mr.id \
-               JOIN channel_models cm ON cm.id = rc.channel_model_id \
-               JOIN channel_model_protocols cmp ON cmp.channel_model_id = cm.id AND cmp.protocol = mr.protocol \
-               JOIN channels c ON c.id = cm.channel_id \
-               JOIN channel_health ch ON ch.channel_id = c.id \
-               WHERE mr.protocol = m.upstream_protocol AND mr.requested_model_id = m.upstream_model_id \
-                 AND mr.enabled = 1 AND rc.enabled = 1 AND cm.available = 1 AND c.manual_enabled = 1 AND ch.state = 'active') \
-             ORDER BY m.{id_column}"
-            );
-            let rows = sqlx::query(&sql).fetch_all(db.pool()).await?;
-            Ok(rows
-                .iter()
-                .map(routable_model_from_row)
-                .collect::<Result<Vec<_>, _>>()?)
         })
     }
 }

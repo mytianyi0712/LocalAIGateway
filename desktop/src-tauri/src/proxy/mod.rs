@@ -1,5 +1,5 @@
 //! 网关的代理流水线：入口 handler 经 `ProxyService::proxy` 进入，
-//! 完成设置读取、鉴权、映射解析、候选路由与上游转发。
+//! 完成设置读取、鉴权、候选路由与上游转发。
 //!
 //! 边界：上游、路由、设置与 Command Code 状态都经 `crate::ports` 端口访问；
 //! 正文转换委托 `convert`，压缩解码委托 `compression`，协议差异委托 `protocol`
@@ -26,10 +26,8 @@ mod stream;
 mod tests;
 
 pub use catalog::{
-    claude_models, claudecode_info, claudecode_models, codex_info, codex_models, gemini_models,
-    openai_models, responses_models,
+    claude_models, gemini_models, openai_models, responses_models,
 };
 pub use service::{
-    ProxyService, ProxyServiceDeps, claude, claudecode, codex, codex_compact, gemini, openai,
-    responses, responses_compact,
+    ProxyService, ProxyServiceDeps, claude, gemini, openai, responses, responses_compact,
 };

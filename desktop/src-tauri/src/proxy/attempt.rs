@@ -11,7 +11,7 @@ use std::{
 use axum::http::StatusCode;
 
 use crate::{
-    domain::{AttemptData, Candidate, Event, MappingTarget, TransportFailure, Usage},
+    domain::{AttemptData, Candidate, Event, TransportFailure, Usage},
     settings,
     telemetry::Telemetry,
 };
@@ -266,7 +266,7 @@ pub(super) fn attempt_finalizer(env: &AttemptEnv<'_>) -> AttemptFinalizer {
     )
 }
 
-/// 映射响应正文无法解码时的终态遥测：一个 outcome 驱动
+/// 转换响应正文无法解码时的终态遥测：一个 outcome 驱动
 /// channel/attempt/request 三类事件，调用方发送稳定的 502。
 /// 转换所需的明文并不存在。
 pub(super) fn decode_failure(env: &AttemptEnv<'_>, failover: bool, response_bytes: i64) {
@@ -293,7 +293,7 @@ pub(super) fn decode_failure(env: &AttemptEnv<'_>, failover: bool, response_byte
 }
 
 /// 一次候选尝试除上游响应之外所需的全部上下文：
-/// 让响应策略构造器（透明/映射流式、有界非流式）保持为
+/// 让响应策略构造器（透明/转换流式、有界非流式）保持为
 /// 独立函数，而不是内联闭包。
 #[derive(Clone)]
 pub(super) struct AttemptEnv<'a> {
@@ -314,10 +314,8 @@ pub(super) struct AttemptEnv<'a> {
     /// 它是候选真实的 `channel_models.model_id`。
     pub(super) upstream_model: &'a str,
     /// 路由层（面向网关）的模型名，用于给转换后的响应打标——
-    /// 仅 Command Code 解码与映射流使用。
+    /// 仅 Command Code 解码与协议转换流使用。
     pub(super) response_model: &'a str,
-    /// 该次尝试命中映射入口时的映射目标。
-    pub(super) mapping: Option<&'a MappingTarget>,
     /// 本次尝试实际使用的 Command Code 传输方式：
     /// `Generate` 响应是 NDJSON，需要 CC 解码器；
     /// `Provider` 响应是普通 OpenAI SSE/JSON。
@@ -325,7 +323,7 @@ pub(super) struct AttemptEnv<'a> {
     /// 本次之后剩余的候选数（failover 资格标志）。
     pub(super) candidates_len: i64,
 }
-/// 组装一次候选尝试的上下文：四个调用点（压缩 / 透明流 / 映射流 /
+/// 组装一次候选尝试的上下文：四个调用点（压缩 / 透明流 / 转换流 /
 /// 有界非流式）的实参完全一致，集中在这里后新增字段只需改一处。
 ///
 /// 全部字段都是借用或廉价拷贝，刻意不引入 `Clone`/`Arc` 包装。
@@ -344,7 +342,6 @@ pub(super) fn attempt_env<'a>(
     upstream_protocol: &'a str,
     upstream_model: &'a str,
     response_model: &'a str,
-    mapping: Option<&'a MappingTarget>,
     candidates_len: i64,
     command_code_transport: Option<crate::commandcode::Transport>,
 ) -> AttemptEnv<'a> {
@@ -363,7 +360,6 @@ pub(super) fn attempt_env<'a>(
         upstream_protocol,
         upstream_model,
         response_model,
-        mapping,
         candidates_len,
         command_code_transport,
     }
@@ -373,7 +369,7 @@ pub(super) fn attempt_env<'a>(
 /// 且在终态标记处结束的流必须在客户端可能挂断之前记录结果——
 /// 已完成的响应绝不能退化成带零值的 `cancelled`。
 ///
-/// 透明转发与映射转换两条流式路径都通过它终结尝试，
+/// 透明转发与转换两条流式路径都通过它终结尝试，
 /// 因此两者的 outcome/error_kind/status 口径保持一致。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn finalize_stream_attempt(
@@ -424,7 +420,7 @@ pub(super) fn finalize_stream_attempt(
     );
 }
 
-/// 构造客户端中途断开时的“取消终态”回调：透明流转发与映射流转发
+/// 构造客户端中途断开时的“取消终态”回调：透明流转发与转换流转发
 /// 各有一个字节级相同的闭包体，集中在这里后两者不可能再漂移。
 ///
 /// 回调读取 **流关闭那一刻** 的真实统计（已转发字节、已解析的 usage、

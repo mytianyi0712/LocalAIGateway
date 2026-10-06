@@ -28,66 +28,11 @@ function protocolOptions() {
   return (state.protocols && state.protocols.length ? state.protocols : FALLBACK_PROTOCOLS);
 }
 
-const MAPPING_KINDS = {
-  claude: {
-    route: '/mappings',
-    title: 'Claude 模型映射助手',
-    description: '以 Claude Code 标准模型名对外提供服务，按模型独立配置上游协议与转换',
-    api: '/claude-mappings',
-    presetsApi: '/claude-presets',
-    modelIdField: 'claude_model_id',
-    modelLabel: 'Claude 标准模型名',
-    tableHead: 'Claude 模型名',
-    placeholder: 'claude-opus-5',
-    displayPlaceholder: 'Claude Opus 5',
-    toolbarTitle: 'Claude 标准模型名',
-    emptyDetail: '添加一个 Claude Code 标准模型名，选择系统中已配置的模型与上游协议即可。',
-    presetLabel: '从 Claude 预设快速选择',
-    presetHelp: '预设来自 Anthropic 当前模型目录（内置默认 + 经已配置的 Claude 渠道实时刷新），选择后自动填充标准模型名与显示名称。',
-    mappingHelp: '客户端（如 Claude Code）请求 /claudecode/v1/messages 时使用的模型名称。',
-    protocolHelp: '请求会被转换为该协议后转发；选择 Claude 原生则不转换，仅替换上游模型名。每个映射可独立设置。',
-    entry: {
-      base: '/claudecode',
-      title: 'Claude Code 接入地址（独立于常规请求）',
-      body: '映射仅在该路径下生效，常规 <code>/v1/*</code> 端点不受影响。在 Claude Code 中设置 <code>ANTHROPIC_BASE_URL={base}</code>，即可从这里探测模型目录并请求映射模型。',
-    },
-  },
-  codex: {
-    route: '/codex-mappings',
-    title: 'Codex 模型映射助手',
-    description: '以 Codex 标准模型名对外提供服务，按模型独立配置上游协议与转换',
-    api: '/codex-mappings',
-    presetsApi: '/codex-presets',
-    modelIdField: 'codex_model_id',
-    modelLabel: 'Codex 标准模型名',
-    tableHead: 'Codex 模型名',
-    placeholder: 'gpt-5-codex',
-    displayPlaceholder: 'GPT-5 Codex',
-    toolbarTitle: 'Codex 标准模型名',
-    emptyDetail: '添加一个 Codex 标准模型名，选择系统中已配置的模型与上游协议即可。',
-    presetLabel: '从 Codex 预设快速选择',
-    presetHelp: '预设来自 OpenAI 当前模型目录（内置默认 + 经已配置的 OpenAI 渠道实时刷新），选择后自动填充标准模型名与显示名称。',
-    mappingHelp: '客户端（如 Codex CLI）请求 /codex/v1/responses 时使用的模型名称。',
-    protocolHelp: '请求会被转换为该协议后转发；选择 OpenAI Responses 原生则不转换，仅替换上游模型名。每个映射可独立设置。',
-    entry: {
-      base: '/codex/v1',
-      title: 'Codex 接入地址（独立于常规请求）',
-      body: '映射仅在该路径下生效，常规 <code>/v1/*</code> 端点不受影响。Codex CLI 会向 base URL 追加 <code>/responses</code> 与 <code>/models</code>，因此 base 需包含 <code>/v1</code>。在 <code>~/.codex/config.toml</code> 中设置 <code>openai_base_url = "{base}"</code>、<code>model = "映射模型名"</code>（如 <code>gpt-5-codex</code>），并设置任意值的 <code>OPENAI_API_KEY</code>，即可从这里探测模型目录并请求映射模型。',
-    },
-  },
-};
-
-function mappingKindForPath(path) {
-  return path === '/codex-mappings' ? 'codex' : 'claude';
-}
-
 const pageMeta = {
   '/': { title: '运行概览', description: '请求、Token 与渠道健康状态' },
   '/providers': { title: '供应商与渠道', description: '上游端点、账号和模型探测目录' },
   '/routes': { title: '模型路由', description: '按模型统一配置候选优先级，请求时按格式过滤' },
   '/profiles': { title: '能力档案', description: '可复用的模型能力集合，多个模型可共用同一套能力' },
-  '/mappings': { title: MAPPING_KINDS.claude.title, description: MAPPING_KINDS.claude.description },
-  '/codex-mappings': { title: MAPPING_KINDS.codex.title, description: MAPPING_KINDS.codex.description },
   '/logs': { title: '请求日志', description: '请求结果、性能指标与上游尝试' },
   '/settings': { title: '运行设置', description: '访问策略、熔断与超时参数' },
 };
@@ -104,9 +49,6 @@ const state = {
   channelModels: [],
   routes: [],
   profiles: [],
-  mappingKind: 'claude',
-  mappings: { claude: [], codex: [] },
-  presets: { claude: null, codex: null },
   summary: null,
   system: null,
   protocols: null,
@@ -233,7 +175,6 @@ async function renderPage() {
     else if (path === '/providers') await loadProviders(version);
     else if (path === '/routes') await loadRoutes(version);
     else if (path === '/profiles') await loadProfiles(version);
-    else if (path === '/mappings' || path === '/codex-mappings') await loadMappings(version);
     else if (path === '/logs') await loadLogs(version);
     else if (path === '/settings') await loadSettings(version);
   } catch (error) {
@@ -861,7 +802,7 @@ async function channelForm(providerId = '', editing = null) {
     ? remoteCompactionBadge(editing)
     : '<span class="subtle-text">保存并探测后自动检测</span>';
   const compactionField = selected.has('openai_responses')
-    ? `<div class="field"><label for="channel-compaction">Codex 远程压缩</label><div id="channel-compaction">${compactionStatus}</div><span class="field-help">模型探测时会自动检测渠道的 V1/V2 远程压缩能力；远程压缩只作用于 Codex 映射入口，无需单独配置。</span></div>`
+    ? `<div class="field"><label for="channel-compaction">Codex 远程压缩</label><div id="channel-compaction">${compactionStatus}</div><span class="field-help">模型探测时会自动检测渠道的 V1/V2 远程压缩能力；远程压缩只作用于 openai_responses（Codex / Responses API）协议的上游渠道，无需单独配置。</span></div>`
     : '';
   const healthModels = editing
     ? state.channelModels.filter((model) => model.channel_id === editing.id && model.available && (model.protocols || [model.protocol]).includes(editing.protocol))
@@ -1152,7 +1093,7 @@ function routeOptions() {
 }
 
 // 为自定义模型默认勾选的协议（Command Code 没有客户端入口端点，
-// 需显式开启，与映射表单一致）。
+// 需显式开启）。
 const ROUTE_DEFAULT_PROTOCOLS = ['openai_compatible', 'openai_responses', 'claude', 'gemini'];
 
 function syncRouteProtocols() {
@@ -1209,7 +1150,7 @@ function routeForm() {
     mode: 'route',
     body: `<form class="form-stack" id="route-form" data-form="route">
       <div class="field"><label for="route-model">模型 ID</label><input class="input" id="route-model" name="requested_model_id" list="route-model-options" required maxlength="255" placeholder="填写自定义模型 ID，或选择已探测模型" autocomplete="off"><datalist id="route-model-options">${options.map((model) => `<option value="${escapeAttr(model)}"></option>`).join('')}</datalist><span class="field-help">可自由填写网关对外暴露的模型 ID；创建后在候选抽屉中选择「渠道 + 模型」作为请求源，多个 ID 不同的来源可合并到同一个模型。</span></div>
-      <div class="field"><label>请求格式</label><div class="checkbox-grid">${protocolBoxes}</div><span class="field-help">网关按候选各自支持的协议自动过滤；输入已探测模型 ID 时会自动勾选它支持的协议。Command Code 渠道可直接服务 Claude / OpenAI Chat / Responses 三种入口（网关自动转换），无需额外映射。</span></div>
+      <div class="field"><label>请求格式</label><div class="checkbox-grid">${protocolBoxes}</div><span class="field-help">网关按候选各自支持的协议自动过滤；输入已探测模型 ID 时会自动勾选它支持的协议。Command Code 渠道可直接服务 Claude / OpenAI Chat / Responses 三种入口，请求格式由网关自动转换。</span></div>
     </form>`,
     footer: `${button({ action: 'close-modal', label: '取消' })}${button({ action: 'submit-route', label: '创建', iconName: 'plus', primary: true })}`,
   });
@@ -1744,217 +1685,6 @@ function protocolLabel(protocol) {
   return PROTOCOL_LABELS[protocol] || protocol;
 }
 
-async function loadMappings(version) {
-  const kind = mappingKindForPath(state.currentPath);
-  const config = MAPPING_KINDS[kind];
-  const [mappingData, modelData, presetData, routeData] = await Promise.all([get(config.api), get('/channel-models'), get(config.presetsApi), get('/routes')]);
-  if (version !== state.renderVersion || !['/mappings', '/codex-mappings'].includes(currentPath())) return;
-  state.mappingKind = kind;
-  state.mappings[kind] = mappingData?.items || [];
-  state.channelModels = modelData?.items || [];
-  state.presets[kind] = presetData;
-  state.routes = routeData?.items || [];
-  elements.page.innerHTML = renderMappingsPage();
-}
-
-function entryBaseUrl(kind) {
-  return `${window.location.origin}${MAPPING_KINDS[kind].entry.base}`;
-}
-
-function entryBanner(kind) {
-  const config = MAPPING_KINDS[kind];
-  const base = entryBaseUrl(kind);
-  const body = config.entry.body.replace('{base}', base);
-  return `<div class="entry-banner">
-    <div class="entry-banner-copy"><strong>${escapeHtml(config.entry.title)}</strong><p>${body}</p></div>
-    <div class="entry-banner-actions"><code class="mono">${escapeHtml(base)}</code>${iconButton({ action: 'copy-entry-url', iconName: 'copy', label: '复制接入地址', attrs: `data-entry-url="${escapeAttr(base)}"` })}</div>
-  </div>`;
-}
-
-function renderMappingsPage() {
-  const kind = state.mappingKind;
-  const config = MAPPING_KINDS[kind];
-  const mappings = state.mappings[kind] || [];
-  const rows = mappings.map((mapping) => `<tr class="${mapping.enabled ? '' : 'is-disabled-row'}">
-    <td><span class="mono">${escapeHtml(mapping[config.modelIdField])}</span>${mapping.display_name ? `<small class="subtle-text">${escapeHtml(mapping.display_name)}</small>` : ''}</td>
-    <td><span class="protocol">${escapeHtml(protocolLabel(mapping.upstream_protocol))}</span></td>
-    <td><span class="mono">${escapeHtml(mapping.upstream_model_id)}</span></td>
-    <td><div class="route-chain">${mapping.candidates.length ? mapping.candidates.map((candidate) => `<span class="route-candidate"><b>P${number(candidate.priority)}</b>${escapeHtml(candidate.channel_name)}</span>`).join('') : '<span class="subtle-text">该模型暂无可用路由候选</span>'}</div></td>
-    <td>${mapping.enabled ? statusDot('已启用', 'is-success') : statusDot('已停用', 'is-muted')}</td>
-    <td class="action-cell"><div class="table-actions">${iconButton({ action: 'edit-mapping', iconName: 'pencil', label: '编辑映射', attrs: `data-mapping-id="${escapeAttr(mapping.id)}"` })}${iconButton({ action: 'delete-mapping', iconName: 'trash-2', label: '删除映射', danger: true, attrs: `data-mapping-id="${escapeAttr(mapping.id)}"` })}</div></td>
-  </tr>`).join('');
-  return `<div class="page-stack">
-    ${entryBanner(kind)}
-    ${toolbar(config.toolbarTitle, '映射指向系统中已配置的模型，候选渠道直接继承该模型的路由', `${button({ action: 'refresh-mappings', label: '刷新', iconName: 'refresh-cw' })}${button({ action: 'open-mapping', label: '添加映射', iconName: 'plus', primary: true })}`)}
-    ${panel('映射表', '候选渠道取自上游模型在「模型路由」中的配置，无需单独设置', `<div class="section-body-flush">${mappings.length ? `<div class="table-scroll"><table class="data-table mappings-table"><thead><tr><th>${escapeHtml(config.tableHead)}</th><th>上游协议</th><th>上游模型</th><th>候选渠道（继承路由）</th><th>状态</th><th class="action-cell">操作</th></tr></thead><tbody>${rows}</tbody></table></div>` : emptyState('尚未创建模型映射', config.emptyDetail, 'shuffle')}</div>`) }
-  </div>`;
-}
-
-function configuredModelOptions(selected, protocol) {
-  const seen = new Set();
-  const models = (state.routes || [])
-    .filter((route) => route.enabled && (route.protocols || []).includes(protocol) && !seen.has(route.requested_model_id) && seen.add(route.requested_model_id))
-    .map((route) => route.requested_model_id)
-    .sort();
-  if (!models.length) return '<option value="" disabled>该协议暂无已配置路由的模型，请先在「模型路由」页配置</option>';
-  return models.map((model) => `<option value="${escapeAttr(model)}" ${selected === model ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('');
-}
-
-function mappingForm(editing = null) {
-  const kind = state.mappingKind;
-  const config = MAPPING_KINDS[kind];
-  const protocols = Object.keys(PROTOCOL_LABELS);
-  const currentProtocol = editing?.upstream_protocol || 'openai_compatible';
-  const protocolOptions = protocols.map((protocol) => `<option value="${protocol}" ${currentProtocol === protocol ? 'selected' : ''}>${escapeHtml(protocolLabel(protocol))}</option>`).join('');
-  const presets = state.presets[kind]?.items || [];
-  const presetOptions = presetOptionsOf(state.presets[kind]);
-  openModal({
-    title: editing ? '编辑模型映射' : '新建模型映射',
-    mode: editing ? 'mapping-edit' : 'mapping-create',
-    body: `<form class="form-stack" id="mapping-form" data-form="mapping" data-mapping-id="${escapeAttr(editing?.id || '')}">
-      <div class="field"><label for="mapping-preset">${escapeHtml(config.presetLabel)}</label><div class="preset-row"><select class="select" id="mapping-preset" data-preset-select ${editing ? 'disabled' : ''}><option value="">-- 手动输入或从预设中选择 --</option>${presetOptions}</select>${button({ action: 'refresh-presets', label: '刷新预设', iconName: 'refresh-cw', disabled: Boolean(editing) })}</div><span class="field-help">${escapeHtml(config.presetHelp)}</span></div>
-      <div class="field"><label for="mapping-model-id">${escapeHtml(config.modelLabel)}</label><input class="input" id="mapping-model-id" name="${escapeAttr(config.modelIdField)}" required maxlength="255" placeholder="${escapeAttr(config.placeholder)}" value="${escapeAttr(editing?.[config.modelIdField] || '')}" autocomplete="off"><span class="field-help">${escapeHtml(config.mappingHelp)}</span></div>
-      <div class="field"><label for="mapping-display-name">显示名称</label><input class="input" id="mapping-display-name" name="display_name" maxlength="255" placeholder="${escapeAttr(config.displayPlaceholder)}" value="${escapeAttr(editing?.display_name || '')}" autocomplete="off"><span class="field-help">出现在模型目录中的展示名称，留空则使用模型名。</span></div>
-      <div class="field"><label for="mapping-upstream-protocol">上游协议</label><select class="select" id="mapping-upstream-protocol" name="upstream_protocol" data-upstream-protocol required>${protocolOptions}</select><span class="field-help">${escapeHtml(config.protocolHelp)}</span></div>
-      <div class="field"><label for="mapping-upstream-model">上游模型（已配置路由）</label><select class="select" id="mapping-upstream-model" name="upstream_model_id" required>${configuredModelOptions(editing?.upstream_model_id || '', currentProtocol)}</select><span class="field-help">数据源为「模型路由」页已配置路由的模型，按所选上游协议过滤；候选渠道自动继承该模型的路由配置，无需单独设置。</span></div>
-    </form>`,
-    footer: `${button({ action: 'close-modal', label: '取消' })}${button({ action: 'submit-mapping', label: editing ? '保存' : '创建', iconName: editing ? 'check' : 'plus', primary: true })}`,
-  });
-}
-
-async function saveMapping(form) {
-  const ctx = captureContext();
-  const kind = state.mappingKind;
-  const config = MAPPING_KINDS[kind];
-  const values = new FormData(form);
-  const payload = {
-    [config.modelIdField]: values.get(config.modelIdField).trim(),
-    display_name: values.get('display_name').trim() || null,
-    upstream_model_id: values.get('upstream_model_id').trim(),
-    upstream_protocol: values.get('upstream_protocol'),
-  };
-  const mappingId = form.dataset.mappingId;
-  if (mappingId) {
-    const mapping = (state.mappings[kind] || []).find((item) => item.id === mappingId);
-    if (mapping) payload.enabled = mapping.enabled;
-    await patch(`${config.api}/${mappingId}`, payload);
-  } else {
-    await post(config.api, payload);
-  }
-  closeModal();
-  toast(mappingId ? '映射已更新' : '映射已创建，候选渠道继承上游模型路由');
-  if (isCurrent(ctx)) await loadMappings(ctx.renderVersion);
-}
-
-
-async function deleteMapping(mappingId) {
-  const kind = state.mappingKind;
-  const config = MAPPING_KINDS[kind];
-  const mapping = (state.mappings[kind] || []).find((item) => item.id === mappingId);
-  if (!await confirmAction({ title: '删除模型映射', message: `删除映射“${mapping?.[config.modelIdField] || ''}”？其全部候选渠道将一并删除。`, confirmLabel: '删除', danger: true })) return;
-  await remove(`${config.api}/${mappingId}`);
-  toast('映射已删除');
-  renderPage();
-}
-
-// 预设刷新去重：一次刷新流程进行中时忽略重复点击。
-let presetRefreshInFlight = false;
-
-async function refreshPresets() {
-  if (presetRefreshInFlight) return;
-  presetRefreshInFlight = true;
-  const kind = state.mappingKind;
-  const config = MAPPING_KINDS[kind];
-  const version = state.renderVersion;
-  try {
-    let queued;
-    try {
-      queued = await post(`${config.presetsApi}/refresh`);
-    } catch (error) {
-      // 无可用渠道时后端返回明确 409，不得假装已排队。
-      toast(error.message || '预设刷新失败', 'error');
-      return;
-    }
-    const runIds = queued?.run_ids || [];
-    if (!runIds.length) return;
-    toast(`已排队 ${runIds.length} 个渠道的模型探测，完成后自动更新预设…`);
-    // 轮询每个 run 的终态；用户导航离开或关闭弹窗后立即放弃，
-    // 不覆盖新页面。
-    const results = await pollDiscoveryRuns(runIds, () =>
-      version !== state.renderVersion || !document.getElementById('mapping-form'));
-    if (results === null) return;
-    const succeeded = results.filter((run) => run.status === 'succeeded').length;
-    const failed = results.length - succeeded;
-    if (failed === 0) {
-      toast(`预设已刷新（${succeeded} 个渠道）`);
-    } else if (succeeded > 0) {
-      toast(`预设部分刷新：成功 ${succeeded}，失败 ${failed}`, 'warning');
-    } else {
-      toast('所有渠道模型探测失败，请检查渠道配置', 'error');
-    }
-    // 重新拉取预设并刷新弹窗里的下拉框。
-    const presetData = await get(config.presetsApi);
-    if (version !== state.renderVersion || !document.getElementById('mapping-form')) return;
-    state.presets[kind] = presetData;
-    const select = document.querySelector('#mapping-preset');
-    if (select && !select.disabled) {
-      const current = select.value;
-      select.innerHTML = `<option value="">-- 手动输入或从预设中选择 --</option>${presetOptionsOf(presetData)}`;
-      if (current) select.value = current;
-    }
-  } catch (error) {
-    toast(error.message || '预设刷新失败', 'error');
-  } finally {
-    presetRefreshInFlight = false;
-  }
-}
-
-function presetOptionsOf(presetData) {
-  return (presetData?.items || [])
-    .map((preset) => `<option value="${escapeAttr(preset.id)}">${escapeHtml(preset.display_name || preset.id)}</option>`)
-    .join('');
-}
-
-// 轮询 discovery runs 直到全部到达终态。页面上下文已消失(导航/关闭
-// 弹窗)时返回 null。
-async function pollDiscoveryRuns(runIds, gone) {
-  const terminal = new Map();
-  // 最多轮询 600 次(每次间隔 1s,合计 10 分钟);超出后提示并退出,
-  // 避免 run 永不终结时页面无限挂起。
-  let attempts = 0;
-  while (terminal.size < runIds.length) {
-    if (gone()) return null;
-    if (attempts >= 600) {
-      toast('探测任务轮询超时，请在列表中稍后查看结果', 'error');
-      return null;
-    }
-    attempts += 1;
-    await Promise.all(runIds.filter((id) => !terminal.has(id)).map(async (id) => {
-      try {
-        const run = await get(`/discovery-runs/${id}`);
-        if (run.status === 'succeeded' || run.status === 'failed') terminal.set(id, run);
-      } catch {
-        // 单次轮询失败不终止流程,下一轮重试。
-      }
-    }));
-    if (terminal.size < runIds.length) {
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-    }
-  }
-  return [...terminal.values()];
-}
-
-async function copyEntryUrl(url) {
-  try {
-    await navigator.clipboard.writeText(url);
-    toast('接入地址已复制');
-  } catch {
-    toast('无法访问剪贴板，请手动复制', 'warning');
-  }
-}
-
-
-
 async function loadLogs(version) {
   const { page, filters } = state.logs;
   const query = new URLSearchParams({ page: String(page), page_size: '50' });
@@ -2088,7 +1818,7 @@ const SETTINGS_SECTIONS = [
     fields: [['failure_threshold', '连续失败阈值', 1, 20], ['circuit_open_seconds', '熔断时间（秒）', 30, 86400], ['max_failover_attempts', '最大渠道尝试', 1, 20]] },
   { id: 'timeout', title: '超时', note: '上游连接与响应期限', grid: '',
     fields: [['connect_timeout_seconds', '连接超时（秒）', 1, 120], ['first_byte_timeout_seconds', '首字节超时（秒）', 1, 600], ['first_token_timeout_seconds', '首 Token 超时（秒）', 1, 600], ['stream_idle_timeout_seconds', '流式空闲超时（秒）', 10, 3600], ['non_stream_total_timeout_seconds', '非流式总超时（秒）', 10, 3600]] },
-  { id: 'limits', title: '请求限制', note: '代理请求体与上游响应缓冲上限', grid: '', help: '映射转换等必须整体缓冲的上游响应硬上限；超过返回 502。流式转发不受此限制。',
+  { id: 'limits', title: '请求限制', note: '代理请求体与上游响应缓冲上限', grid: '', help: '协议转换等必须整体缓冲的上游响应硬上限；超过返回 502。流式转发不受此限制。',
     fields: [['max_request_body_mb', '最大请求体（MiB）', 1, 1024], ['max_buffered_upstream_body_mb', '上游响应缓冲上限（MiB）', 1, 1024]] },
   { id: 'maintenance', title: '维护', note: '周期任务与数据保留', grid: 'is-two',
     fields: [['model_discovery_interval_hours', '模型探测周期（小时）', 1, 168], ['log_retention_days', '日志保留（天）', 1, 365]] },
@@ -2381,12 +2111,6 @@ async function handleAction(target) {
     if (action === 'edit-profile') return profileForm(state.profiles.find((item) => item.id === target.dataset.profileId));
     if (action === 'delete-profile') return deleteProfile(target.dataset.profileId);
     if (action === 'save-as-profile') return saveCurrentAsProfile();
-    if (action === 'refresh-mappings') return renderPage();
-    if (action === 'open-mapping') return mappingForm();
-    if (action === 'edit-mapping') return mappingForm((state.mappings[state.mappingKind] || []).find((item) => item.id === target.dataset.mappingId));
-    if (action === 'delete-mapping') return deleteMapping(target.dataset.mappingId);
-    if (action === 'refresh-presets') return refreshPresets();
-    if (action === 'copy-entry-url') return copyEntryUrl(target.dataset.entryUrl);
     if (action === 'refresh-logs') return loadLogs(state.renderVersion);
     if (action === 'logs-prev') { state.logs.page -= 1; return loadLogs(state.renderVersion); }
     if (action === 'logs-next') { state.logs.page += 1; return loadLogs(state.renderVersion); }
@@ -2399,7 +2123,6 @@ async function handleAction(target) {
     if (action === 'submit-route') return document.getElementById('route-form')?.requestSubmit();
     if (action === 'submit-profile') return document.getElementById('profile-form')?.requestSubmit();
     if (action === 'submit-save-as-profile') return document.getElementById('save-as-profile-form')?.requestSubmit();
-    if (action === 'submit-mapping') return document.getElementById('mapping-form')?.requestSubmit();
     if (action === 'submit-auth') return document.getElementById('auth-form')?.requestSubmit();
     if (action === 'submit-settings') return document.getElementById('settings-form')?.requestSubmit();
     if (action === 'submit-dashboard-filter') return document.querySelector('[data-form="dashboard-filter"]')?.requestSubmit();
@@ -2419,7 +2142,6 @@ async function handleSubmit(event) {
     else if (form.dataset.form === 'route') await saveRoute(form);
     else if (form.dataset.form === 'profile') await saveProfile(form);
     else if (form.dataset.form === 'save-as-profile') await submitSaveAsProfile(form);
-    else if (form.dataset.form === 'mapping') await saveMapping(form);
     else if (form.dataset.form === 'caps') await saveCapabilities(form);
     else if (form.dataset.form === 'auth') await saveAuth(form);
     else if (form.dataset.form === 'settings') await saveSettings(form);
@@ -2446,25 +2168,6 @@ function handleChange(event) {
   if (target.matches('[data-candidate-channel]')) {
     state.candidatePicker.channelId = target.value;
     refreshCandidateResults();
-  }
-  if (target.matches('[data-preset-select]')) {
-    const presetId = target.value;
-    const preset = (state.presets[state.mappingKind]?.items || []).find((item) => item.id === presetId);
-    if (preset) {
-      const modelInput = document.getElementById('mapping-model-id');
-      const nameInput = document.getElementById('mapping-display-name');
-      if (modelInput) modelInput.value = preset.id;
-      if (nameInput) nameInput.value = preset.display_name || '';
-    }
-  }
-  if (target.matches('[data-upstream-protocol]')) {
-    const modelSelect = document.getElementById('mapping-upstream-model');
-    if (modelSelect) {
-      const current = modelSelect.value;
-      modelSelect.innerHTML = configuredModelOptions(current, target.value);
-      const stillValid = [...modelSelect.options].some((option) => option.value === current);
-      if (!stillValid) modelSelect.value = '';
-    }
   }
   if (target.matches('[data-provider-preset]')) {
     const option = target.selectedOptions[0];

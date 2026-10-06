@@ -2,8 +2,8 @@
 //!
 //! 职责：把非流式上游响应体转换为入口协议响应；把文本中的 DSML（DeepSeek
 //! 风格）工具调用标记解析成结构化 function_call。
-//! 边界：只处理非流式响应，流式转换在 `stream.rs`，错误响应在 `error.rs`。
-//! 关键不变量：同协议映射按字节透传；usage 换算保持上游与入口语义一致。
+//! 边界：只处理非流式响应，流式转换在 `stream.rs`。
+//! 关键不变量：同协议直通按字节透传；usage 换算保持上游与入口语义一致。
 
 use super::*;
 
@@ -13,16 +13,6 @@ pub(super) fn stop_reason_openai(reason: &str) -> &'static str {
         "length" => "max_tokens",
         "tool_calls" | "function_call" => "tool_use",
         "content_filter" => "refusal",
-        _ => "end_turn",
-    }
-}
-
-pub(super) fn stop_reason_gemini(reason: &str) -> &'static str {
-    match reason {
-        "STOP" | "FINISH_REASON_UNSPECIFIED" => "end_turn",
-        "MAX_TOKENS" => "max_tokens",
-        "SAFETY" | "RECITATION" => "refusal",
-        "TOOL_CALL" | "FUNCTION_CALL" | "MALFORMED_FUNCTION_CALL" => "tool_use",
         _ => "end_turn",
     }
 }
@@ -143,117 +133,6 @@ pub(super) fn openai_compatible_to_claude(claude_model: &str, data: &Value) -> V
             usage.get("completion_tokens").or_else(|| usage.get("output_tokens")).and_then(Value::as_i64),
             cache_read,
             cache_write,
-        ),
-    })
-}
-
-pub(super) fn openai_responses_to_claude(claude_model: &str, data: &Value) -> Value {
-    let mut content: Vec<Value> = Vec::new();
-    if let Some(output) = data.get("output").and_then(Value::as_array) {
-        for item in output {
-            let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
-            if matches!(item_type, "message" | "reasoning") {
-                if let Some(parts) = item.get("content").and_then(Value::as_array) {
-                    for part in parts {
-                        if let Some("output_text" | "summary_text") =
-                            part.get("type").and_then(Value::as_str)
-                            && let Some(text) = part.get("text").and_then(Value::as_str)
-                        {
-                            content.push(json!({"type": "text", "text": text}));
-                        }
-                    }
-                }
-            } else if item_type == "function_call" {
-                let arguments = item
-                    .get("arguments")
-                    .and_then(Value::as_str)
-                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-                    .filter(|value| value.is_object())
-                    .unwrap_or_else(|| json!({}));
-                content.push(json!({
-                    "type": "tool_use",
-                    "id": item.get("call_id").and_then(Value::as_str).map(str::to_owned)
-                        .unwrap_or_else(|| new_id("toolu")),
-                    "name": item.get("name").and_then(Value::as_str).unwrap_or(""),
-                    "input": arguments,
-                }));
-            }
-        }
-    }
-    let usage = data.get("usage").unwrap_or(&Value::Null);
-    let input_details = usage.get("input_tokens_details").unwrap_or(&Value::Null);
-    let stop_reason = if content
-        .last()
-        .is_some_and(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
-    {
-        "tool_use"
-    } else {
-        "end_turn"
-    };
-    json!({
-        "id": data.get("id").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| new_id("msg")),
-        "type": "message",
-        "role": "assistant",
-        "model": claude_model,
-        "content": content,
-        "stop_reason": stop_reason,
-        "stop_sequence": Value::Null,
-        "usage": claude_usage(
-            usage.get("input_tokens").and_then(Value::as_i64),
-            usage.get("output_tokens").and_then(Value::as_i64),
-            input_details.get("cached_tokens").and_then(Value::as_i64),
-            input_details.get("cache_write_tokens").and_then(Value::as_i64),
-        ),
-    })
-}
-
-pub(super) fn gemini_to_claude(claude_model: &str, data: &Value) -> Value {
-    let candidate = data
-        .get("candidates")
-        .and_then(Value::as_array)
-        .and_then(|candidates| candidates.first())
-        .unwrap_or(&Value::Null);
-    let parts = candidate
-        .get("content")
-        .and_then(|content| content.get("parts"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut content: Vec<Value> = Vec::new();
-    for part in &parts {
-        if let Some(thought) = part.get("thought")
-            && !thought.is_null()
-        {
-            content.push(json!({"type": "thinking", "thinking": thought}));
-        }
-        if part.get("text").is_some() {
-            content.push(json!({"type": "text", "text": part.get("text").and_then(Value::as_str).unwrap_or("")}));
-        }
-        if let Some(function_call) = part.get("functionCall").filter(|value| value.is_object()) {
-            content.push(json!({
-                "type": "tool_use",
-                "id": new_id("toolu"),
-                "name": function_call.get("name").and_then(Value::as_str).unwrap_or(""),
-                "input": function_call.get("args").cloned().unwrap_or_else(|| json!({})),
-            }));
-        }
-    }
-    let usage = data.get("usageMetadata").unwrap_or(&Value::Null);
-    json!({
-        "id": new_id("msg"),
-        "type": "message",
-        "role": "assistant",
-        "model": claude_model,
-        "content": content,
-        "stop_reason": stop_reason_gemini(
-            candidate.get("finishReason").and_then(Value::as_str).unwrap_or("STOP")
-        ),
-        "stop_sequence": Value::Null,
-        "usage": claude_usage(
-            usage.get("promptTokenCount").and_then(Value::as_i64),
-            usage.get("candidatesTokenCount").and_then(Value::as_i64),
-            usage.get("cachedContentTokenCount").and_then(Value::as_i64),
-            None,
         ),
     })
 }
@@ -784,128 +663,6 @@ pub(super) fn openai_compatible_to_responses(codex_model: &str, data: &Value) ->
     )
 }
 
-pub(super) fn claude_to_responses(codex_model: &str, data: &Value) -> Value {
-    let mut output: Vec<Value> = Vec::new();
-    if let Some(blocks) = data.get("content").and_then(Value::as_array) {
-        for block in blocks {
-            match block.get("type").and_then(Value::as_str) {
-                Some("text") => {
-                    output.push(json!({
-                        "type": "message",
-                        "id": new_id("msg"),
-                        "status": "completed",
-                        "role": "assistant",
-                        "content": [{
-                            "type": "output_text",
-                            "text": block.get("text").and_then(Value::as_str).unwrap_or(""),
-                            "annotations": [],
-                        }],
-                    }));
-                }
-                Some("tool_use") => {
-                    output.push(json!({
-                        "type": "function_call",
-                        "id": new_id("fc"),
-                        "call_id": block.get("id").and_then(Value::as_str).map(str::to_owned)
-                            .unwrap_or_else(|| new_id("call")),
-                        "name": block.get("name").and_then(Value::as_str).unwrap_or(""),
-                        "arguments": serde_json::to_string(block.get("input").unwrap_or(&Value::Null))
-                            .unwrap_or_else(|_| "{}".into()),
-                        "status": "completed",
-                    }));
-                }
-                _ => {}
-            }
-        }
-    }
-    let usage = data.get("usage").unwrap_or(&Value::Null);
-    let status = if data.get("stop_reason").and_then(Value::as_str) == Some("max_tokens") {
-        "incomplete"
-    } else {
-        "completed"
-    };
-    responses_envelope(
-        codex_model,
-        &new_id("resp"),
-        unix_timestamp(),
-        status,
-        output,
-        responses_usage(
-            usage.get("input_tokens").and_then(Value::as_i64),
-            usage.get("output_tokens").and_then(Value::as_i64),
-            usage.get("cache_read_input_tokens").and_then(Value::as_i64),
-            None,
-        ),
-        None,
-    )
-}
-
-pub(super) fn gemini_to_responses(codex_model: &str, data: &Value) -> Value {
-    let candidate = data
-        .get("candidates")
-        .and_then(Value::as_array)
-        .and_then(|candidates| candidates.first())
-        .unwrap_or(&Value::Null);
-    let parts = candidate
-        .get("content")
-        .and_then(|content| content.get("parts"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut output: Vec<Value> = Vec::new();
-    for part in &parts {
-        if part.get("text").is_some() {
-            output.push(json!({
-                "type": "message",
-                "id": new_id("msg"),
-                "status": "completed",
-                "role": "assistant",
-                "content": [{
-                    "type": "output_text",
-                    "text": part.get("text").and_then(Value::as_str).unwrap_or(""),
-                    "annotations": [],
-                }],
-            }));
-        }
-        if let Some(function_call) = part.get("functionCall").filter(|value| value.is_object()) {
-            output.push(json!({
-                "type": "function_call",
-                "id": new_id("fc"),
-                "call_id": new_id("call"),
-                "name": function_call.get("name").and_then(Value::as_str).unwrap_or(""),
-                "arguments": serde_json::to_string(function_call.get("args").unwrap_or(&Value::Null))
-                    .unwrap_or_else(|_| "{}".into()),
-                "status": "completed",
-            }));
-        }
-    }
-    let usage = data.get("usageMetadata").unwrap_or(&Value::Null);
-    let status = if candidate
-        .get("finishReason")
-        .and_then(Value::as_str)
-        .unwrap_or("STOP")
-        == "MAX_TOKENS"
-    {
-        "incomplete"
-    } else {
-        "completed"
-    };
-    responses_envelope(
-        codex_model,
-        &new_id("resp"),
-        unix_timestamp(),
-        status,
-        output,
-        responses_usage(
-            usage.get("promptTokenCount").and_then(Value::as_i64),
-            usage.get("candidatesTokenCount").and_then(Value::as_i64),
-            usage.get("cachedContentTokenCount").and_then(Value::as_i64),
-            None,
-        ),
-        None,
-    )
-}
-
 /// 与入口协议无关的非流式响应转换入口。
 pub fn convert_response(
     entry: &str,
@@ -917,7 +674,7 @@ pub fn convert_response(
     let strategy = ConversionStrategy::for_pair(entry, upstream_protocol).ok_or_else(|| {
         anyhow::anyhow!("Unsupported conversion pair: {entry} -> {upstream_protocol}")
     })?;
-    // 同协议映射按字节透传：重新序列化会丢失工具调用、推理项与 usage。
+    // 同协议直通按字节透传：重新序列化会丢失工具调用、推理项与 usage。
     if strategy == Passthrough {
         return Ok(body.to_vec());
     }
@@ -929,14 +686,10 @@ pub fn convert_response(
     let converted = match strategy {
         Passthrough => unreachable!("handled above"),
         ClaudeToChat => openai_compatible_to_claude(mapped_model, &data),
-        ClaudeToResponses => openai_responses_to_claude(mapped_model, &data),
-        ClaudeToGemini => gemini_to_claude(mapped_model, &data),
         ClaudeToCommandCode | ResponsesToCommandCode | ChatToCommandCode => bail!(
             "Command Code responses are decoded to openai_compatible before conversion"
         ),
         ResponsesToChat => openai_compatible_to_responses(mapped_model, &data),
-        ResponsesToClaude => claude_to_responses(mapped_model, &data),
-        ResponsesToGemini => gemini_to_responses(mapped_model, &data),
     };
     Ok(serde_json::to_vec(&converted)?)
 }

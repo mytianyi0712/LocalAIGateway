@@ -9,9 +9,8 @@ use axum::{
 use serde_json::{Value, json};
 
 use crate::{
-    convert,
     domain::{
-        Event, MappingTarget,
+        Event,
         TransportFailure,
     },
     protocol,
@@ -74,17 +73,12 @@ pub(super) fn final_gateway_response(
     request_id: &str,
     started: chrono::DateTime<chrono::Utc>,
     attempts: i64,
-    mapping: Option<&MappingTarget>,
     last_error: Option<(StatusCode, axum::http::HeaderMap, Vec<u8>, String)>,
     last_gateway_error: Option<(StatusCode, &'static str, &'static str, String)>,
     last_transport_kind: Option<TransportFailure>,
 ) -> Response<Body> {
     if let Some((status, headers, raw, channel_id)) = last_error {
-        let result_body = if let Some(value) = mapping.as_ref() {
-            convert::convert_error(&value.entry, &value.upstream_protocol, &raw)
-        } else {
-            raw
-        };
+        let result_body = raw;
         telemetry.emit(Event::RequestFinish {
             id: request_id.to_owned(),
             finished_at: clock.now_utc().to_rfc3339(),

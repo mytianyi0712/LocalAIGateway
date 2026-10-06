@@ -7,7 +7,7 @@
 use super::stream::*;
 use super::*;
 
-/// 上游 SSE/JSON 流的增量扫描器，供映射流式前缀与流中错误检测使用。
+/// 上游 SSE/JSON 流的增量扫描器，供转换流式前缀（prelude）与流中错误检测使用。
 /// 按序喂入分片：识别首个生成 token 与完成信号，并在事件携带错误对象时
 /// 返回上游错误文案。
 pub struct StreamScan {
@@ -73,8 +73,7 @@ impl StreamScan {
 
 /// 检测 2xx 流式事件中的错误对象（沿用既有 stream_error 判定启发式），
 /// 返回错误文案。
-// 与 error.rs::error_payload 的差异：只从 2xx 流式事件提取 message（按上游协议回退），
-// 不产出响应体、不做错误类型归类；两处语义不同，不合并。
+// 只从 2xx 流式事件取 message（按上游协议回退）：不产出响应体、不做错误类型归类。
 pub fn stream_error_message(upstream: &str, value: &Value) -> Option<String> {
     if let Some(error) = value.get("error").filter(|error| error.is_object()) {
         let message = error
@@ -163,8 +162,6 @@ mod tests {
         let pairs = [
             (("claude", "claude"), Some(Passthrough)),
             (("claude", "openai_compatible"), Some(ClaudeToChat)),
-            (("claude", "openai_responses"), Some(ClaudeToResponses)),
-            (("claude", "gemini"), Some(ClaudeToGemini)),
             (("claude", "command_code"), Some(ClaudeToCommandCode)),
             (
                 ("openai_compatible", "openai_compatible"),
@@ -179,8 +176,6 @@ mod tests {
                 ("openai_responses", "openai_compatible"),
                 Some(ResponsesToChat),
             ),
-            (("openai_responses", "claude"), Some(ResponsesToClaude)),
-            (("openai_responses", "gemini"), Some(ResponsesToGemini)),
             (
                 ("openai_responses", "command_code"),
                 Some(ResponsesToCommandCode),
@@ -268,28 +263,6 @@ mod tests {
         assert_eq!(
             converted["messages"][0]["content"][0]["image_url"]["url"],
             "data:image/png;base64,AAAA"
-        );
-    }
-
-    #[test]
-    fn claude_to_gemini_maps_tools_and_thinking() {
-        let input = br#"{"model":"m","max_tokens":64,"temperature":0.5,"top_k":10,
-            "thinking":{"budget_tokens":1024},
-            "tools":[{"name":"t","description":"d","input_schema":{"type":"object"}}],
-            "messages":[{"role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"t","input":{"a":1}}]}]}"#;
-        let converted =
-            parse(&convert_request("claude", "gemini", "upstream-model", input).unwrap());
-        assert_eq!(converted["generationConfig"]["maxOutputTokens"], 64);
-        assert_eq!(converted["generationConfig"]["topK"], 10);
-        assert_eq!(converted["thinkingConfig"]["thinkingBudget"], 1024);
-        assert_eq!(converted["contents"][0]["role"], "model");
-        assert_eq!(
-            converted["contents"][0]["parts"][0]["functionCall"]["name"],
-            "t"
-        );
-        assert_eq!(
-            converted["tools"][0]["functionDeclarations"][0]["name"],
-            "t"
         );
     }
 
@@ -454,36 +427,6 @@ data: [DONE]
         assert!(text.contains("\"type\":\"response.completed\""));
         assert!(text.contains("\"sequence_number\":0"));
         assert!(text.contains("\"status\":\"completed\""));
-    }
-
-    #[test]
-    fn gemini_stream_converts_to_claude() {
-        let mut converter =
-            MappedStreamConverter::new("claude", "gemini", "claude-client").unwrap();
-        let mut out = Vec::new();
-        out.extend(
-            converter.feed(b"{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Gem\"}]}}]}\n"),
-        );
-        out.extend(converter.feed(b"{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ini\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":2}}\n"));
-        out.extend(converter.flush());
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("Gem"));
-        assert!(text.contains("ini"));
-        assert!(text.contains("event: message_stop"));
-        assert!(text.contains("\"input_tokens\":5"));
-    }
-
-    #[test]
-    fn error_conversion_wraps_upstream_message() {
-        let body = br#"{"error":{"message":"boom","type":"server_error"}}"#;
-        let claude = String::from_utf8(convert_error("claude", "openai_compatible", body)).unwrap();
-        assert!(claude.contains("\"type\":\"error\""));
-        assert!(claude.contains("boom"));
-        let codex = String::from_utf8(convert_error("openai_responses", "claude", body)).unwrap();
-        assert!(codex.contains("\"code\":\"server_error\""));
-        assert!(codex.contains("\"param\":null"));
-        // 同协议透传
-        assert_eq!(convert_error("claude", "claude", body), body);
     }
 
     #[test]

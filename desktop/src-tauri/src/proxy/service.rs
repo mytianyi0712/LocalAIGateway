@@ -16,7 +16,7 @@ use bytes::Bytes;
 
 use crate::{
     crypto::SecretStore,
-    domain::{Candidate, CompactionMode, MappingTarget, TransportFailure, Usage},
+    domain::{Candidate, CompactionMode, TransportFailure, Usage},
     protocol, settings,
     runtime::RuntimeLimits,
     state::AppState,
@@ -81,7 +81,6 @@ pub(super) struct RequestCtx<'a> {
     pub(super) runtime: &'a settings::RuntimeSettings,
     pub(super) candidates: &'a [Candidate],
     pub(super) compaction_mode: Option<CompactionMode>,
-    pub(super) mapping: Option<&'a MappingTarget>,
     pub(super) stream_requested: bool,
 }
 
@@ -102,7 +101,7 @@ pub(super) struct CandidateCtx<'a> {
 }
 
 impl CandidateCtx<'_> {
-    /// 组装尝试上下文：四个调用点（压缩 / 透明流 / 映射流 / 有界非流式）
+    /// 组装尝试上下文：四个调用点（压缩 / 透明流 / 转换流 / 有界非流式）
     /// 的实参完全一致，集中在这里后新增字段只需改一处。
     fn attempt_env(&self, cc_transport_used: Option<crate::commandcode::Transport>) -> AttemptEnv<'_> {
         attempt_env(
@@ -119,7 +118,6 @@ impl CandidateCtx<'_> {
             self.upstream_protocol,
             self.candidate.model_id.as_str(),
             self.request.upstream_model,
-            self.request.mapping,
             self.request.candidates.len() as i64,
             cc_transport_used,
         )
@@ -155,7 +153,7 @@ impl ProxyService {
     ) -> Response<Body> {
         let request_id = uuid::Uuid::new_v4().to_string();
         let started = self.clock.now_utc();
-        // 准备阶段（设置、鉴权、映射、候选）自成一相；
+        // 准备阶段（设置、鉴权、协议与候选）自成一相；
         // 失败在此短路返回网关错误。
         let prepared = match prepare_request(
             self,
@@ -177,7 +175,6 @@ impl ProxyService {
             query,
             entry_model,
             stream_requested,
-            mapping,
             upstream_protocol,
             upstream_model,
             converted_body,
@@ -198,7 +195,6 @@ impl ProxyService {
             runtime: &runtime,
             candidates: &candidates,
             compaction_mode,
-            mapping: mapping.as_ref(),
             stream_requested,
         };
         let mut state = FailoverState::default();
@@ -284,7 +280,6 @@ impl ProxyService {
             &request_id,
             started,
             attempts,
-            mapping.as_ref(),
             state.last_error,
             state.last_gateway_error,
             state.last_transport_kind,
@@ -385,7 +380,7 @@ impl ProxyService {
         .await
     }
 
-    /// 上游响应分派：远程压缩 → 透明流 → 映射流 → 有界非流式；
+    /// 上游响应分派：远程压缩 → 透明流 → 转换流 → 有界非流式；
     /// 非 2xx 交给 [`Self::handle_upstream_error`]。
     async fn dispatch_response(
         &self,
@@ -442,10 +437,7 @@ impl ProxyService {
             }
         }
         if status.is_success() {
-            if ctx.request.stream_requested
-                && ctx.request.mapping.is_none()
-                && ctx.upstream_protocol != "command_code"
-            {
+            if ctx.request.stream_requested && ctx.upstream_protocol != "command_code" {
                 // 透明转发自成一个构造器。
                 return AttemptStep::Respond(transparent_stream(
                     ctx.attempt_env(cc_transport_used),
@@ -454,8 +446,8 @@ impl ProxyService {
                     response_headers,
                 ));
             }
-            // 映射入口经增量转换器流式输出。先缓冲一小段 prelude，
-            // 这样 200 响应若其实是上游错误仍能 failover，
+            // 需要协议转换的响应经增量转换器流式输出（同协议直通原样转发字节）。
+            // 先缓冲一小段 prelude，这样 200 响应若其实是上游错误仍能 failover，
             // 并且像历史实现一样遵守 `first_token_timeout_seconds`。
             // 其余正文按事件逐个转换，客户端因此看到的是实时流。
             if ctx.request.stream_requested {
@@ -615,16 +607,4 @@ pub async fn gemini(
     request: Request,
 ) -> Response<Body> {
     normal(State(state), request, "gemini").await
-}
-pub async fn claudecode(State(state): State<AppState>, request: Request) -> Response<Body> {
-    normal(State(state), request, "claude").await
-}
-pub async fn codex(State(state): State<AppState>, request: Request) -> Response<Body> {
-    normal(State(state), request, "openai_responses").await
-}
-pub async fn codex_compact(
-    State(state): State<AppState>,
-    request: Request,
-) -> Response<Body> {
-    normal(State(state), request, "openai_responses").await
 }

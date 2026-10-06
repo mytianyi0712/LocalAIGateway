@@ -214,15 +214,6 @@ impl CompactionSupport {
     }
 }
 
-/// 一条已配置的映射：从入口 model 指向某个上游协议 + model
-/// （claudecode/codex 入口）。
-#[derive(Clone)]
-pub struct MappingTarget {
-    pub entry: String,
-    pub upstream_protocol: String,
-    pub upstream_model: String,
-}
-
 /// 一次请求尝试的候选渠道：路由解析的输出，proxy 的输入。
 /// 字段与 `route_candidates` 查询的列同名（行映射由 infrastructure 手工完成，
 /// 因此本类型不依赖 sqlx）。

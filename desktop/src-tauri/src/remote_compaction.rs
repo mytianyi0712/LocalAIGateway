@@ -355,7 +355,7 @@ mod tests {
     fn detects_v1_by_path() {
         let body = br#"{"model":"m","input":[]}"#;
         assert_eq!(
-            detect_compaction("/codex/v1/responses/compact", body).unwrap(),
+            detect_compaction("/v1/responses/compact", body).unwrap(),
             Some(CompactionMode::V1)
         );
     }
@@ -364,7 +364,7 @@ mod tests {
     fn detects_v2_by_trailing_trigger() {
         let body = br#"{"model":"m","stream":true,"input":[{"type":"message","role":"user","content":[]},{"type":"compaction_trigger"}]}"#;
         assert_eq!(
-            detect_compaction("/codex/v1/responses", body).unwrap(),
+            detect_compaction("/v1/responses", body).unwrap(),
             Some(CompactionMode::V2)
         );
     }
@@ -372,10 +372,7 @@ mod tests {
     #[test]
     fn ordinary_responses_is_not_compaction() {
         let body = br#"{"model":"m","stream":true,"input":[{"type":"message","role":"user","content":[]}]}"#;
-        assert_eq!(
-            detect_compaction("/codex/v1/responses", body).unwrap(),
-            None
-        );
+        assert_eq!(detect_compaction("/v1/responses", body).unwrap(), None);
     }
 
     #[test]

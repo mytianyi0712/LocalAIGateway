@@ -140,33 +140,6 @@ pub async fn build(config: AppConfig) -> Result<GatewayRuntime> {
             "/v1beta/models/{*action}",
             axum::routing::post(crate::proxy::gemini),
         )
-        .route("/claudecode", get(crate::proxy::claudecode_info))
-        .route(
-            "/claudecode/v1/models",
-            get(crate::proxy::claudecode_models),
-        )
-        .route(
-            "/claudecode/v1/messages/models",
-            get(crate::proxy::claudecode_models),
-        )
-        .route(
-            "/claudecode/v1/messages",
-            axum::routing::post(crate::proxy::claudecode),
-        )
-        .route("/codex", get(crate::proxy::codex_info))
-        .route("/codex/v1/models", get(crate::proxy::codex_models))
-        .route(
-            "/codex/v1/responses/models",
-            get(crate::proxy::codex_models),
-        )
-        .route(
-            "/codex/v1/responses",
-            axum::routing::post(crate::proxy::codex),
-        )
-        .route(
-            "/codex/v1/responses/compact",
-            axum::routing::post(crate::proxy::codex_compact),
-        )
         .fallback(assets::serve)
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());

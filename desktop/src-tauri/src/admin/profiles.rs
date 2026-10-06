@@ -256,8 +256,7 @@ impl AdminService {
         model_id: &str,
         input: CapsInput,
     ) -> ApiResult {
-        let (routes, claude, codex) = self.entry_model_reference_counts(model_id).await?;
-        if routes + claude + codex == 0 {
+        if self.route_reference_count(model_id).await? == 0 {
             return Err(ApiError::not_found("Route not found"));
         }
         let source = input.source.clone().unwrap_or_else(|| "manual".into());
@@ -382,5 +381,15 @@ impl AdminService {
             .execute(self.db.pool())
             .await?;
         Ok(ok(get_caps_value(state, model_id).await?))
+    }
+
+    /// 该模型在「模型路由」中被引用的次数：能力配置只能写给已配置路由的模型。
+    async fn route_reference_count(&self, model_id: &str) -> Result<i64, ApiError> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM model_routes WHERE requested_model_id=?")
+                .bind(model_id)
+                .fetch_one(self.db.pool())
+                .await?;
+        Ok(count)
     }
 }

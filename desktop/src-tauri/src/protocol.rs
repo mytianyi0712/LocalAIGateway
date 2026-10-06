@@ -709,7 +709,7 @@ impl ProtocolId {
                 "/v1beta/models/{model}:generateContent",
                 "/v1beta/models/{model}:streamGenerateContent",
             ],
-            // 仅上游：只能经 claude/codex 模型映射抵达，绝不作为客户端入口端点。
+            // 仅上游：绝不作为客户端入口端点，只能由普通入口协议静默转换抵达。
             ProtocolId::CommandCode => &[],
         }
     }

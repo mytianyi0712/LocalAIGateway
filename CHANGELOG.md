@@ -8,6 +8,22 @@ Local AI Gateway 的版本变更记录，按版本倒序排列。版本号形如
 > 这些文件已在 2026-09-29 的文档整理中移除，原文可在 git 历史中检索：`git log --diff-filter=D --name-only -- docs/`。
 > 未入库的本地快照（根目录 `CODE-REVIEW-REPORT.md`、`docs/code-health-report.md`）不在版本库中，已不在工作区。
 
+## [0.3.0] — 2026-10-06
+
+### ♻️ 重构
+
+- 移除「Claude 模型映射 / Codex 模型映射」功能，不再维护 Claude Code / Codex CLI 集成：删除 `/claudecode/*` 与 `/codex/*` 专用入口、管理端映射与预设 API（`/api/admin/v1/{claude,codex}-{mappings,presets}`）、前端映射页、代理管线中的映射解析（`MappingTarget`），两张 `*_model_mappings` 表由迁移 `0007_drop_model_mappings.sql` 删除。
+- 转换矩阵收敛为实际可达的方向：保留同协议直通与 Command Code 静默转换所需的四对（`claude` / `openai_compatible` / `openai_responses` → `command_code`，以及三者的 `openai_compatible` 伴生体）；删除仅映射可达的四对（claude↔responses / claude↔gemini / responses↔claude / responses↔gemini）及其流式转换器分支、上游错误重框（`convert_error`）。
+- 远程压缩不再绑定映射入口：`/v1/responses/compact`（V1）与 `/v1/responses` 末尾携带 `{"type":"compaction_trigger"}`（V2）继续可用，仍需 `openai_responses` 上游渠道。
+- Command Code 上游集成保持：普通入口（`/v1/chat/completions`、`/v1/messages`、`/v1/responses`）命中 `command_code` 候选时继续静默转换。
+- 能力配置守卫（`PUT /api/admin/v1/model-capabilities/{model_id}`）改为只统计「模型路由」引用。
+- SPA 回退只服务 GET/HEAD：已移除的代理端点（POST）返回 404 JSON，而不是 200 HTML。
+
+### ⬆️ 升级说明
+
+- 升级后首次启动会执行迁移 `0007`，删除 `claude_model_mappings` 与 `codex_model_mappings`（无 down 脚本，回滚只能靠备份）。
+- 依赖 `/claudecode` 或 `/codex` 入口的客户端不再可用；`command_code` 渠道请改用常规入口协议的服务方式。
+
 ## [0.2.6] — 2026-09-29
 
 ### ✨ 新增

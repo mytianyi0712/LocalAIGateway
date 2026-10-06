@@ -1,4 +1,4 @@
-//! 请求准备：设置读取、正文读取、网关鉴权、模型与映射解析、候选解析，
+//! 请求准备：设置读取、正文读取、网关鉴权、模型解析与候选解析，
 //! 以及 Command Code 的正文预转换。
 
 use anyhow::Result;
@@ -11,7 +11,7 @@ use bytes::Bytes;
 
 use crate::{
     convert,
-    domain::{Candidate, CompactionMode, Event, MappingTarget},
+    domain::{Candidate, CompactionMode, Event},
     protocol,
     remote_compaction::{self},
     routing,
@@ -21,32 +21,6 @@ use crate::{
 // 同目录兄弟模块的内部项（`pub(super)` / `pub(crate)`）。
 use super::error::*;
 use super::service::*;
-
-pub(super) fn mapped_path(
-    mapping: &MappingTarget,
-    request_path: &str,
-    stream_requested: bool,
-    model: &str,
-    compaction: Option<CompactionMode>,
-) -> String {
-    let mapped = |upstream_protocol: &str| {
-        // 协议 → 主路径的唯一来源是 `protocol::main_path`；未知协议保留入参路径。
-        crate::protocol::main_path(upstream_protocol, model, stream_requested)
-            .unwrap_or_else(|| request_path.into())
-    };
-    if mapping.entry == "claude" && request_path.starts_with("/claudecode/") {
-        return mapped(&mapping.upstream_protocol);
-    }
-    if mapping.entry == "openai_responses" && request_path.starts_with("/codex/") {
-        // V1 远程压缩有专用端点；其余情况与映射入口走同一张协议→路径表。
-        if compaction == Some(CompactionMode::V1) && mapping.upstream_protocol == "openai_responses"
-        {
-            return "/v1/responses/compact".into();
-        }
-        return mapped(&mapping.upstream_protocol);
-    }
-    request_path.into()
-}
 
 // 遥测边界组装器：各字段来自互不相干的调用点上下文
 // （候选、尝试记账、计时、usage），把它们分组只会把冗长
@@ -66,7 +40,6 @@ pub(super) struct PreparedRequest {
     pub(super) query: Option<String>,
     pub(super) entry_model: String,
     pub(super) stream_requested: bool,
-    pub(super) mapping: Option<MappingTarget>,
     pub(super) upstream_protocol: String,
     pub(super) upstream_model: String,
     pub(super) converted_body: Bytes,
@@ -91,8 +64,8 @@ pub(super) struct CommandCodeBodies {
     pub(super) provider: Bytes,
 }
 
-/// 请求准备：设置、正文读取、网关鉴权、模型解析、
-/// 映射解析与候选路由。任何失败都
+/// 请求准备：设置、正文读取、网关鉴权、模型识别、
+/// 上游协议与候选路由。任何失败都
 /// 产生一个提前返回的网关错误响应，
 /// 而不进入尝试循环。
 pub(super) async fn prepare_request(
@@ -139,29 +112,13 @@ pub(super) async fn prepare_request(
             ));
         }
     };
-    // 第二相：映射入口解析（未知/禁用映射以 404 失败）。
-    let mapping = resolve_entry_mapping(
-        svc,
-        entry_protocol,
-        &path,
-        &entry_model,
-        stream_requested,
-        started,
-        &started_at,
-        &body,
-        request_id,
-    )
-    .await?;
-    let mut upstream_protocol = mapping
-        .as_ref()
-        .map(|value| value.upstream_protocol.as_str())
-        .unwrap_or(entry_protocol);
+    // 第二相：上游协议与模型（无映射入口，始终等于入口协议/模型；
+    // 静默转换只切换协议，不改写模型）。
+    let mut upstream_protocol = entry_protocol;
     // 静默转换兜底：直接入口自身没有路由、但该模型可通过某个
     // 已注册转换的协议到达时（OpenAI chat → Command Code），
     // 切换到该协议，而不是以 `no_active_channel` 失败。
-    if mapping.is_none()
-        && let Some(fallback) = routing::fallback_upstream_protocol(entry_protocol)
-    {
+    if let Some(fallback) = routing::fallback_upstream_protocol(entry_protocol) {
         let native_available = svc
             .routes
             .resolve_candidates(upstream_protocol, &entry_model, 1)
@@ -180,10 +137,7 @@ pub(super) async fn prepare_request(
             }
         }
     }
-    let upstream_model = mapping
-        .as_ref()
-        .map(|value| value.upstream_model.as_str())
-        .unwrap_or(entry_model.as_str());
+    let upstream_model = entry_model.as_str();
     // 该集成默认关闭：关闭期间必须发起零个上游请求。
     if upstream_protocol == "command_code" && !runtime.command_code_enabled {
         return Err(gateway_error(
@@ -231,7 +185,6 @@ pub(super) async fn prepare_request(
     } = build_converted_bodies(
         entry_protocol,
         &body,
-        mapping.as_ref(),
         upstream_protocol,
         upstream_model,
         request_id,
@@ -275,13 +228,7 @@ pub(super) async fn prepare_request(
             .iter()
             .any(|candidate| protocol::requires_command_code_identity(candidate.kind.as_deref()));
     let command_code_bodies = if override_needed && runtime.command_code_enabled {
-        build_command_code_bodies(
-            entry_protocol,
-            &body,
-            mapping.as_ref(),
-            upstream_model,
-            request_id,
-        )
+        build_command_code_bodies(entry_protocol, &body, upstream_model, request_id)
     } else {
         None
     };
@@ -335,7 +282,6 @@ pub(super) async fn prepare_request(
         query: query.map(str::to_owned),
         entry_model,
         stream_requested,
-        mapping,
         upstream_protocol,
         upstream_model,
         converted_body,
@@ -406,75 +352,6 @@ async fn prepare_authorize(
 }
 
 #[allow(clippy::result_large_err)]
-/// 第二相：模型映射只适用于专用映射入口（`/codex/v1/responses`、
-/// `/claudecode/v1/messages`）；普通协议端点（`/v1/responses`、`/v1/messages`）
-/// 始终直接路由，不经过映射解析。
-/// 映射未知或已禁用时以 404 `unknown_mapped_model` 失败，
-/// 而不是把请求当作普通协议请求悄悄路由。
-#[allow(clippy::too_many_arguments)]
-async fn resolve_entry_mapping(
-    svc: &ProxyService,
-    entry_protocol: &str,
-    path: &str,
-    entry_model: &str,
-    stream_requested: bool,
-    started: chrono::DateTime<chrono::Utc>,
-    started_at: &str,
-    body: &Bytes,
-    request_id: &str,
-) -> Result<Option<MappingTarget>, Response<Body>> {
-    let is_mapped_entry = (entry_protocol == "openai_responses" && path.starts_with("/codex/"))
-        || (entry_protocol == "claude" && path.starts_with("/claudecode/"));
-    if !is_mapped_entry {
-        return Ok(None);
-    }
-    let mapping = match svc.routes.resolve_mapping(entry_protocol, entry_model).await {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::error!(request_id = %request_id, error = %error, "mapping lookup failed");
-            return Err(gateway_error(
-                entry_protocol,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "database_error",
-                "Database error",
-                request_id,
-            ));
-        }
-    };
-    if mapping.is_none() {
-        let finished = svc.clock.now_utc();
-        emit_request_start(
-            svc,
-            request_id,
-            entry_protocol,
-            entry_model,
-            path,
-            stream_requested,
-            started_at,
-            body.len() as i64,
-        );
-        svc.telemetry.emit(Event::RequestFinish {
-            id: request_id.to_owned(),
-            finished_at: finished.to_rfc3339(),
-            duration_ms: finished.signed_duration_since(started).num_milliseconds(),
-            status: Some(404),
-            outcome: "gateway_error".into(),
-            attempts: 0,
-            channel_id: None,
-            response_bytes: 0,
-        });
-        return Err(gateway_error(
-            entry_protocol,
-            StatusCode::NOT_FOUND,
-            "unknown_mapped_model",
-            &format!("Model '{entry_model}' is not a configured model mapping."),
-            request_id,
-        ));
-    }
-    Ok(mapping)
-}
-
-#[allow(clippy::result_large_err)]
 /// 第四相：候选解析。压缩请求走「按能力过滤」的压缩候选，
 /// 其余走普通候选；失败时返回 `routing_error`。
 async fn resolve_candidates_for(
@@ -527,12 +404,11 @@ struct ConvertedBodies {
 }
 
 #[allow(clippy::result_large_err)]
-/// 第三相：上游正文。映射入口按映射目标转换；未映射但协议不同时做静默转换；
+/// 第三相：上游正文。协议不同时做静默转换（如 OpenAI chat → Command Code），
 /// 同协议则原样转发。
 fn build_converted_bodies(
     entry_protocol: &str,
     body: &Bytes,
-    mapping: Option<&MappingTarget>,
     upstream_protocol: &str,
     upstream_model: &str,
     request_id: &str,
@@ -546,18 +422,8 @@ fn build_converted_bodies(
             request_id,
         )
     };
-    let converted_body = if let Some(value) = mapping {
-        match convert::convert_request(
-            &value.entry,
-            &value.upstream_protocol,
-            &value.upstream_model,
-            body,
-        ) {
-            Ok(body) => Bytes::from(body),
-            Err(error) => return Err(invalid_request(&error)),
-        }
-    } else if upstream_protocol != entry_protocol {
-        // 未映射的静默转换（如 OpenAI chat → Command Code）：
+    let converted_body = if upstream_protocol != entry_protocol {
+        // 静默转换（如 OpenAI chat → Command Code）：
         // 客户端正文需要转换成上游请求形状。
         match convert::convert_request(entry_protocol, upstream_protocol, upstream_model, body) {
             Ok(body) => Bytes::from(body),
@@ -570,10 +436,7 @@ fn build_converted_bodies(
     // 因此与 `/alpha/generate` 正文一并备好。
     // 传输路由器只在账号未被升级门禁拦截时才发送它。
     let provider_body = if upstream_protocol == "command_code" {
-        let (provider_entry, provider_model) = mapping
-            .map(|value| (value.entry.as_str(), value.upstream_model.as_str()))
-            .unwrap_or((entry_protocol, upstream_model));
-        match convert::convert_request(provider_entry, "openai_compatible", provider_model, body) {
+        match convert::convert_request(entry_protocol, "openai_compatible", upstream_model, body) {
             Ok(body) => Some(Bytes::from(body)),
             Err(error) => return Err(invalid_request(&error)),
         }
@@ -587,18 +450,15 @@ fn build_converted_bodies(
 }
 
 /// 非 `command_code` 路由协议下的 Command Code 候选所需的双正文
-/// （generate + provider），与映射/非映射正文准备使用同一个转换来源。
-/// 入口没有注册转换（如 gemini）时返回 `None`——这是预期路径，不是失败。
+/// （generate + provider）。入口没有注册转换（如 gemini）时返回 `None`
+/// ——这是预期路径，不是失败。
 fn build_command_code_bodies(
     entry_protocol: &str,
     body: &Bytes,
-    mapping: Option<&MappingTarget>,
     upstream_model: &str,
     request_id: &str,
 ) -> Option<CommandCodeBodies> {
-    let (source_protocol, source_model) = mapping
-        .map(|value| (value.entry.as_str(), value.upstream_model.as_str()))
-        .unwrap_or((entry_protocol, upstream_model));
+    let (source_protocol, source_model) = (entry_protocol, upstream_model);
     if !crate::protocol::converts_to_command_code(source_protocol) {
         return None;
     }

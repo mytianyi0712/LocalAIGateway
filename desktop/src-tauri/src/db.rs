@@ -84,10 +84,6 @@ impl Database {
             .await?;
         self.add_column_if_missing("health_probe_logs", "protocol", "TEXT")
             .await?;
-        self.add_column_if_missing("claude_model_mappings", "upstream_model_id", "TEXT")
-            .await?;
-        sqlx::query("UPDATE claude_model_mappings SET upstream_model_id = claude_model_id WHERE upstream_model_id IS NULL")
-            .execute(&self.pool).await?;
         Ok(())
     }
 

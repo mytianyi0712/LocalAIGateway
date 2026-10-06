@@ -680,9 +680,9 @@ Gemini：
 
 生成错误只包含稳定错误码和内部请求 ID，不暴露 Base URL、API Key、堆栈或上游错误正文。
 
-### 10.5 Command Code 上游（映射入口专用）
+### 10.5 Command Code 上游（无客户端入口，常规入口静默转换）
 
-`command_code` 没有客户端入口，只作为 Claude / Codex 模型映射的 `upstream_protocol`：
+`command_code` 是无客户端入口的上游专用协议：常规入口（`/v1/chat/completions`、`/v1/messages`、`/v1/responses`）命中 `command_code` 候选时由网关静默完成协议转换，响应再转换回入口格式：
 
 - 请求方向：入口请求先转成 canonical OpenAI Chat（官网 Provider API 用），再转成
   `/alpha/generate` 的 CLI 请求体（`{config,memory,taste,skills,permissionMode,params}`）；

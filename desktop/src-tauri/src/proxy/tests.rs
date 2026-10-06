@@ -81,17 +81,7 @@ use tokio_util::sync::CancellationToken;
     }
 
     async fn test_gateway(upstream_port: u16, extra_settings: &[(&str, &str)]) -> TestGateway {
-        test_gateway_inner(upstream_port, extra_settings, false, false, false).await
-    }
-
-    /// 同一脚手架，另加一条 claude 模型映射（`mapped-model` ->
-    /// openai_compatible `test-model`），使经
-    /// `/claudecode/v1/messages` 的请求走映射流管线。
-    async fn test_gateway_mapped(
-        upstream_port: u16,
-        extra_settings: &[(&str, &str)],
-    ) -> TestGateway {
-        test_gateway_inner(upstream_port, extra_settings, true, false, false).await
+        test_gateway_inner(upstream_port, extra_settings, false, false).await
     }
 
     /// 同一脚手架，另加一条 claude 协议路由（`claude-model`
@@ -101,22 +91,29 @@ use tokio_util::sync::CancellationToken;
         upstream_port: u16,
         extra_settings: &[(&str, &str)],
     ) -> TestGateway {
-        test_gateway_inner(upstream_port, extra_settings, false, true, false).await
+        test_gateway_inner(upstream_port, extra_settings, true, false).await
     }
 
-    /// Command Code 脚手架：`command_code` 路由 + provider kind 标记 +
-    /// 一条启用的 claude 映射 `mapped-cc` -> `cc-model`。
+    /// Command Code 脚手架：`command_code` 路由 + provider kind 标记；
+    /// 请求经普通入口（`/v1/messages`、`/v1/chat/completions`）静默转换抵达。
+    /// 该集成默认关闭，此处统一开启（调用方无需重复传入）。
     async fn test_gateway_command_code(
         upstream_port: u16,
         extra_settings: &[(&str, &str)],
     ) -> TestGateway {
-        test_gateway_inner(upstream_port, extra_settings, false, false, true).await
+        let mut settings: Vec<(&str, &str)> = vec![("command_code_enabled", "true")];
+        settings.extend(
+            extra_settings
+                .iter()
+                .copied()
+                .filter(|(key, _)| *key != "command_code_enabled"),
+        );
+        test_gateway_inner(upstream_port, &settings, false, true).await
     }
 
     async fn test_gateway_inner(
         upstream_port: u16,
         extra_settings: &[(&str, &str)],
-        mapped: bool,
         claude_route: bool,
         command_code: bool,
     ) -> TestGateway {
@@ -177,28 +174,6 @@ use tokio_util::sync::CancellationToken;
             .execute(db.pool())
             .await
             .unwrap();
-        if mapped {
-            sqlx::query("INSERT INTO claude_model_mappings(id,claude_model_id,display_name,upstream_protocol,upstream_model_id,enabled,created_at,updated_at) VALUES('map-1','mapped-model','Mapped','openai_compatible','test-model',1,?,?)")
-                .bind(time)
-                .bind(time)
-                .execute(db.pool())
-                .await
-                .unwrap();
-        }
-        if command_code {
-            sqlx::query("INSERT INTO claude_model_mappings(id,claude_model_id,display_name,upstream_protocol,upstream_model_id,enabled,created_at,updated_at) VALUES('map-cc','mapped-cc','Mapped CC','command_code','cc-model',1,?,?)")
-                .bind(time)
-                .bind(time)
-                .execute(db.pool())
-                .await
-                .unwrap();
-            sqlx::query("INSERT INTO codex_model_mappings(id,codex_model_id,display_name,upstream_protocol,upstream_model_id,enabled,created_at,updated_at) VALUES('map-cc-codex','mapped-cc-codex','Mapped CC Codex','command_code','cc-model',1,?,?)")
-                .bind(time)
-                .bind(time)
-                .execute(db.pool())
-                .await
-                .unwrap();
-        }
         if claude_route {
             sqlx::query("INSERT INTO channel_model_protocols(channel_model_id,protocol) VALUES('cm-1','claude')")
                 .execute(db.pool())
@@ -315,15 +290,13 @@ use tokio_util::sync::CancellationToken;
         }
     }
 
-    /// Codex 压缩测试骨架：在默认单候选之上加一条 `openai_responses` 路由与一个
-    /// codex 映射（`gpt-5-codex` → `test-model`），请求走 `/codex/` 映射入口。
-    /// 路由的 `requested_model_id` 必须等于映射的上游模型（`test-model`）：
-    /// 映射入口先重写正文模型，再按上游模型路由。
+    /// Codex 压缩测试骨架：在默认单候选之上加一条 `openai_responses` 路由
+    /// （`test-model`），请求直接走常规入口 `/v1/responses`。
     async fn test_gateway_codex_compaction(
         upstream_port: u16,
         extra_settings: &[(&str, &str)],
     ) -> TestGateway {
-        let gateway = test_gateway_inner(upstream_port, extra_settings, false, false, false).await;
+        let gateway = test_gateway_inner(upstream_port, extra_settings, false, false).await;
         let time = "2026-08-04T01:00:00+00:00";
         sqlx::query("INSERT INTO channel_model_protocols(channel_model_id,protocol) VALUES('cm-1','openai_responses')")
             .execute(gateway.db.pool())
@@ -341,37 +314,26 @@ use tokio_util::sync::CancellationToken;
             .execute(gateway.db.pool())
             .await
             .unwrap();
-        sqlx::query("INSERT INTO codex_model_mappings(id,codex_model_id,display_name,upstream_protocol,upstream_model_id,enabled,created_at,updated_at) VALUES('map-codex','gpt-5-codex','Codex','openai_responses','test-model',1,?,?)")
-            .bind(time)
-            .bind(time)
-            .execute(gateway.db.pool())
-            .await
-            .unwrap();
         gateway
     }
 
-    /// V2 远程压缩请求：`input` 以 `compaction_trigger` 结尾，走 `/codex/` 映射入口。
+    /// V2 远程压缩请求：`input` 以 `compaction_trigger` 结尾，走常规 `/v1/responses` 入口。
     fn codex_compaction_request() -> axum::extract::Request {
-        let body = r#"{"model":"gpt-5-codex","stream":true,"input":[{"type":"message","role":"user","content":[]},{"type":"compaction_trigger"}]}"#;
+        let body = r#"{"model":"test-model","stream":true,"input":[{"type":"message","role":"user","content":[]},{"type":"compaction_trigger"}]}"#;
         axum::extract::Request::builder()
             .method("POST")
-            .uri("/codex/v1/responses")
+            .uri("/v1/responses")
             .header("content-type", "application/json")
             .body(axum::body::Body::from(body))
             .unwrap()
     }
 
-    /// 经 claude 映射入口（/claudecode/v1/messages）发起的请求。
-    fn chat_request_mapped(stream: bool) -> axum::extract::Request {
-        let body = format!(
-            r#"{{"model":"mapped-model","max_tokens":10,"stream":{stream},"messages":[{{"role":"user","content":"hi"}}]}}"#
-        );
-        axum::extract::Request::builder()
-            .method("POST")
-            .uri("/claudecode/v1/messages")
-            .header("content-type", "application/json")
-            .body(axum::body::Body::from(body))
-            .unwrap()
+    /// Command Code 渠道上的 claude 入口请求（`/v1/messages`）：
+    /// 模型只有 `command_code` 路由，网关静默转换。
+    fn cc_claude_chat_request(stream: bool) -> axum::extract::Request {
+        cc_claude_request(&format!(
+            r#"{{"model":"cc-model","max_tokens":10,"stream":{stream},"messages":[{{"role":"user","content":"hi"}}]}}"#
+        ))
     }
 
     /// 对每个被接受的连接都返回 `response` 的上游，
@@ -837,7 +799,7 @@ use tokio_util::sync::CancellationToken;
         gateway.shutdown().await;
     }
 
-    /// 映射路径上的同一保证：客户端在转换器消费完内容 + usage 后挂断，
+    /// 转换路径上的同一保证：客户端在转换器消费完内容 + usage 后挂断，
     /// 留下的 cancelled 记录携带真实的字节与 usage，
     /// 而不是零值。
     #[tokio::test]
@@ -849,11 +811,11 @@ use tokio_util::sync::CancellationToken;
         );
         let response = stream_response(&body, Some(1000));
         let port = spawn_upstream(response.into_bytes(), true).await;
-        let gateway = test_gateway_mapped(port, &[]).await;
+        let gateway = test_gateway_command_code(port, &[]).await;
         let response = gateway
             .state
             .proxy
-            .proxy(chat_request_mapped(true), "claude", None)
+            .proxy(cc_claude_chat_request(true), "claude", None)
             .await;
         let mut frames = response.into_body().into_data_stream();
         while let Ok(Some(Ok(chunk))) =
@@ -891,139 +853,6 @@ use tokio_util::sync::CancellationToken;
             first_token_ms.is_some(),
             "the observed first token must survive the disconnect"
         );
-        gateway.shutdown().await;
-    }
-
-    /// 审查发现：上游是 Responses API 的映射流
-    /// 必须记录输入 token 与缓存命中数。Responses 的
-    /// usage 形状把缓存命中嵌在 `input_tokens_details.cached_tokens`
-    /// 里（没有 Claude 风格的顶层 `cache_read_input_tokens`），
-    /// 因此转换器的 usage 合并必须去那里取。
-    #[tokio::test]
-    async fn mapped_responses_upstream_records_cache_read() {
-        let body = format!(
-            "{}{}",
-            sse_event(r#"{"type":"response.output_text.delta","delta":"hi"}"#),
-            sse_event(r#"{"type":"response.completed","response":{"id":"r-1","usage":{"input_tokens":100,"output_tokens":50,"input_tokens_details":{"cached_tokens":30}}}}"#),
-        );
-        let response = stream_response(&body, Some(body.len()));
-        let port = spawn_upstream(response.into_bytes(), false).await;
-        let gateway = test_gateway_mapped(port, &[]).await;
-        // 重接脚手架：该映射渠道说 openai_responses。
-        sqlx::query("UPDATE channels SET protocol='openai_responses' WHERE id='ch-1'")
-            .execute(gateway.db.pool())
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO channel_model_protocols(channel_model_id,protocol) VALUES('cm-1','openai_responses')")
-            .execute(gateway.db.pool())
-            .await
-            .unwrap();
-        sqlx::query("UPDATE model_routes SET protocol='openai_responses' WHERE id='route-1'")
-            .execute(gateway.db.pool())
-            .await
-            .unwrap();
-        sqlx::query("UPDATE claude_model_mappings SET upstream_protocol='openai_responses' WHERE id='map-1'")
-            .execute(gateway.db.pool())
-            .await
-            .unwrap();
-        let response = gateway
-            .state
-            .proxy
-            .proxy(chat_request_mapped(true), "claude", None)
-            .await;
-        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-        assert!(!bytes.is_empty());
-        let (_, outcome, attempts, _) =
-            wait_for_outcome(&gateway.db, "success", Duration::from_secs(5)).await;
-        assert_eq!(outcome, "success");
-        assert_eq!(attempts, 1);
-        let (input, cache_read, miss, output): (
-            Option<i64>,
-            Option<i64>,
-            Option<i64>,
-            Option<i64>,
-        ) = sqlx::query_as(
-            "SELECT input_tokens, cache_read_tokens, cache_miss_input_tokens, output_tokens \
-             FROM request_attempts LIMIT 1",
-        )
-        .fetch_one(gateway.db.pool())
-        .await
-        .unwrap();
-        assert_eq!(input, Some(100), "input tokens must be recorded");
-        assert_eq!(
-            cache_read, Some(30),
-            "responses cache hits (input_tokens_details.cached_tokens) must be recorded"
-        );
-        assert_eq!(miss, Some(70), "cache miss = total - hit");
-        assert_eq!(output, Some(50));
-        gateway.shutdown().await;
-    }
-
-    /// 审查发现：同协议的映射流（claude 渠道上的模型改名映射）
-    /// 转发原始字节，但仍必须记录 usage——
-    /// 此前直通转换器从不合并 usage，
-    /// 导致日志里 input/output/cache 全为 NULL。
-    #[tokio::test]
-    async fn mapped_passthrough_stream_records_usage() {
-        let body = format!(
-            "{}{}{}{}{}{}",
-            sse_event(r#"{"type":"message_start","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":4,"cache_creation_input_tokens":2}}}"#),
-            sse_event(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#),
-            sse_event(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#),
-            sse_event(r#"{"type":"content_block_stop","index":0}"#),
-            sse_event(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":4,"cache_creation_input_tokens":2}}"#),
-            sse_event(r#"{"type":"message_stop"}"#),
-        );
-        let response = stream_response(&body, Some(body.len()));
-        let port = spawn_upstream(response.into_bytes(), false).await;
-        let gateway = test_gateway_mapped(port, &[]).await;
-        // 重接脚手架：同协议映射（claude -> claude）。
-        sqlx::query("UPDATE channels SET protocol='claude' WHERE id='ch-1'")
-            .execute(gateway.db.pool())
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO channel_model_protocols(channel_model_id,protocol) VALUES('cm-1','claude')")
-            .execute(gateway.db.pool())
-            .await
-            .unwrap();
-        sqlx::query("UPDATE model_routes SET protocol='claude' WHERE id='route-1'")
-            .execute(gateway.db.pool())
-            .await
-            .unwrap();
-        sqlx::query("UPDATE claude_model_mappings SET upstream_protocol='claude' WHERE id='map-1'")
-            .execute(gateway.db.pool())
-            .await
-            .unwrap();
-        let response = gateway
-            .state
-            .proxy
-            .proxy(chat_request_mapped(true), "claude", None)
-            .await;
-        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-        assert!(!bytes.is_empty());
-        let (_, outcome, attempts, _) =
-            wait_for_outcome(&gateway.db, "success", Duration::from_secs(5)).await;
-        assert_eq!(outcome, "success");
-        assert_eq!(attempts, 1);
-        let (input, cache_read, cache_write, output): (
-            Option<i64>,
-            Option<i64>,
-            Option<i64>,
-            Option<i64>,
-        ) = sqlx::query_as(
-            "SELECT input_tokens, cache_read_tokens, cache_write_tokens, output_tokens \
-             FROM request_attempts LIMIT 1",
-        )
-        .fetch_one(gateway.db.pool())
-        .await
-        .unwrap();
-        assert_eq!(input, Some(10), "passthrough input tokens must be recorded");
-        assert_eq!(
-            cache_read, Some(4),
-            "passthrough cache hits must be recorded"
-        );
-        assert_eq!(cache_write, Some(2));
-        assert_eq!(output, Some(5));
         gateway.shutdown().await;
     }
 
@@ -1077,11 +906,11 @@ use tokio_util::sync::CancellationToken;
         );
         let response = stream_response(&body, Some(body.len()));
         let port = spawn_upstream(response.into_bytes(), false).await;
-        let gateway = test_gateway_mapped(port, &[]).await;
+        let gateway = test_gateway_command_code(port, &[]).await;
         let response = gateway
             .state
             .proxy
-            .proxy(chat_request_mapped(true), "claude", None)
+            .proxy(cc_claude_chat_request(true), "claude", None)
             .await;
         let mut frames = response.into_body().into_data_stream();
         // 读取帧直到终态 claude 事件到达，然后像认为本轮结束的 CLI
@@ -1275,51 +1104,24 @@ use tokio_util::sync::CancellationToken;
         gateway.shutdown().await;
     }
 
-    /// 映射路径上的首 token 保护：直通映射
-    /// （entry == 上游协议）的上游若未产出任何 token 就关闭，
+    /// 转换路径上的首 token 保护：转换路径（entry != 上游协议）
+    /// 的上游若未产出任何 token 就关闭，
     /// 同样必须使熔断失败。
     #[tokio::test]
-    async fn mapped_passthrough_empty_close_fails_circuit() {
+    async fn mapped_stream_empty_close_fails_circuit() {
         let response = stream_response("", Some(0));
         let port = spawn_upstream(response.into_bytes(), false).await;
-        let gateway = test_gateway_mapped(port, &[("failure_threshold", "1")]).await;
-        sqlx::query("INSERT INTO claude_model_mappings(id,claude_model_id,display_name,upstream_protocol,upstream_model_id,enabled,created_at,updated_at) VALUES('map-2','passthrough-model','Passthrough','claude','test-model',1,?,?)")
-            .bind("2026-08-04T01:00:00+00:00")
-            .bind("2026-08-04T01:00:00+00:00")
-            .execute(gateway.db.pool())
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO channel_model_protocols(channel_model_id,protocol) VALUES('cm-1','claude')")
-            .execute(gateway.db.pool())
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO model_routes(id,protocol,requested_model_id,enabled,created_at,updated_at) VALUES('route-2','claude','test-model',1,?,?)")
-            .bind("2026-08-04T01:00:00+00:00")
-            .bind("2026-08-04T01:00:00+00:00")
-            .execute(gateway.db.pool())
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO route_candidates(id,route_id,channel_model_id,priority,enabled,created_at,updated_at) VALUES('rc-2','route-2','cm-1',1,1,?,?)")
-            .bind("2026-08-04T01:00:00+00:00")
-            .bind("2026-08-04T01:00:00+00:00")
-            .execute(gateway.db.pool())
-            .await
-            .unwrap();
-        let request = axum::extract::Request::builder()
-            .method("POST")
-            .uri("/claudecode/v1/messages")
-            .header("content-type", "application/json")
-            .body(axum::body::Body::from(
-                r#"{"model":"passthrough-model","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
-            ))
-            .unwrap();
+        let gateway = test_gateway_command_code(port, &[("failure_threshold", "1")]).await;
         let response = gateway
             .state
             .proxy
-            .proxy(request, "claude", None)
+            .proxy(cc_claude_chat_request(true), "claude", None)
             .await;
         let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-        assert!(bytes.is_empty());
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("content_block_delta"),
+            "an empty upstream must never be turned into answer content"
+        );
         let (_, outcome, attempts, _) =
             wait_for_outcome(&gateway.db, "stream_interrupted", Duration::from_secs(5)).await;
         assert_eq!(outcome, "stream_interrupted");
@@ -1568,7 +1370,7 @@ use tokio_util::sync::CancellationToken;
         gateway.shutdown().await;
     }
 
-    /// 映射路径同样如此：prelude 窗口也锚定在尝试开始。
+    /// 转换路径同样如此：prelude 窗口也锚定在尝试开始。
     /// 200 + 内容在 2s 后才到，1s 预算早已过期，
     /// 因此单候选 failover 进 504 尾部，而不是成功。
     #[tokio::test]
@@ -1580,7 +1382,7 @@ use tokio_util::sync::CancellationToken;
         );
         let response = stream_response(&body, Some(body.len()));
         let port = spawn_upstream_delayed(response.into_bytes(), Duration::from_secs(2)).await;
-        let gateway = test_gateway_mapped(
+        let gateway = test_gateway_command_code(
             port,
             &[
                 ("first_byte_timeout_seconds", "3"),
@@ -1591,7 +1393,7 @@ use tokio_util::sync::CancellationToken;
         let response = gateway
             .state
             .proxy
-            .proxy(chat_request_mapped(true), "claude", None)
+            .proxy(cc_claude_chat_request(true), "claude", None)
             .await;
         assert_eq!(
             response.status(),
@@ -1606,7 +1408,7 @@ use tokio_util::sync::CancellationToken;
         gateway.shutdown().await;
     }
 
-    /// 映射流的 200 响应头已到达但从未产出首 token 属于超时，
+    /// 转换流的 200 响应头已到达但从未产出首 token 属于超时，
     /// 因此单候选运行以 504 结束
     /// （修复前：prelude 超时未被分类，
     /// 尾部错误地产生 502）。
@@ -1617,11 +1419,12 @@ use tokio_util::sync::CancellationToken;
                 .as_bytes()
                 .to_vec();
         let port = spawn_upstream(headers_only, true).await;
-        let gateway = test_gateway_mapped(port, &[("first_token_timeout_seconds", "1")]).await;
+        let gateway =
+            test_gateway_command_code(port, &[("first_token_timeout_seconds", "1")]).await;
         let response = gateway
             .state
             .proxy
-            .proxy(chat_request_mapped(true), "claude", None)
+            .proxy(cc_claude_chat_request(true), "claude", None)
             .await;
         assert_eq!(
             response.status(),
@@ -1743,11 +1546,11 @@ use tokio_util::sync::CancellationToken;
             .into_bytes();
             response_bytes.extend_from_slice(&compressed);
             let port = spawn_upstream(response_bytes, false).await;
-            let gateway = test_gateway_mapped(port, &[]).await;
+            let gateway = test_gateway_command_code(port, &[]).await;
             let response = gateway
                 .state
                 .proxy
-                .proxy(chat_request_mapped(true), "claude", None)
+                .proxy(cc_claude_chat_request(true), "claude", None)
                 .await;
             assert_eq!(
                 response.headers().get("content-encoding"),
@@ -1792,11 +1595,11 @@ use tokio_util::sync::CancellationToken;
         )
         .into_bytes();
         let port = spawn_upstream(response_bytes, false).await;
-        let gateway = test_gateway_mapped(port, &[]).await;
+        let gateway = test_gateway_command_code(port, &[]).await;
         let response = gateway
             .state
             .proxy
-            .proxy(chat_request_mapped(false), "claude", None)
+            .proxy(cc_claude_chat_request(false), "claude", None)
             .await;
         assert_eq!(
             response.status(),
@@ -1857,11 +1660,11 @@ use tokio_util::sync::CancellationToken;
         )
         .into_bytes();
         let port = spawn_upstream(response_bytes, false).await;
-        let gateway = test_gateway_mapped(port, &[("max_buffered_upstream_body_mb", "1")]).await;
+        let gateway = test_gateway_command_code(port, &[("max_buffered_upstream_body_mb", "1")]).await;
         let response = gateway
             .state
             .proxy
-            .proxy(chat_request_mapped(false), "claude", None)
+            .proxy(cc_claude_chat_request(false), "claude", None)
             .await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
@@ -1890,11 +1693,11 @@ use tokio_util::sync::CancellationToken;
             .to_vec();
         response_bytes.extend(std::iter::repeat_n(b'x', 2 * 1024 * 1024));
         let port = spawn_upstream(response_bytes, false).await;
-        let gateway = test_gateway_mapped(port, &[("max_buffered_upstream_body_mb", "1")]).await;
+        let gateway = test_gateway_command_code(port, &[("max_buffered_upstream_body_mb", "1")]).await;
         let response = gateway
             .state
             .proxy
-            .proxy(chat_request_mapped(false), "claude", None)
+            .proxy(cc_claude_chat_request(false), "claude", None)
             .await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let (_, _, attempts, status) =
@@ -1928,11 +1731,11 @@ use tokio_util::sync::CancellationToken;
         let mut body = response_bytes;
         body.extend_from_slice(&compressed);
         let port = spawn_upstream(body, false).await;
-        let gateway = test_gateway_mapped(port, &[("max_buffered_upstream_body_mb", "1")]).await;
+        let gateway = test_gateway_command_code(port, &[("max_buffered_upstream_body_mb", "1")]).await;
         let response = gateway
             .state
             .proxy
-            .proxy(chat_request_mapped(false), "claude", None)
+            .proxy(cc_claude_chat_request(false), "claude", None)
             .await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let (_, _, attempts, status) =
@@ -1968,11 +1771,11 @@ use tokio_util::sync::CancellationToken;
         let mut body = response_bytes;
         body.extend_from_slice(&compressed);
         let port = spawn_upstream(body, false).await;
-        let gateway = test_gateway_mapped(port, &[("max_buffered_upstream_body_mb", "1")]).await;
+        let gateway = test_gateway_command_code(port, &[("max_buffered_upstream_body_mb", "1")]).await;
         let response = gateway
             .state
             .proxy
-            .proxy(chat_request_mapped(false), "claude", None)
+            .proxy(cc_claude_chat_request(false), "claude", None)
             .await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let (_, _, attempts, status) =
@@ -2097,11 +1900,11 @@ use tokio_util::sync::CancellationToken;
         let mut body = response_bytes;
         body.extend_from_slice(&compressed);
         let port = spawn_upstream(body, false).await;
-        let gateway = test_gateway_mapped(port, &[("max_buffered_upstream_body_mb", "8")]).await;
+        let gateway = test_gateway_command_code(port, &[("max_buffered_upstream_body_mb", "8")]).await;
         let response = gateway
             .state
             .proxy
-            .proxy(chat_request_mapped(false), "claude", None)
+            .proxy(cc_claude_chat_request(false), "claude", None)
             .await;
         assert_eq!(
             response.status(),
@@ -2153,11 +1956,11 @@ use tokio_util::sync::CancellationToken;
         part1.extend_from_slice(&compressed[..split]);
         let parts = vec![part1, compressed[split..].to_vec()];
         let port = spawn_upstream_parts(parts, Duration::from_millis(30)).await;
-        let gateway = test_gateway_mapped(port, &[("max_buffered_upstream_body_mb", "1")]).await;
+        let gateway = test_gateway_command_code(port, &[("max_buffered_upstream_body_mb", "1")]).await;
         let response = gateway
             .state
             .proxy
-            .proxy(chat_request_mapped(true), "claude", None)
+            .proxy(cc_claude_chat_request(true), "claude", None)
             .await;
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
@@ -2194,18 +1997,18 @@ use tokio_util::sync::CancellationToken;
         let port_a = spawn_upstream(response_bytes.clone(), false).await;
         let port_b = spawn_upstream(response_bytes, false).await;
         let gateway_a =
-            test_gateway_mapped(port_a, &[("max_buffered_upstream_body_mb", "1")]).await;
+            test_gateway_command_code(port_a, &[("max_buffered_upstream_body_mb", "1")]).await;
         let gateway_b =
-            test_gateway_mapped(port_b, &[("max_buffered_upstream_body_mb", "1")]).await;
+            test_gateway_command_code(port_b, &[("max_buffered_upstream_body_mb", "1")]).await;
         let (response_a, response_b) = tokio::join!(
             gateway_a
                 .state
                 .proxy
-                .proxy(chat_request_mapped(false), "claude", None),
+                .proxy(cc_claude_chat_request(false), "claude", None),
             gateway_b
                 .state
                 .proxy
-                .proxy(chat_request_mapped(false), "claude", None),
+                .proxy(cc_claude_chat_request(false), "claude", None),
         );
         assert_eq!(response_a.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(response_b.status(), StatusCode::BAD_GATEWAY);
@@ -2772,7 +2575,7 @@ use tokio_util::sync::CancellationToken;
     fn cc_claude_request(body: &str) -> axum::extract::Request {
         axum::extract::Request::builder()
             .method("POST")
-            .uri("/claudecode/v1/messages")
+            .uri("/v1/messages")
             .header("content-type", "application/json")
             .body(Body::from(body.to_owned()))
             .unwrap()
@@ -2924,7 +2727,7 @@ use tokio_util::sync::CancellationToken;
         let gateway =
             test_gateway_command_code(port, &[("command_code_enabled", "true")]).await;
         let request = cc_claude_request(
-            r#"{"model":"mapped-cc","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+            r#"{"model":"cc-model","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
         );
         let response = gateway
             .state
@@ -3035,7 +2838,7 @@ use tokio_util::sync::CancellationToken;
         let gateway =
             test_gateway_command_code(port, &[("command_code_enabled", "true")]).await;
         let request = cc_claude_request(
-            r#"{"model":"mapped-cc","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+            r#"{"model":"cc-model","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
         );
         let response = gateway
             .state
@@ -3085,7 +2888,7 @@ use tokio_util::sync::CancellationToken;
         let gateway =
             test_gateway_command_code(port, &[("command_code_enabled", "true")]).await;
         let request = cc_claude_request(
-            r#"{"model":"mapped-cc","max_tokens":10,"stream":false,"messages":[{"role":"user","content":"hi"}]}"#,
+            r#"{"model":"cc-model","max_tokens":10,"stream":false,"messages":[{"role":"user","content":"hi"}]}"#,
         );
         let response = gateway
             .state
@@ -3117,9 +2920,10 @@ use tokio_util::sync::CancellationToken;
     #[tokio::test]
     async fn command_code_disabled_blocks_all_upstream_requests() {
         let (port, mut requests) = spawn_command_code_upstream(CcUpstreamMode::GoDowngrade).await;
-        let gateway = test_gateway_command_code(port, &[]).await;
+        // 集成关闭的裸脚手架（helper 会自动开启该开关，这里刻意不用它）。
+        let gateway = test_gateway_inner(port, &[], false, true).await;
         let request = cc_claude_request(
-            r#"{"model":"mapped-cc","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+            r#"{"model":"cc-model","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
         );
         let response = gateway
             .state
@@ -3184,7 +2988,7 @@ use tokio_util::sync::CancellationToken;
             .await
             .unwrap();
 
-        let body = r#"{"model":"mapped-cc","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+        let body = r#"{"model":"cc-model","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
         let response = gateway
             .state
             .proxy
@@ -3347,7 +3151,7 @@ use tokio_util::sync::CancellationToken;
             ],
         )
         .await;
-        let body = r#"{"model":"mapped-cc","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+        let body = r#"{"model":"cc-model","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
 
         let proxy_a = Arc::clone(&gateway.state.proxy);
         let task_a = tokio::spawn(async move {
@@ -3412,7 +3216,7 @@ use tokio_util::sync::CancellationToken;
         gateway.shutdown().await;
     }
 
-    /// Codex 入口（`/codex/v1/responses`）共享同一 Command Code
+    /// Responses 入口（`/v1/responses`）同样驱动 Command Code
     /// 管线；Responses usage 保留输入 token 总数，
     /// 而缓存计数是其子集。
     #[tokio::test]
@@ -3420,10 +3224,10 @@ use tokio_util::sync::CancellationToken;
         let (port, _requests) = spawn_command_code_upstream(CcUpstreamMode::GoDowngrade).await;
         let gateway =
             test_gateway_command_code(port, &[("command_code_enabled", "true")]).await;
-        let body = r#"{"model":"mapped-cc-codex","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#;
+        let body = r#"{"model":"cc-model","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#;
         let request = axum::extract::Request::builder()
             .method("POST")
-            .uri("/codex/v1/responses")
+            .uri("/v1/responses")
             .header("content-type", "application/json")
             .body(Body::from(body.to_owned()))
             .unwrap();
@@ -3751,7 +3555,8 @@ use tokio_util::sync::CancellationToken;
     #[tokio::test]
     async fn command_code_candidate_is_dropped_while_the_integration_is_off() {
         let (port, mut requests) = spawn_command_code_upstream(CcUpstreamMode::GoDowngrade).await;
-        let gateway = test_gateway_command_code(port, &[]).await;
+        // 集成关闭的裸脚手架（helper 会自动开启该开关，这里刻意不用它）。
+        let gateway = test_gateway_inner(port, &[], false, true).await;
         add_command_code_entry_routes(&gateway).await;
         let body = r#"{"model":"route-openai","stream":true,"max_tokens":16,
             "messages":[{"role":"user","content":"hi"}]}"#;

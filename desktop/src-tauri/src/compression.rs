@@ -4,7 +4,7 @@
 //! 边界：只做解码，不做 HTTP 分类（编码识别仅按头值字符串匹配）。
 //! 不变量：单次 feed 输出上限为 `max_out`，且单次 feed 至多越过该上限 16 KiB
 //! （内部缓冲粒度）；累计输出受 `max_total` 约束；初始化失败不 panic。
-//! 使用方：[`RequiredDecoder`]（映射转换等必须拿到完整明文的路径）、
+//! 使用方：[`RequiredDecoder`]（协议转换等必须拿到完整明文的路径）、
 //! [`ObservableDecoder`]（原样转发响应的尽力观测，解码失败即静默，不影响中继）。
 
 use std::io;

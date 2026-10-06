@@ -20,7 +20,7 @@ use futures_util::{Stream, StreamExt};
 use http::{HeaderMap, StatusCode};
 use url::Url;
 
-use crate::domain::{Candidate, CompactionMode, Event, MappingTarget, RoutableModel};
+use crate::domain::{Candidate, CompactionMode, Event, RoutableModel};
 
 /// 一次上游 HTTP 交换的抽象，业务逻辑因此永远看不到 reqwest。
 pub struct UpstreamRequest {
@@ -194,13 +194,6 @@ pub trait RouteRepository: Send + Sync {
         protocol: Option<&str>,
     ) -> BoxFuture<'static, Result<Vec<RoutableModel>>>;
 
-    /// 映射入口模型（claudecode/codex）的映射目标（若有）。
-    fn resolve_mapping(
-        &self,
-        entry: &str,
-        model: &str,
-    ) -> BoxFuture<'static, Result<Option<MappingTarget>>>;
-
     /// 记录一次运行时确认的远程压缩能力探测结果（`channel_protocols`）。
     ///
     /// 写入失败只记录告警：这是一次“顺带”的能力标注，失败不该影响本次请求。
@@ -216,9 +209,6 @@ pub trait RouteRepository: Send + Sync {
         &self,
         model_id: &str,
     ) -> BoxFuture<'static, Result<Vec<String>>>;
-
-    /// 启用的映射模型（claudecode/codex 目录行）。
-    fn list_mapping_models(&self, kind: &str) -> BoxFuture<'static, Result<Vec<RoutableModel>>>;
 }
 
 /// 后台服务（健康探测、discovery）所需的渠道行快照：

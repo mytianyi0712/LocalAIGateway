@@ -1,0 +1,14 @@
+# 统一文本行尾：仓库内存 LF，检出即 LF（Windows 上亦同），
+# 避免 CRLF 让 bash 脚本失败、让 diff 变成整文件重写。
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.ico binary
+*.icns binary
+*.zst binary
+*.gz binary
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.a binary

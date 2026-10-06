@@ -300,8 +300,8 @@ content block（曾按 delta 逐条新开 block）；`text`/`tool_use` 开始前
 累积时会用文本覆盖已关闭的 thinking 块）。
 
 **OAI 聊天入口 → CC 的静默转换**（`ChatToCommandCode`，2026-09-12）：
-`/v1/chat/completions` 无映射直连时，若模型只有 `command_code` 路由，网关自动回落到
-`command_code` 上游（无需 Claude/Codex 映射）：请求转成 `/alpha/generate` body，流式
+`/v1/chat/completions` 直连时，若模型只有 `command_code` 路由，网关自动回落到
+`command_code` 上游：请求转成 `/alpha/generate` body，流式
 NDJSON 解码回 OpenAI SSE，非流式聚合为单个 `chat.completion`。`reasoning_effort` →
 `params.reasoning_effort`；CC 的 `reasoning-delta` 以 `reasoning_content` 返回；usage
 保持 OpenAI 形状（`prompt_tokens` 含缓存、`prompt_tokens_details.cached_tokens` 单列）。
