@@ -20,6 +20,48 @@ pub struct Database {
     pool: SqlitePool,
 }
 
+/// 已应用迁移的校验和容错：迁移内容一旦与旧库记录的字节不同（例如历史整理
+/// 时只改了注释头），sqlx 会以 `VersionMismatch` 拒绝启动，让已经部署的旧库
+/// 在升级时直接打不开。这里把这类已应用行的校验和对齐到本次构建内嵌的版本并
+/// 留下告警：迁移内容本身有 `migration_files_are_pinned` 测试看守，
+/// 结构变更必须以新迁移承载，本函数只负责让历史库继续可用。
+async fn reconcile_migration_checksums(
+    pool: &SqlitePool,
+    migrator: &sqlx::migrate::Migrator,
+) -> Result<()> {
+    let exists: Option<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='_sqlx_migrations'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    if exists.is_none() {
+        return Ok(());
+    }
+    let applied: Vec<(i64, Vec<u8>)> =
+        sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations")
+            .fetch_all(pool)
+            .await?;
+    for (version, stored) in applied {
+        let Some(migration) = migrator.iter().find(|item| item.version == version) else {
+            continue;
+        };
+        if stored.as_slice() == migration.checksum.as_ref() {
+            continue;
+        }
+        tracing::warn!(
+            version,
+            description = %migration.description,
+            "已应用迁移的内容与本次构建不同；对齐校验和并继续（结构变更应以新迁移承载）"
+        );
+        sqlx::query("UPDATE _sqlx_migrations SET checksum=? WHERE version=?")
+            .bind(migration.checksum.as_ref())
+            .bind(version)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
 impl Database {
     pub async fn open(path: &Path) -> Result<Self> {
         // 库里存着加密的渠道密钥与全部请求日志，文件权限必须是 0600。
@@ -57,7 +99,9 @@ impl Database {
             .connect_with(options)
             .await
             .with_context(|| format!("无法打开数据库 {}", path.display()))?;
-        sqlx::migrate!("./migrations")
+        let migrator = sqlx::migrate!("./migrations");
+        reconcile_migration_checksums(&pool, &migrator).await?;
+        migrator
             .run(&pool)
             .await
             .context("无法初始化数据库结构")?;
@@ -166,6 +210,114 @@ mod tests {
     }
     use super::*;
     use crate::test_support::TempDir;
+
+    /// 已应用迁移的校验和容错：旧库记录的校验和与本构建内嵌内容不同（历史
+    /// 整理时只改了注释头就会这样）时，必须对齐校验和并继续启动，
+    /// 而不是以 `VersionMismatch` 让已部署的库直接打不开。
+    #[tokio::test]
+    async fn migration_checksum_drift_is_reconciled_on_open() {
+        let dir = TempDir::new("db-checksum");
+        let path = dir.path().join("gateway.db");
+        let db = Database::open(&path).await.unwrap();
+        sqlx::query("UPDATE _sqlx_migrations SET checksum=? WHERE version=1")
+            .bind(vec![0u8; 48])
+            .execute(db.pool())
+            .await
+            .unwrap();
+        drop(db);
+
+        let db = Database::open(&path).await.unwrap();
+        let stored: Vec<u8> =
+            sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version=1")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            stored.as_slice(),
+            sqlx::migrate!("./migrations")
+                .iter()
+                .find(|item| item.version == 1)
+                .unwrap()
+                .checksum
+                .as_ref(),
+            "the stored checksum must be aligned with the embedded migration"
+        );
+    }
+
+    /// 迁移文件一旦应用就必须保持字节不变：内容漂移会让已部署的库无法升级，
+    /// 结构变更只能以新的（编号更大的）迁移承载。新增迁移时把它的哈希追加到
+    /// 这里；修改既有迁移文件会让本测试失败。
+    #[test]
+    fn migration_files_are_pinned() {
+        // (文件名, 内容 CRLF→LF 归一化后的 SHA-384)
+        let pinned: [(&str, &str); 7] = [
+            (
+                "0001_gateway_schema.sql",
+                "43e1e3b42cc7ac850c893e9fb2c582c7e02a065085d36cf966c9284fb8d51b66635b3d9cb4047ea451e009547eadc6ab",
+            ),
+            (
+                "0002_token_usage.sql",
+                "8947131e80babb58abb0fac354bd7db26fda97e2d37c75528e64491113b9c0369b5e2a32c876637cf99ca8d51c5f1c56",
+            ),
+            (
+                "0003_remote_compaction.sql",
+                "b7a2cba8191cb6042525f925af84246be4488823f80eb19d538f49a32d488e6cb4fbec1c8c1e385e9811aee2c003ebf1",
+            ),
+            (
+                "0004_channel_balance.sql",
+                "385deceae85c561c978b37e4174999c62925b7fc54f0c2b494209555166c32e04c8ad6c144d9b8a16dbc774b0e611584",
+            ),
+            (
+                "0005_command_code.sql",
+                "1929d47d8ccfc8a0daa7584f72a8b93835b42904af195d9968e3a690cd5beb4e83c41150a4a13f6a1d9b943634b4aa58",
+            ),
+            (
+                "0006_command_code_model_bindings.sql",
+                "a1b5fc1520a9f94d4c7ba6635180546150c14edb01fa5e05adcb2d25696688c77e8d6d0939730b18e3b13a1b1be73394",
+            ),
+            (
+                "0007_drop_model_mappings.sql",
+                "2a38eb7bb54e00592eb252bfca368f73d4a8c2415f4ef4d3d00bb23b8403c3f4ff8e5988cc3fb7f1e30409f2d9b88aa9",
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (name, expected) in pinned {
+            let raw = std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("migrations")
+                    .join(name),
+            )
+            .unwrap();
+            let normalized: Vec<u8> = {
+                let mut out = Vec::with_capacity(raw.len());
+                let mut iter = raw.iter().copied().peekable();
+                while let Some(byte) = iter.next() {
+                    if byte == b'\r' && iter.peek() == Some(&b'\n') {
+                        continue;
+                    }
+                    out.push(byte);
+                }
+                out
+            };
+            let digest = {
+                use sha2::{Digest as _, Sha384};
+                let mut hasher = Sha384::new();
+                hasher.update(&normalized);
+                hasher.finalize()
+            };
+            let actual = digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            if actual != expected {
+                failures.push(format!("{name}: {actual} != {expected}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "迁移文件被修改了；结构变更请新增迁移：{failures:?}"
+        );
+    }
 
     /// Migration 0006 为既有的 Command Code catalog 行回填可转换的入口绑定，
     /// 使路由候选池无需等待下一轮 discovery 即可提供它们。判定依据是 provider 的

@@ -949,6 +949,93 @@ use tokio_util::sync::CancellationToken;
         gateway.shutdown().await;
     }
 
+    /// 回归（真实观测）：上游以 `finish_reason` 结束、**不发 `data: [DONE]`**
+    /// （如 tierflow 等 relay），客户端（agent）在收到终态事件后立刻挂断。
+    /// 这属于正常结束，必须记为 success——终态标记（含随行 usage）在
+    /// 交给客户端之前就已用于判定，绝不能退化成 `cancelled`。
+    #[tokio::test]
+    async fn client_close_after_finish_reason_without_done_records_success() {
+        let events = vec![
+            sse_event(r#"{"id":"1","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#),
+            sse_event(r#"{"id":"2","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#),
+        ];
+        let body: String = events.concat();
+        let parts = vec![
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                events[0]
+            )
+            .into_bytes(),
+            events[1].clone().into_bytes(),
+        ];
+        let port = spawn_upstream_parts(parts, Duration::from_millis(60)).await;
+        let gateway = test_gateway(port, &[]).await;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request(true), "openai_compatible", None)
+            .await;
+        let mut frames = response.into_body().into_data_stream();
+        let mut saw_terminal = false;
+        for _ in 0..32 {
+            let Ok(Some(Ok(chunk))) =
+                tokio::time::timeout(Duration::from_millis(500), frames.next()).await
+            else {
+                break;
+            };
+            if String::from_utf8_lossy(&chunk).contains("\"finish_reason\":\"stop\"") {
+                saw_terminal = true;
+                break;
+            }
+        }
+        assert!(saw_terminal, "the client must observe the terminal chunk");
+        drop(frames);
+        let (_, outcome, attempts, status) =
+            wait_for_outcome(&gateway.db, "success", Duration::from_secs(5)).await;
+        assert_eq!(
+            outcome, "success",
+            "a finish_reason-terminated stream that the client already saw must not become cancelled"
+        );
+        assert_eq!(attempts, 1);
+        assert_eq!(status, Some(200));
+        let (input, output): (Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT input_tokens, output_tokens FROM request_attempts ORDER BY attempt_no DESC LIMIT 1",
+        )
+        .fetch_one(gateway.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(input, Some(10), "usage from the terminal chunk survives");
+        assert_eq!(output, Some(5));
+        gateway.shutdown().await;
+    }
+
+    /// 上游既不发送终态标记也不发送 `[DONE]`、客户端读到流尾才结束时，
+    /// 同样必须记为 success（上游 EOF 既是客户端的结束信号，
+    /// 也必须先于客户端挂断被网关观察到）。
+    #[tokio::test]
+    async fn client_reads_to_eof_without_terminal_marker_records_success() {
+        let body = sse_event(
+            r#"{"id":"1","choices":[{"delta":{"content":"hi"},"finish_reason":null}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}"#,
+        );
+        let response = stream_response(&body, Some(body.len()));
+        let port = spawn_upstream(response.into_bytes(), false).await;
+        let gateway = test_gateway(port, &[]).await;
+        let response = gateway
+            .state
+            .proxy
+            .proxy(chat_request(true), "openai_compatible", None)
+            .await;
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(!bytes.is_empty());
+        let (_, outcome, attempts, status) =
+            wait_for_outcome(&gateway.db, "success", Duration::from_secs(5)).await;
+        assert_eq!(outcome, "success");
+        assert_eq!(attempts, 1);
+        assert_eq!(status, Some(200));
+        gateway.shutdown().await;
+    }
+
     /// 流式 usage 会跨多个 chunk 上报；后面某个省略缓存细节的 chunk
     /// 不得抹掉前一个 chunk 携带的缓存字段
     /// （逐字段合并，最新的非 None 值胜出）。

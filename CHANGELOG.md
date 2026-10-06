@@ -19,6 +19,12 @@ Local AI Gateway 的版本变更记录，按版本倒序排列。版本号形如
 - 能力配置守卫（`PUT /api/admin/v1/model-capabilities/{model_id}`）改为只统计「模型路由」引用。
 - SPA 回退只服务 GET/HEAD：已移除的代理端点（POST）返回 404 JSON，而不是 200 HTML。
 
+### 🐛 修复
+
+- 上游以 `finish_reason` 正常结束、但**不发 `data: [DONE]`**（tierflow 等 relay）时，客户端在收到终态事件后立刻挂断不再被记成 `cancelled`：终态判定按协议识别（`finish_reason` / `response.completed` / `message_stop` / `finishReason`），且终态分片在交给客户端之前就完成记账；新增「无 `[DONE]` + 客户端立刻挂断」与「无任何终态标记 + 客户端读到流尾」两条回归用例。
+- 启动修复 `reconcile_completed_stream_cancellations` 此前把 `response_bytes`（INTEGER）当字符串读取，每行都以 “unreadable” 告警跳过，历史误记的 `cancelled` 从未被真正修复；改为按 `id` 取行并补上覆盖用例（已解析到完整 usage 的取消记录会连同最终尝试一起改写为 `success`）。
+- 已应用迁移的校验和容错：旧库记录的校验和与本构建内嵌内容不同（历史整理只改注释头、行尾差异等）时不再以 `VersionMismatch` 拒绝启动，而是对齐校验和并留下告警；迁移文件字节新增 pin 测试，结构变更仍必须以新迁移承载。
+
 ### ⬆️ 升级说明
 
 - 升级后首次启动会执行迁移 `0007`，删除 `claude_model_mappings` 与 `codex_model_mappings`（无 down 脚本，回滚只能靠备份）。

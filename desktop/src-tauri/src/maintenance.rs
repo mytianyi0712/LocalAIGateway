@@ -15,6 +15,7 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::db::Database;
 use crate::state::AppState;
 use crate::settings;
 
@@ -23,34 +24,31 @@ use crate::settings;
 type FinalAttempt = (String, Option<i64>, Option<i64>, bool, Option<i64>);
 
 /// 修复历史上已捕获完整流用量、却被记成 cancelled 的取消记录。
-pub async fn reconcile_completed_stream_cancellations(state: &AppState) -> anyhow::Result<i64> {
-    let mut rows: Vec<(String, String)> = Vec::new();
+pub async fn reconcile_completed_stream_cancellations(db: &Database) -> anyhow::Result<i64> {
+    let mut rows: Vec<String> = Vec::new();
     for row in sqlx::query(
-        "SELECT rl.id, rl.response_bytes FROM request_logs rl \
+        "SELECT rl.id FROM request_logs rl \
          WHERE rl.outcome = 'cancelled' AND rl.final_status_code = 200 AND rl.response_bytes > 0",
     )
-    .fetch_all(state.db.pool())
+    .fetch_all(db.pool())
     .await?
     {
         // 读不出来的行直接跳过并告警：用 `unwrap_or_default()` 会伪造出一个空
         // id，后续按 id 修复会命中错误的记录。
-        let (Ok(id), Ok(response_bytes)) = (
-            row.try_get::<String, _>("id"),
-            row.try_get::<String, _>("response_bytes"),
-        ) else {
+        let Ok(id) = row.try_get::<String, _>("id") else {
             tracing::warn!("cancelled-stream repair: skipping unreadable request_logs row");
             continue;
         };
-        rows.push((id, response_bytes));
+        rows.push(id);
     }
     let mut repaired = 0i64;
-    for (request_id, _) in rows {
+    for request_id in rows {
         let final_attempt: Option<FinalAttempt> = sqlx::query(
             "SELECT outcome, status_code, response_started, raw_usage_json, output_tokens \
                  FROM request_attempts WHERE request_id = ? ORDER BY attempt_no DESC LIMIT 1",
         )
         .bind(&request_id)
-        .fetch_optional(state.db.pool())
+        .fetch_optional(db.pool())
         .await?
         .map(|row| -> anyhow::Result<FinalAttempt> {
             Ok((
@@ -77,7 +75,7 @@ pub async fn reconcile_completed_stream_cancellations(state: &AppState) -> anyho
         {
             sqlx::query("UPDATE request_logs SET outcome='success' WHERE id=?")
                 .bind(&request_id)
-                .execute(state.db.pool())
+                .execute(db.pool())
                 .await?;
             sqlx::query(
                 "UPDATE request_attempts SET outcome='success' \
@@ -85,7 +83,7 @@ pub async fn reconcile_completed_stream_cancellations(state: &AppState) -> anyho
             )
             .bind(&request_id)
             .bind(&request_id)
-            .execute(state.db.pool())
+            .execute(db.pool())
             .await?;
             repaired += 1;
         }
@@ -99,7 +97,7 @@ pub async fn reconcile_completed_stream_cancellations(state: &AppState) -> anyho
 /// 任务一起被排空。
 pub async fn run_supervisor(state: AppState, cancel: CancellationToken) {
     // 启动期修复失败不能悄无声息地结束。
-    if let Err(error) = reconcile_completed_stream_cancellations(&state).await {
+    if let Err(error) = reconcile_completed_stream_cancellations(&state.db).await {
         tracing::warn!(%error, "startup stream reconciliation failed");
     }
     let discovering: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -321,4 +319,86 @@ async fn cleanup_logs(state: &AppState) -> anyhow::Result<()> {
         .await?;
     tx.commit().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TempDir;
+
+    /// 播种一条请求日志与其最终尝试。
+    async fn seed(db: &Database, id: &str, response_bytes: i64, attempt: &str, usage: bool) {
+        let time = crate::test_support::SEED_TIME;
+        sqlx::query(
+            "INSERT INTO request_logs(id, protocol, model_id, endpoint, stream, started_at, finished_at, final_status_code, outcome, attempt_count, response_bytes) \
+             VALUES(?,'openai_compatible','m','/v1/chat/completions',1,?,?,200,?,1,?)",
+        )
+        .bind(id)
+        .bind(time)
+        .bind(time)
+        .bind(attempt)
+        .bind(response_bytes)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let (output_tokens, raw_usage): (Option<i64>, Option<&str>) = if usage {
+            (Some(7), Some(r#"{"prompt_tokens":10,"completion_tokens":7}"#))
+        } else {
+            (None, None)
+        };
+        sqlx::query(
+            "INSERT INTO request_attempts(id, request_id, channel_name, attempt_no, priority_snapshot, started_at, finished_at, status_code, outcome, response_started, output_tokens, raw_usage_json, response_bytes) \
+             VALUES(?,?,'chan',1,1,?,?,200,?,1,?,?,?)",
+        )
+        .bind(format!("att-{id}"))
+        .bind(id)
+        .bind(time)
+        .bind(time)
+        .bind(attempt)
+        .bind(output_tokens)
+        .bind(raw_usage)
+        .bind(response_bytes)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+
+    /// 历史上「已解析到完整流用量却被记成 cancelled」的记录必须被修复：
+    /// 请求与最终尝试同时改写为 success。真正中途取消（没有 usage）的记录、
+    /// 以及没有任何响应字节的记录都保持原样。
+    #[tokio::test]
+    async fn completed_stream_cancellations_are_repaired() {
+        let dir = TempDir::new("maintenance-repair");
+        let db = Database::open(&dir.path().join("gateway.db")).await.unwrap();
+        seed(&db, "req-completed", 4096, "cancelled", true).await;
+        seed(&db, "req-aborted", 512, "cancelled", false).await;
+        seed(&db, "req-no-bytes", 0, "cancelled", true).await;
+
+        let repaired = reconcile_completed_stream_cancellations(&db).await.unwrap();
+        assert_eq!(repaired, 1, "only the usage-bearing completed stream is repaired");
+
+        let outcome: String =
+            sqlx::query_scalar("SELECT outcome FROM request_logs WHERE id='req-completed'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(outcome, "success");
+        let attempt: String = sqlx::query_scalar(
+            "SELECT outcome FROM request_attempts WHERE request_id='req-completed'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(attempt, "success", "the final attempt is repaired too");
+
+        for id in ["req-aborted", "req-no-bytes"] {
+            let outcome: String =
+                sqlx::query_scalar("SELECT outcome FROM request_logs WHERE id=?")
+                    .bind(id)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(outcome, "cancelled", "{id} must stay cancelled");
+        }
+    }
 }
